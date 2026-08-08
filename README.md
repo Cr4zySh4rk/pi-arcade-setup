@@ -34,19 +34,20 @@ Don't prefix this with `sudo` — the script calls `sudo` itself for the specifi
 2. **DSI display setup** *(if `ENABLE_DSI_DISPLAY=true`, the default)* — KMS overlay, kernel cmdline rotation, larger console font for the high-DPI panel. Reboots to activate it.
 3. **RetroPie** — clones `RetroPie-Setup` and runs `basic_install` (RetroPie core, RetroArch, classic EmulationStation, standard emulator set).
 4. **Emulators** — installs `lr-mame` (always) plus the cores listed in `EMULATOR_CORES` (SNES, PS1, PSP, NES, GB/GBC, Genesis, N64, etc. by default).
-5. **File sharing** — ProFTPD, for dropping ROMs onto the Pi over the network.
-6. **Disk cleanup** — `apt autoremove`/`clean`.
-7. **ES-DE**, built from source (no prebuilt ARM package exists) with `DEINIT_ON_LAUNCH` so it can run directly on the console without a desktop environment.
-8. **ES-DE Quit-menu patch** — removes the unreliable "Suspend" option and adds "Restart EmulationStation", by patching ES-DE's C++ source before building it (matched against the real `stable-3.4` source; if a future ES-DE version changes that code, the patch is skipped with a warning rather than failing the whole build).
-9. **ES-DE configuration** — first-run default settings, then points it at RetroPie's existing ROM folder and sets the theme/aspect ratio.
-10. **Emulator reuse** — symlinks ES-DE to RetroPie's existing RetroArch/PPSSPP install and libretro cores, so nothing is set up twice.
-11. **Themes** — clones three ES-DE themes (`artflix-revisited`, `art-book-next`, `alekfull-nx`) and installs the actual curated per-theme artwork (logos, backgrounds, metadata) for the custom RetroPie-menu system from [`theme-art/`](theme-art) in this repo — pulled directly from the reference build, not generated placeholders.
-12. **Frontend autostart/switching** — `autostart.sh` boots into whichever frontend is selected, with the restart-loop and clean-shutdown log detection needed to make Quit/Reboot/Power Off/Restart all behave correctly; a `switch-frontend.sh [esde|classic]` helper and an `esde` relaunch command.
-13. **Custom "RetroPie Setup" system in ES-DE** — reproduces classic EmulationStation's built-in config-tools menu (Audio, Bluetooth, File Manager, Raspi-Config, RetroArch, Netplay, RetroPie-Setup, Run Command, Show IP, Splashscreen, WiFi) inside ES-DE, correctly wired through `openvt`+`TERM=linux` so the whiptail/curses tools actually render.
-14. **Splash screen** — configures the existing RetroPie splash mechanism's rotation; optionally downloads a custom splash video if you set `SPLASH_VIDEO_URL`.
-15. **Polkit fix** — grants your user passwordless authorization to reboot/power off/suspend, which headless kiosk setups need (`sudo`'s `NOPASSWD` alone isn't enough — this is a separate polkit-layer permission).
-16. **Controller hotkey daemon** — holds L3+R3 while pressing Square/X/Triangle/Circle to adjust screen brightness and volume system-wide, regardless of what has input focus.
-17. **In-frontend "Hotkey Config" tool** — a full-screen wizard (reachable from the RetroPie Setup menu inside ES-DE, or `sudo python3 ~/scripts/hotkey-remap.py`) to re-capture your controller's button numbers without SSH.
+5. **RetroArch controller autoconfig** — populates RetroArch's *active* autoconfig directory with its full ~440-profile preset library (Xbox, PlayStation, 8BitDo, and hundreds more, matched by USB vendor/product id). Without this, a controller can work fine for menu navigation but do nothing inside actual games — RetroPie only auto-generates an autoconfig profile for a controller you've walked through classic EmulationStation's own input-configuration screen, and ES-DE doesn't do this at all. This closes that gap for any common controller up front.
+6. **File sharing** — ProFTPD, for dropping ROMs onto the Pi over the network.
+7. **Disk cleanup** — `apt autoremove`/`clean`.
+8. **ES-DE**, built from source (no prebuilt ARM package exists) with `DEINIT_ON_LAUNCH` so it can run directly on the console without a desktop environment.
+9. **ES-DE Quit-menu patch** — removes the unreliable "Suspend" option and adds "Restart EmulationStation", by patching ES-DE's C++ source before building it (matched against the real `stable-3.4` source; if a future ES-DE version changes that code, the patch is skipped with a warning rather than failing the whole build).
+10. **ES-DE configuration** — first-run default settings, then points it at RetroPie's existing ROM folder and sets the theme/aspect ratio.
+11. **Emulator reuse** — symlinks ES-DE to RetroPie's existing RetroArch/PPSSPP install and libretro cores, so nothing is set up twice.
+12. **Themes** — clones three ES-DE themes (`artflix-revisited`, `art-book-next`, `alekfull-nx`) and installs the actual curated per-theme artwork (logos, backgrounds, metadata) for the custom RetroPie-menu system from [`theme-art/`](theme-art) in this repo — pulled directly from the reference build, not generated placeholders.
+13. **Frontend autostart/switching** — `autostart.sh` boots into whichever frontend is selected, with the restart-loop and clean-shutdown log detection needed to make Quit/Reboot/Power Off/Restart all behave correctly; a `switch-frontend.sh [esde|classic]` helper and an `esde` relaunch command.
+14. **Custom "RetroPie Setup" system in ES-DE** — reproduces classic EmulationStation's built-in config-tools menu (Audio, Bluetooth, File Manager, Raspi-Config, RetroArch, Netplay, RetroPie-Setup, Run Command, Show IP, Splashscreen, WiFi) inside ES-DE, correctly wired through `openvt`+`TERM=linux` so the whiptail/curses tools actually render.
+15. **Splash screen** — configures the existing RetroPie splash mechanism's rotation; optionally downloads a custom splash video if you set `SPLASH_VIDEO_URL`.
+16. **Polkit fix** — grants your user passwordless authorization to reboot/power off/suspend, which headless kiosk setups need (`sudo`'s `NOPASSWD` alone isn't enough — this is a separate polkit-layer permission).
+17. **Controller hotkey daemon** — holds L3+R3 while pressing Square/X/Triangle/Circle to adjust screen brightness and volume system-wide, regardless of what has input focus.
+18. **In-frontend "Hotkey Config" tool** — a full-screen wizard (reachable from the RetroPie Setup menu inside ES-DE, or `sudo python3 ~/scripts/hotkey-remap.py`) to re-capture your controller's button numbers without SSH.
 
 ## Configuration
 
@@ -92,6 +93,7 @@ ENABLE_DSI_DISPLAY=false ENABLE_CONTROLLER_HOTKEYS=false \
 - **Relaunch ES-DE** without rebooting after a deliberate Quit: run `esde`.
 - **Remap controller hotkeys**: RetroPie Setup → *Hotkey Config* inside ES-DE, or `sudo python3 ~/scripts/hotkey-remap.py` over SSH.
 - **Logs**: `/var/log/pi-arcade-setup.log` (installer), `~/ES-DE/logs/es_log.txt` (ES-DE), `/var/log/controller-hotkeys.log` (hotkey daemon).
+- **Controller works in menus but not in-game?** This is almost always a missing RetroArch autoconfig profile, not a broken controller — the installer pre-populates ~440 common profiles (step 5 above), but a controller RetroArch has never seen the exact USB identity of won't have one. Confirm with `grep -i autoconf <(XDG_RUNTIME_DIR=/run/user/$(id -u) timeout 5 /opt/retropie/emulators/retroarch/bin/retroarch --verbose --menu 2>&1)` over SSH — it logs a line like `[Autoconf]: Xbox 360 Controller configured in port 1` on success, or silence if nothing matched. DIY/open-source controllers (e.g. GP2040-CE-based sticks) can also present a *different* USB vendor/product ID per input mode (PS4/PS5/XInput/etc.), each needing its own match — switching modes is effectively switching to what RetroArch sees as a different controller.
 
 ## Known limitations
 

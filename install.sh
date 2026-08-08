@@ -343,6 +343,33 @@ phase_emulators_install() {
     return 0
 }
 
+# RetroArch ships a large library of controller autoconfig profiles under
+# .../retroarch/autoconfig-presets/udev/ (hundreds of pads, matched by
+# vendor/product id), but only copies a profile into the *active*
+# autoconfig directory when you walk a specific controller through classic
+# EmulationStation's own input-configuration screen. ES-DE does not do this
+# at all. The practical effect: a controller can work fine for menu
+# navigation (SDL2, read directly) while doing nothing inside actual games
+# (RetroArch's udev joypad driver has no profile to match it against). This
+# copies the whole preset library into the active directory once, up front,
+# so any common controller "just works" in-game without that manual step.
+phase_retroarch_autoconfig() {
+    local preset_dir="/opt/retropie/emulators/retroarch/autoconfig-presets/udev"
+    local active_dir="/opt/retropie/configs/all/retroarch/autoconfig"
+    if [ ! -d "$preset_dir" ]; then
+        log_warn "RetroArch autoconfig preset library not found at $preset_dir; skipping"
+        return 0
+    fi
+    sudo mkdir -p "$active_dir"
+    # -n: never overwrite a profile that's already there (e.g. one already
+    # generated for a controller that went through EmulationStation's own
+    # input configuration, which may have hand-tuned hotkey bindings).
+    sudo cp -n "$preset_dir"/*.cfg "$active_dir"/ 2>/dev/null
+    sudo chown "$PI_USER":"$PI_USER" "$active_dir"/*.cfg 2>/dev/null
+    log "Populated RetroArch autoconfig directory with $(ls "$active_dir"/*.cfg 2>/dev/null | wc -l) controller profiles"
+    return 0
+}
+
 phase_ftp_install() {
     sudo apt-get install -y proftpd-core proftpd-doc || log_warn "proftpd install failed"
     return 0
@@ -1347,6 +1374,7 @@ main() {
         verify_display
         retropie_install
         emulators_install
+        retroarch_autoconfig
         ftp_install
         disk_cleanup
         esde_build_deps
