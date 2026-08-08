@@ -78,11 +78,11 @@ INITIAL_FRONTEND="${INITIAL_FRONTEND:-esde}"            # esde | classic
 # in-frontend "Hotkey Config" tool this script installs (see README).
 ENABLE_CONTROLLER_HOTKEYS="${ENABLE_CONTROLLER_HOTKEYS:-true}"
 ALSA_CARD_INDEX="${ALSA_CARD_INDEX:-0}"
-BTN_L3="${BTN_L3:-10}"
-BTN_R3="${BTN_R3:-11}"
-BTN_SQUARE="${BTN_SQUARE:-0}"
-BTN_X="${BTN_X:-1}"
-BTN_CIRCLE="${BTN_CIRCLE:-2}"
+BTN_L3="${BTN_L3:-9}"
+BTN_R3="${BTN_R3:-10}"
+BTN_SQUARE="${BTN_SQUARE:-2}"
+BTN_X="${BTN_X:-0}"
+BTN_CIRCLE="${BTN_CIRCLE:-1}"
 BTN_TRIANGLE="${BTN_TRIANGLE:-3}"
 HOTKEY_STEP="${HOTKEY_STEP:-5}"
 
@@ -593,43 +593,42 @@ phase_themes_install() {
     return 0
 }
 
-# Best-effort per-system art for the custom "RetroPie Setup" system, so it
-# doesn't render as plain text in each theme's carousel. This is a
-# simplified, automated stand-in for the manual/visual asset work described
-# in the reference build log (section 14.5) - re-touch by hand if you want
-# a closer match to a given theme's exact art style.
+# Per-system art for the custom "RetroPie Setup" system, so it doesn't
+# render as plain text in each theme's carousel. These are the actual
+# curated assets from the reference build (section 14.5) - logos,
+# metadata, and backgrounds for each theme - bundled in this repo under
+# theme-art/ and downloaded into place here, rather than generated.
 phase_theme_system_art() {
     if [ "$INSTALL_THEMES" != "true" ]; then
         return 0
     fi
-    if ! require_cmd convert && ! require_cmd rsvg-convert; then
-        sudo apt-get install -y imagemagick librsvg2-bin || log_warn "Could not install imagemagick/librsvg2-bin for theme art generation"
-    fi
-    local logo_svg="/etc/emulationstation/themes/carbon-2021/art/systems/retropie.svg"
-    [ -f "$logo_svg" ] || { log_warn "Source RetroPie logo not found at $logo_svg; skipping per-theme art generation"; return 0; }
-
+    local assets_base="https://raw.githubusercontent.com/Cr4zySh4rk/pi-arcade-setup/main/theme-art"
     local themes_dir="$PI_HOME/ES-DE/themes"
 
+    _fetch_asset() {
+        local url="$1" dest="$2"
+        mkdir -p "$(dirname "$dest")"
+        curl -fsSL "$url" -o "$dest" || log_warn "Could not download theme art asset: $url"
+    }
+
     if [ -d "$themes_dir/artflix-revisited" ]; then
-        mkdir -p "$themes_dir/artflix-revisited/_inc/systems/logos" "$themes_dir/artflix-revisited/_inc/systems/fanart"
-        require_cmd rsvg-convert && rsvg-convert -w 600 -h 600 "$logo_svg" -o "$themes_dir/artflix-revisited/_inc/systems/logos/retropie.png" 2>/dev/null
-        require_cmd convert && convert -size 1920x1080 xc:'#101010' "$themes_dir/artflix-revisited/_inc/systems/fanart/retropie.jpg" 2>/dev/null
+        _fetch_asset "$assets_base/artflix-revisited/fanart_retropie.jpg" "$themes_dir/artflix-revisited/_inc/systems/fanart/retropie.jpg"
+        _fetch_asset "$assets_base/artflix-revisited/logos_retropie.png" "$themes_dir/artflix-revisited/_inc/systems/logos/retropie.png"
+        _fetch_asset "$assets_base/artflix-revisited/metadata-global_retropie.xml" "$themes_dir/artflix-revisited/_inc/systems/metadata-global/retropie.xml"
     fi
     if [ -d "$themes_dir/art-book-next" ]; then
-        mkdir -p "$themes_dir/art-book-next/_inc/systems/logos"
-        cp "$logo_svg" "$themes_dir/art-book-next/_inc/systems/logos/retropie.svg" 2>/dev/null
+        _fetch_asset "$assets_base/art-book-next/logos_retropie.svg" "$themes_dir/art-book-next/_inc/systems/logos/retropie.svg"
+        _fetch_asset "$assets_base/art-book-next/_metadata-global_retropie.xml" "$themes_dir/art-book-next/_inc/systems/_metadata-global/retropie.xml"
         for variant in artwork artwork-outline artwork-circuit artwork-noir artwork-screenshots; do
-            mkdir -p "$themes_dir/art-book-next/$variant"
-            require_cmd rsvg-convert && rsvg-convert -w 454 -h 1080 "$logo_svg" -o "$themes_dir/art-book-next/$variant/retropie.png" 2>/dev/null
+            _fetch_asset "$assets_base/art-book-next/${variant}_retropie.png" "$themes_dir/art-book-next/_inc/systems/$variant/retropie.png"
         done
     fi
     if [ -d "$themes_dir/alekfull-nx" ]; then
-        mkdir -p "$themes_dir/alekfull-nx/_inc/systems/logos" "$themes_dir/alekfull-nx/_inc/systems/backgrounds" "$themes_dir/alekfull-nx/_inc/systems/carousel-icons"
-        cp "$logo_svg" "$themes_dir/alekfull-nx/_inc/systems/logos/retropie.svg" 2>/dev/null
-        require_cmd convert && convert -size 1920x1080 xc:'#101010' "$themes_dir/alekfull-nx/_inc/systems/backgrounds/retropie.jpg" 2>/dev/null
-        require_cmd rsvg-convert && rsvg-convert -w 600 -h 600 "$logo_svg" -o "$themes_dir/alekfull-nx/_inc/systems/carousel-icons/retropie.webp" 2>/dev/null
+        _fetch_asset "$assets_base/alekfull-nx/logos_retropie.svg" "$themes_dir/alekfull-nx/_inc/systems/logos/retropie.svg"
+        _fetch_asset "$assets_base/alekfull-nx/backgrounds_retropie.jpg" "$themes_dir/alekfull-nx/_inc/systems/backgrounds/retropie.jpg"
+        _fetch_asset "$assets_base/alekfull-nx/carousel-icons_retropie.webp" "$themes_dir/alekfull-nx/_inc/systems/carousel-icons/retropie.webp"
     fi
-    log "Generated placeholder per-theme art for the custom RetroPie system (touch up manually for a polished look, see README)"
+    log "Installed reference per-theme art for the custom RetroPie system"
     return 0
 }
 
@@ -995,6 +994,8 @@ def main():
     state = load_state()
     set_brightness(state["brightness"])
     print(f"[hotkeys] starting, brightness={state['brightness']}% volume={state['volume']}% backlight={BACKLIGHT_PATH}")
+    print(f"[hotkeys] button mapping: L3={buttons['l3']} R3={buttons['r3']} Square={buttons['square']} "
+          f"X={buttons['x']} Circle={buttons['circle']} Triangle={buttons['triangle']}")
 
     held = {}
 
@@ -1133,7 +1134,7 @@ def draw_chrome(win, subtitle):
 
 
 def draw_progress(win, step, total):
-    dots = " ".join("*" if i < step else "o" for i in range(total))
+    dots = " ".join("●" if i < step else "○" for i in range(total))
     safe_addstr(win, 5, cx(win, dots), dots, curses.color_pair(COL_LABEL))
     label = f"STEP {step} OF {total}"
     safe_addstr(win, 6, cx(win, label), label, curses.A_DIM)
@@ -1292,11 +1293,17 @@ idx = text.find(anchor)
 if idx == -1:
     print("[hotkeyconfig] anchor 'filemanager.rp)' not found in retropiemenu.sh; skipping menu wiring")
     sys.exit(0)
-# Insert a new case right before the filemanager.rp) case, preserving indentation.
+# Insert a new case immediately after the filemanager.rp) case's closing
+# ";;", preserving indentation (matches the reference build exactly).
+case_end = text.find(";;", idx)
+if case_end == -1:
+    print("[hotkeyconfig] could not find end of filemanager.rp) case; skipping menu wiring")
+    sys.exit(0)
+insert_point = text.find("\n", case_end) + 1
 line_start = text.rfind("\n", 0, idx) + 1
 indent = text[line_start:idx]
 insert_block = f"{indent}hotkeyconfig.rp)\n{indent}    python3 {pi_home}/scripts/hotkey-remap.py\n{indent}    ;;\n"
-new_text = text[:line_start] + insert_block + text[line_start:]
+new_text = text[:insert_point] + insert_block + text[insert_point:]
 open(path, "w").write(new_text)
 print("[hotkeyconfig] wired into retropiemenu.sh")
 PYEOF

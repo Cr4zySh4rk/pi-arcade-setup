@@ -1,0 +1,19 @@
+<theme>
+    <variables>
+        <systemName>RetroPie Setup</systemName>
+        <systemDescription>Install RetroPie from binary or source, configure emulators, controllers, splash screens, networking and other RetroPie-related settings.</systemDescription>
+        <systemManufacturer>RetroPie</systemManufacturer>
+        <systemReleaseYear>Various</systemReleaseYear>
+        <systemReleaseDate>Various</systemReleaseDate>
+        <systemReleaseDateFormated>Various</systemReleaseDateFormated>
+        <systemHardwareType>Folder</systemHardwareType>
+        <systemCoverSize>3-4</systemCoverSize>
+        <systemCoverSizeType>portrait</systemCoverSizeType>
+        <systemColor>C4302B</systemColor>
+        <systemColorPalette1>4F5054</systemColorPalette1>
+        <systemColorPalette2>737375</systemColorPalette2>
+        <systemColorPalette3>F4BE46</systemColorPalette3>
+        <systemColorPalette4>C4302B</systemColorPalette4>
+        <systemCartSize>1-1</systemCartSize>
+    </variables>
+</theme>

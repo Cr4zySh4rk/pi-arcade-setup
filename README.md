@@ -6,6 +6,8 @@ It's a faithful automation of a real, hand-documented build — DSI touchscreen 
 
 The reference hardware is a Raspberry Pi 4 with a **Waveshare 10.1" DSI Touch A** display and a PS4-style **GP2040-CE** controller — the script's defaults match that build exactly. Every hardware-specific value is also a configuration variable, so it works on generic HDMI setups and other controllers too (see [Configuration](#configuration)).
 
+This script has been verified directly against the reference Pi over SSH — every phase's output on disk (display config, ES-DE build + patch, themes, custom RetroPie menu, splash, polkit rule, controller hotkey mapping) was diffed against what `install.sh` actually generates, and a few real discrepancies found in that process were fixed in both places (see [Known limitations](#known-limitations)).
+
 ## Quick start
 
 Flash Raspberry Pi OS Lite (64-bit) with Raspberry Pi Imager, set your username/password/Wi-Fi/SSH in the Imager's own customization options, boot the Pi, and SSH in as that user (**not** root). Then run:
@@ -38,7 +40,7 @@ Don't prefix this with `sudo` — the script calls `sudo` itself for the specifi
 8. **ES-DE Quit-menu patch** — removes the unreliable "Suspend" option and adds "Restart EmulationStation", by patching ES-DE's C++ source before building it (matched against the real `stable-3.4` source; if a future ES-DE version changes that code, the patch is skipped with a warning rather than failing the whole build).
 9. **ES-DE configuration** — first-run default settings, then points it at RetroPie's existing ROM folder and sets the theme/aspect ratio.
 10. **Emulator reuse** — symlinks ES-DE to RetroPie's existing RetroArch/PPSSPP install and libretro cores, so nothing is set up twice.
-11. **Themes** — clones three ES-DE themes (`artflix-revisited`, `art-book-next`, `alekfull-nx`) and generates placeholder per-theme artwork for the custom RetroPie-menu system (best-effort — see [Known limitations](#known-limitations)).
+11. **Themes** — clones three ES-DE themes (`artflix-revisited`, `art-book-next`, `alekfull-nx`) and installs the actual curated per-theme artwork (logos, backgrounds, metadata) for the custom RetroPie-menu system from [`theme-art/`](theme-art) in this repo — pulled directly from the reference build, not generated placeholders.
 12. **Frontend autostart/switching** — `autostart.sh` boots into whichever frontend is selected, with the restart-loop and clean-shutdown log detection needed to make Quit/Reboot/Power Off/Restart all behave correctly; a `switch-frontend.sh [esde|classic]` helper and an `esde` relaunch command.
 13. **Custom "RetroPie Setup" system in ES-DE** — reproduces classic EmulationStation's built-in config-tools menu (Audio, Bluetooth, File Manager, Raspi-Config, RetroArch, Netplay, RetroPie-Setup, Run Command, Show IP, Splashscreen, WiFi) inside ES-DE, correctly wired through `openvt`+`TERM=linux` so the whiptail/curses tools actually render.
 14. **Splash screen** — configures the existing RetroPie splash mechanism's rotation; optionally downloads a custom splash video if you set `SPLASH_VIDEO_URL`.
@@ -74,12 +76,12 @@ ENABLE_DSI_DISPLAY=false ENABLE_CONTROLLER_HOTKEYS=false \
 | `EMULATOR_CORES` | `lr-snes9x,lr-pcsx-rearmed,ppsspp,lr-fceumm,lr-gambatte,lr-genesis-plus-gx,lr-nestopia,lr-picodrive,mupen64plus` | Comma-separated RetroPie-Setup package ids to install in addition to MAME. |
 | `ESDE_BRANCH` | `stable-3.4` | ES-DE git branch/tag to build. |
 | `APPLY_ESDE_QUITMENU_PATCH` | `true` | Apply the Restart-EmulationStation source patch. |
-| `INSTALL_THEMES` | `true` | Clone the three ES-DE themes and generate placeholder system art. |
+| `INSTALL_THEMES` | `true` | Clone the three ES-DE themes and install the bundled reference system art. |
 | `ESDE_THEME_NAME` | `artflix-revisited` | Active ES-DE theme. |
 | `INITIAL_FRONTEND` | `esde` | `esde` or `classic` — which frontend boots by default. |
 | `ENABLE_CONTROLLER_HOTKEYS` | `true` | Installs the brightness/volume hotkey daemon. Safe on generic hardware — it no-ops gracefully with no controller/backlight, and is remappable later regardless. |
 | `ALSA_CARD_INDEX` | `0` | ALSA card used for the hardware volume mixer. |
-| `BTN_L3` / `BTN_R3` / `BTN_SQUARE` / `BTN_X` / `BTN_CIRCLE` / `BTN_TRIANGLE` | GP2040-CE mapping from the reference build (`10`/`11`/`0`/`1`/`2`/`3`) | Default joystick button numbers. Re-capture for your own controller with the in-frontend "Hotkey Config" tool after install — button numbering isn't standardized across controllers. |
+| `BTN_L3` / `BTN_R3` / `BTN_SQUARE` / `BTN_X` / `BTN_CIRCLE` / `BTN_TRIANGLE` | GP2040-CE mapping currently active on the reference build (`9`/`10`/`2`/`0`/`1`/`3`), captured live via the remap tool | Default joystick button numbers. Re-capture for your own controller with the in-frontend "Hotkey Config" tool after install — button numbering isn't standardized across controllers, and can shift even on the same controller across firmware/reconnects. |
 | `HOTKEY_STEP` | `5` | Brightness/volume step size per press, in percent. |
 | `AUTO_REBOOT_AT_END` | `true` | Reboot into the finished arcade UI once setup completes. |
 
@@ -93,10 +95,10 @@ ENABLE_DSI_DISPLAY=false ENABLE_CONTROLLER_HOTKEYS=false \
 
 ## Known limitations
 
-- **N64 (`mupen64plus_next`) is flaky to build** upstream — the script installs it best-effort and continues without failing the whole run if it doesn't compile, matching what happened in the reference build.
-- **Per-theme system artwork is a simplified placeholder**, not the hand-picked/recolored assets from the original build. It generates a plain logo + solid background per theme so the custom "RetroPie Setup" system isn't blank; touch it up by hand in `~/ES-DE/themes/<theme>/` if you want a closer visual match.
-- **The ES-DE Quit-menu source patch is matched against `stable-3.4`.** It's applied as an exact text match against the real upstream source (verified against the actual `stable-3.4` files at build time), and fails soft — if you build a different `ESDE_BRANCH` and the surrounding code has changed, the patch step logs a warning and ES-DE still builds, just without the "Restart EmulationStation" menu entry.
-- **Controller button numbers are hardware-specific** and can't be captured non-interactively during a `curl | bash` install. The script ships the reference GP2040-CE mapping as a default and installs the in-frontend remap tool so you can re-capture the real numbers for your own controller afterward.
+- **N64 (`mupen64plus_next`) is flaky to build** upstream — the script installs it best-effort and continues without failing the whole run if it doesn't compile. On the reference Pi this core never ended up installed, matching the original build log's note.
+- **The ES-DE Quit-menu source patch is matched against `stable-3.4`.** It's applied as an exact text match against the real upstream source (verified against the actual `stable-3.4` files at build time, and against the compiled binary on the reference Pi via `strings` — the "RESTART EMULATIONSTATION" menu text is present), and fails soft — if you build a different `ESDE_BRANCH` and the surrounding code has changed, the patch step logs a warning and ES-DE still builds, just without that menu entry.
+- **Controller button numbers are hardware-specific** and can drift even for the *same* controller (reconnects, firmware mode changes). The defaults shipped here are whatever the reference Pi's controller is actually mapped to right now, captured live via the remap tool — re-capture for your own controller with the in-frontend "Hotkey Config" tool after install regardless.
+- **The RetroPie-menu "Splash Screens" tool can silently drop the custom rotation flag.** `splashscreen.cfg`'s `--transform-type=$SPLASH_TRANSFORM_TYPE` is a hand-added option outside what that GUI tool manages: using it to pick/enable a splash video appears to regenerate the file and lose the custom flag (this happened on the reference Pi and was fixed by hand). If your splash video looks unrotated after using that menu, re-run `phase_splash_setup` logic manually or just re-apply the `CMD_OPTS` line shown in [install.sh](install.sh).
 - Passwordless polkit reboot/power-off is deliberately granted to `PI_USER` (see below) — appropriate for a dedicated kiosk device, not for a Pi that's also used as a general multi-user machine.
 
 ## Security notes

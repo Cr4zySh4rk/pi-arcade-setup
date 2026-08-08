@@ -1,0 +1,14 @@
+<theme>
+    <variables>
+        <systemName>RetroPie Setup</systemName>
+        <systemDescription>Install RetroPie from binary or source, configure emulators, controllers, splash screens, networking and other RetroPie-related settings.</systemDescription>
+        <systemManufacturer>RetroPie</systemManufacturer>
+        <systemReleaseYear>Various</systemReleaseYear>
+        <systemReleaseDate>Various</systemReleaseDate>
+        <systemReleaseDateFormated>Various</systemReleaseDateFormated>
+        <systemHardwareType>Folder</systemHardwareType>
+        <systemCoverSize>1-1</systemCoverSize>
+        <systemCoverSizeType>square</systemCoverSizeType>
+        <systemCartSize>1-1</systemCartSize>
+    </variables>
+</theme>
