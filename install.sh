@@ -112,6 +112,9 @@ run_phase() {
         log "Skipping phase '$name' (already completed)"
         return 0
     fi
+    # Exposed so request_reboot() can mark this phase done before it exits
+    # the process (a phase that reboots never returns to the "if" below).
+    CURRENT_PHASE="$name"
     log "==> Starting phase: $name"
     if "phase_$name"; then
         mark_done "$name"
@@ -167,6 +170,15 @@ EOF
 request_reboot() {
     local reason="$1"
     log "Reboot required: $reason"
+
+    # This phase is complete as far as its own work goes - mark it done
+    # *before* rebooting, since this function exits the process and never
+    # returns to run_phase()'s own mark_done call. Without this, resuming
+    # after reboot would see the phase as not-done and re-run it (and hit
+    # this same reboot again) forever.
+    if [ -n "${CURRENT_PHASE:-}" ]; then
+        mark_done "$CURRENT_PHASE"
+    fi
 
     sudo mkdir -p "$STATE_DIR"
     if [ ! -f "$STATE_DIR/install.sh" ]; then
@@ -227,8 +239,27 @@ require_cmd() { command -v "$1" >/dev/null 2>&1; }
 phase_preflight() {
     [ "$(id -u)" -eq 0 ] && die "Run this script as your normal Pi user (e.g. 'pi'), not as root/with sudo. It calls sudo itself where needed."
     require_cmd sudo || die "sudo is required"
+
+    # Newer Raspberry Pi OS images (Bookworm/Trixie, user created via
+    # Imager) do NOT ship the old hardcoded passwordless-sudo file for the
+    # first user the way legacy "pi" images did - sudo may require a
+    # password. This script has to run non-interactively across reboots
+    # (a systemd service resumes it, with no terminal to type a password
+    # into), so passwordless sudo is a hard requirement, not just a nicety.
+    # Fix it now, once, while a human is actually present at this terminal
+    # to enter a password if prompted.
     if ! sudo -n true 2>/dev/null; then
-        log "This script needs passwordless (or interactive) sudo for $PI_USER. You may be prompted for your password."
+        log "Passwordless sudo isn't set up for $PI_USER yet - configuring it now (you may be prompted for your password once)."
+        sudo -v || die "Could not authenticate with sudo for $PI_USER. This installer requires sudo access."
+        local sudoers_file="/etc/sudoers.d/010_${PI_USER}-nopasswd"
+        echo "$PI_USER ALL=(ALL) NOPASSWD: ALL" | sudo tee "$sudoers_file" >/dev/null
+        sudo chmod 440 "$sudoers_file"
+        if ! sudo visudo -c -f "$sudoers_file" >/dev/null 2>&1; then
+            sudo rm -f "$sudoers_file"
+            die "Generated sudoers rule failed validation; refusing to install a broken sudoers file. Configure passwordless sudo for $PI_USER manually (visudo) and re-run."
+        fi
+        sudo -n true 2>/dev/null || die "Still could not get passwordless sudo working for $PI_USER after configuring $sudoers_file. Please check it and re-run."
+        log "Passwordless sudo configured for $PI_USER ($sudoers_file)."
     fi
     grep -qi "raspbian\|raspberry pi os\|debian" /etc/os-release 2>/dev/null || log_warn "This doesn't look like Raspberry Pi OS/Debian - continuing anyway, but things may not match the reference build."
     sudo mkdir -p "$STATE_DIR"
