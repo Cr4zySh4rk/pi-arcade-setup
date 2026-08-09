@@ -349,7 +349,29 @@ phase_retropie_install() {
     fi
     cd "$PI_HOME/RetroPie-Setup" || die "cannot cd into RetroPie-Setup"
     log "Running RetroPie basic_install - this is long-running (can exceed an hour on a Pi 4)"
-    sudo ./retropie_packages.sh setup basic_install || die "RetroPie basic_install failed"
+
+    # basic_install fetches dozens of packages/binary assets over the network
+    # across a run that can take well over an hour. A single transient
+    # download blip anywhere in that run (e.g. a flaky fetch of a cosmetic
+    # asset like the splashscreen pack) makes retropie_packages.sh exit
+    # non-zero, which previously killed the whole phase via die() - and
+    # since the phase is never marked done, the next resume re-ran the
+    # *entire* basic_install (including everything that already built fine)
+    # instead of just retrying the one flaky fetch. Retry a few times with a
+    # short backoff before giving up; these failures are almost always
+    # transient network hiccups, not real breakage.
+    local attempt
+    for attempt in 1 2 3; do
+        if sudo ./retropie_packages.sh setup basic_install; then
+            break
+        fi
+        if [ "$attempt" -eq 3 ]; then
+            die "RetroPie basic_install failed after $attempt attempts"
+        fi
+        log_warn "RetroPie basic_install failed (attempt $attempt/3) - likely a transient network hiccup, retrying in 30s"
+        sleep 30
+    done
+
     [ -x /opt/retropie/supplementary/emulationstation/emulationstation ] || command -v emulationstation >/dev/null 2>&1 || log_warn "emulationstation binary not found where expected after basic_install"
     return 0
 }
