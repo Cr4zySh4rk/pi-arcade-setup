@@ -409,7 +409,10 @@ phase_retropie_install() {
 phase_emulators_install() {
     cd "$PI_HOME/RetroPie-Setup" || die "RetroPie-Setup missing"
     log "Installing MAME (lr-mame)"
-    sudo ./retropie_packages.sh lr-mame _binary_ || die "lr-mame install failed"
+    if ! sudo ./retropie_packages.sh lr-mame _binary_; then
+        log_warn "No lr-mame binary available for this platform/OS combination - falling back to building lr-mame from source (this can take a while)"
+        sudo ./retropie_packages.sh lr-mame _source_ || die "lr-mame install failed (no binary available and source build also failed)"
+    fi
 
     IFS=',' read -ra cores <<< "$EMULATOR_CORES"
     for core in "${cores[@]}"; do
