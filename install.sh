@@ -364,8 +364,13 @@ phase_emulators_install() {
     for core in "${cores[@]}"; do
         [ -z "$core" ] && continue
         log "Installing emulator core: $core"
-        if ! sudo ./retropie_packages.sh "$core" _binary_; then
-            log_warn "$core failed to install/build (this is a known flaky step for some cores, e.g. mupen64plus/N64 upstream) - continuing without it"
+        sudo ./retropie_packages.sh "$core" _binary_
+        # retropie_packages.sh can exit non-zero on a non-fatal post-install
+        # step (e.g. gamelist/scriptmodule bookkeeping) even though the
+        # package itself installed fine - so don't trust the exit code
+        # alone. Only actually warn if nothing landed on disk for it.
+        if [ ! -d "/opt/retropie/libretrocores/$core" ] && [ ! -d "/opt/retropie/emulators/$core" ]; then
+            log_warn "$core does not appear to be installed (this is a known flaky step for some cores, e.g. mupen64plus/N64 upstream) - continuing without it"
         fi
     done
 
