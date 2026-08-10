@@ -63,8 +63,10 @@ SPLASH_TRANSFORM_TYPE="${SPLASH_TRANSFORM_TYPE:-90}"    # VLC --transform-type, 
 # can't process, and VLC silently drops the whole filter chain (confirmed
 # via `vlc -vv`: "Unsupported pixel size 0 (chroma DPV0)" -> "removing all
 # filters"). So bundled/custom splash videos must have their rotation baked
-# into the file itself (e.g. `ffmpeg -i in.mp4 -vf hflip,vflip out.mp4` for
-# a 180 correction) rather than relying on SPLASH_TRANSFORM_TYPE.
+# into the file itself (e.g. `ffmpeg -i in.mp4 -vf transpose=2 out.mp4` for
+# a 90 degree counter-clockwise / 270 clockwise correction, the rotation
+# needed for the reference build's landscape source clip on this portrait
+# panel) rather than relying on SPLASH_TRANSFORM_TYPE.
 SPLASH_VIDEO_URL="${SPLASH_VIDEO_URL:-https://raw.githubusercontent.com/Cr4zySh4rk/pi-arcade-setup/main/splash/retro-splash.mp4}"
 DO_RPI_FIRMWARE_UPDATE="${DO_RPI_FIRMWARE_UPDATE:-false}" # runs `rpi-update`; opt-in, only if panel is blank on old firmware
 
