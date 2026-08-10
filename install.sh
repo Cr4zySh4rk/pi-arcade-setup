@@ -56,7 +56,16 @@ CLASSIC_ES_SCREENSIZE="${CLASSIC_ES_SCREENSIZE:-1280 800}"
 ESDE_THEME_ASPECT="${ESDE_THEME_ASPECT:-16:10}"
 CONSOLE_FONT_TWEAK="${CONSOLE_FONT_TWEAK:-$ENABLE_DSI_DISPLAY}"
 SPLASH_TRANSFORM_TYPE="${SPLASH_TRANSFORM_TYPE:-90}"    # VLC --transform-type, only used if ENABLE_DSI_DISPLAY
-SPLASH_VIDEO_URL="${SPLASH_VIDEO_URL:-}"                # optional custom splash .mp4 to download
+# Custom splash video. Defaults to the bundled reference-build splash
+# (splash/retro-splash.mp4 in this repo). NOTE: VLC's --video-filter=transform
+# is only reliably applied to *images* on this stack - for h264 video it
+# gets hardware-decoded to a DRM_PRIME buffer that the transform filter
+# can't process, and VLC silently drops the whole filter chain (confirmed
+# via `vlc -vv`: "Unsupported pixel size 0 (chroma DPV0)" -> "removing all
+# filters"). So bundled/custom splash videos must have their rotation baked
+# into the file itself (e.g. `ffmpeg -i in.mp4 -vf hflip,vflip out.mp4` for
+# a 180 correction) rather than relying on SPLASH_TRANSFORM_TYPE.
+SPLASH_VIDEO_URL="${SPLASH_VIDEO_URL:-https://raw.githubusercontent.com/Cr4zySh4rk/pi-arcade-setup/main/splash/retro-splash.mp4}"
 DO_RPI_FIRMWARE_UPDATE="${DO_RPI_FIRMWARE_UPDATE:-false}" # runs `rpi-update`; opt-in, only if panel is blank on old firmware
 
 # --- Emulators --------------------------------------------------------------
@@ -919,8 +928,9 @@ EOF
         mkdir -p "$PI_HOME/RetroPie/splashscreens"
         local dest="$PI_HOME/RetroPie/splashscreens/custom-retro-splash.mp4"
         if curl -fsSL "$SPLASH_VIDEO_URL" -o "$dest"; then
+            sudo chown "$PI_USER":"$PI_USER" "$dest"
             echo "$dest" | sudo tee /etc/splashscreen.list >/dev/null
-            log "Custom splash video installed from $SPLASH_VIDEO_URL"
+            log "Custom splash video installed from $SPLASH_VIDEO_URL (rotation is baked into the file - see SPLASH_VIDEO_URL comment above)"
         else
             log_warn "Failed to download splash video from $SPLASH_VIDEO_URL; leaving stock splash in place"
         fi
