@@ -349,71 +349,17 @@ phase_retropie_install() {
     fi
     cd "$PI_HOME/RetroPie-Setup" || die "cannot cd into RetroPie-Setup"
     log "Running RetroPie basic_install - this is long-running (can exceed an hour on a Pi 4)"
-
-    # basic_install fetches dozens of packages/binary assets over the network
-    # across a run that can take well over an hour. Blindly retrying the
-    # *whole* basic_install on any failure (the previous fix here) turned
-    # out not to help in practice: three consecutive real runs all failed
-    # on the exact same late-stage fetch (retroarch's cosmetic splashscreen
-    # asset pack, retroarch-minimal-assets.tar.gz) after ~80 minutes each
-    # time, burning ~4 hours total to end up exactly as stuck as a single
-    # attempt would have - EmulationStation, RetroArch and every emulator
-    # core had already installed fine every time; only that one trailing
-    # cosmetic package kept failing.
-    #
-    # So: run basic_install once. If it fails but the essentials
-    # (EmulationStation + the RetroArch binary) are already on disk, the
-    # failure is almost certainly that same late, non-critical package -
-    # retry just that specific package directly (seconds, not another
-    # ~80-minute rebuild) and don't let it block the rest of setup if it
-    # keeps failing, since it has no effect on whether the cabinet actually
-    # works. Only fall back to retrying the full basic_install (as before,
-    # up to 3 attempts total) if the essentials themselves are missing,
-    # i.e. this is a real failure rather than a cosmetic-asset hiccup.
-    local es_bin="/opt/retropie/supplementary/emulationstation/emulationstation"
-    local ra_bin="/opt/retropie/emulators/retroarch/bin/retroarch"
-
-    if ! sudo ./retropie_packages.sh setup basic_install; then
-        if [ -x "$es_bin" ] && [ -x "$ra_bin" ]; then
-            log_warn "basic_install failed but EmulationStation and RetroArch are already installed - likely just the cosmetic splashscreen asset pack. Retrying that package directly instead of the full basic_install."
-            local attempt splash_ok=false
-            for attempt in 1 2 3; do
-                if sudo ./retropie_packages.sh splashscreen; then
-                    splash_ok=true
-                    break
-                fi
-                log_warn "splashscreen retry $attempt/3 failed, retrying in 15s"
-                sleep 15
-            done
-            [ "$splash_ok" = true ] || log_warn "splashscreen install still failing after retries - continuing without it since it's cosmetic only and won't affect the arcade cabinet's operation."
-        else
-            log_warn "basic_install failed and EmulationStation/RetroArch are not yet installed - this is a real failure, not a cosmetic-asset hiccup. Retrying the full basic_install."
-            local attempt
-            for attempt in 2 3; do
-                sleep 30
-                if sudo ./retropie_packages.sh setup basic_install; then
-                    break
-                fi
-                if [ "$attempt" -eq 3 ]; then
-                    die "RetroPie basic_install failed after $attempt attempts"
-                fi
-                log_warn "RetroPie basic_install failed (attempt $attempt/3) - retrying in 30s"
-            done
-        fi
-    fi
-
-    [ -x "$es_bin" ] || command -v emulationstation >/dev/null 2>&1 || log_warn "emulationstation binary not found where expected after basic_install"
+    sudo ./retropie_packages.sh setup basic_install || die "RetroPie basic_install failed"
+    [ -x /opt/retropie/supplementary/emulationstation/emulationstation ] || command -v emulationstation >/dev/null 2>&1 || log_warn "emulationstation binary not found where expected after basic_install"
     return 0
 }
 
 phase_emulators_install() {
     cd "$PI_HOME/RetroPie-Setup" || die "RetroPie-Setup missing"
     log "Installing MAME (lr-mame)"
-    if ! sudo ./retropie_packages.sh lr-mame _binary_; then
-        log_warn "No lr-mame binary available for this platform/OS combination - falling back to building lr-mame from source (this can take a while)"
-        sudo ./retropie_packages.sh lr-mame _source_ || die "lr-mame install failed (no binary available and source build also failed)"
-    fi
+    sudo ./retropie_packages.sh lr-mame _binary_ || die "lr-mame install failed"
 
+    local core sys
     IFS=',' read -ra cores <<< "$EMULATOR_CORES"
     for core in "${cores[@]}"; do
         [ -z "$core" ] && continue
@@ -665,6 +611,7 @@ phase_esde_retroarch_links() {
         [lr-picodrive]=picodrive
         [mupen64plus]=mupen64plus_next
     )
+    local core cores
     IFS=',' read -ra cores <<< "$EMULATOR_CORES"
     for core in "${cores[@]}"; do
         local so="${core_so[$core]:-}"
@@ -698,9 +645,10 @@ phase_themes_install() {
         [art-book-next]="https://github.com/anthonycaccese/art-book-next-es-de.git"
         [alekfull-nx]="https://github.com/anthonycaccese/alekfull-nx-es-de.git"
     )
-    for name in "${!theme_repos[@]}"; do
-        if [ ! -d "$name" ]; then
-            git clone --depth=1 "${theme_repos[$name]}" "$name" || log_warn "Failed to clone theme $name"
+    local theme_name
+    for theme_name in "${!theme_repos[@]}"; do
+        if [ ! -d "$theme_name" ]; then
+            git clone --depth=1 "${theme_repos[$theme_name]}" "$theme_name" || log_warn "Failed to clone theme $theme_name"
         fi
     done
     return 0
@@ -717,6 +665,7 @@ phase_theme_system_art() {
     fi
     local assets_base="https://raw.githubusercontent.com/Cr4zySh4rk/pi-arcade-setup/main/theme-art"
     local themes_dir="$PI_HOME/ES-DE/themes"
+    local variant
 
     _fetch_asset() {
         local url="$1" dest="$2"
