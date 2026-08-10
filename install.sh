@@ -70,6 +70,10 @@ APPLY_ESDE_QUITMENU_PATCH="${APPLY_ESDE_QUITMENU_PATCH:-true}"
 INSTALL_THEMES="${INSTALL_THEMES:-true}"
 ESDE_THEME_NAME="${ESDE_THEME_NAME:-artflix-revisited}"
 INITIAL_FRONTEND="${INITIAL_FRONTEND:-esde}"            # esde | classic
+# Console autologin + boot-time launch trigger (RetroPie's own "autostart"
+# module - see phase_autostart_setup). Off only makes sense if you intend
+# to wire up autostart some other way yourself.
+ENABLE_CONSOLE_AUTOSTART="${ENABLE_CONSOLE_AUTOSTART:-true}"
 
 # --- Controller hotkeys (brightness/volume) ------------------------------
 # Safe to leave on for generic hardware: the daemon auto-detects the
@@ -151,6 +155,7 @@ APPLY_ESDE_QUITMENU_PATCH=$APPLY_ESDE_QUITMENU_PATCH
 INSTALL_THEMES=$INSTALL_THEMES
 ESDE_THEME_NAME=$ESDE_THEME_NAME
 INITIAL_FRONTEND=$INITIAL_FRONTEND
+ENABLE_CONSOLE_AUTOSTART=$ENABLE_CONSOLE_AUTOSTART
 ENABLE_CONTROLLER_HOTKEYS=$ENABLE_CONTROLLER_HOTKEYS
 ALSA_CARD_INDEX=$ALSA_CARD_INDEX
 BTN_L3=$BTN_L3
@@ -763,6 +768,30 @@ EOF
 
     if [ ! -f "$PI_HOME/.frontend" ]; then
         echo "$INITIAL_FRONTEND" > "$PI_HOME/.frontend"
+    fi
+
+    if [ "$ENABLE_CONSOLE_AUTOSTART" = "true" ]; then
+        # `retropie_packages.sh setup basic_install` does NOT wire up boot
+        # autostart on its own - that's a separate, optional RetroPie
+        # module ("autostart") that's normally only enabled by hand via the
+        # RetroPie-Setup menu. Its enable_autostart function does two
+        # things (replicated here, matching its own scriptmodule source at
+        # RetroPie-Setup/scriptmodules/supplementary/autostart.sh):
+        #   1. `raspi-config nonint do_boot_behaviour B2` - console autologin
+        #   2. /etc/profile.d/10-retropie.sh - the actual trigger that runs
+        #      autostart.sh on tty1 login (not ~/.bashrc, despite older
+        #      documentation/folklore describing it that way).
+        # Without this, the Pi boots to a plain login prompt and nothing
+        # ever launches the frontend.
+        sudo raspi-config nonint do_boot_behaviour B2 || log_warn "Could not set console autologin via raspi-config"
+        sudo rm -f /etc/profile.d/10-emulationstation.sh
+        sudo tee /etc/profile.d/10-retropie.sh >/dev/null <<PROFEOF
+# launch our autostart apps (if we are on the correct tty and not in X)
+if [ "\`tty\`" = "/dev/tty1" ] && [ -z "\$DISPLAY" ] && [ "\$USER" = "$PI_USER" ]; then
+    bash "/opt/retropie/configs/all/autostart.sh"
+fi
+PROFEOF
+        log "Console autologin + boot autostart trigger enabled for $PI_USER"
     fi
     return 0
 }
