@@ -22,11 +22,25 @@ Don't prefix this with `sudo` — the script calls `sudo` itself for the specifi
 
 ## What to expect
 
-- Full run time is roughly **1.5–3 hours** on a Pi 4, most of it RetroPie's own `basic_install` and the ES-DE source build.
+- Full run time is roughly **1.5–2 hours of actual setup work**, but budget more like **half a day to overnight** if `lr-mame` has to build from source — see [Install time breakdown](#install-time-breakdown) below. It's unattended either way, so this doesn't need babysitting; SSH back in occasionally (or set up a scheduled check) to confirm it's progressing.
 - The Pi **reboots itself** at a couple of points (after the base OS update, and after applying display settings if `ENABLE_DSI_DISPLAY=true`). Your SSH session will drop — that's expected. The installer sets up a one-shot `systemd` service that automatically resumes the setup after each reboot, so you don't need to log back in and re-run anything. It removes that service once the whole build is done.
 - Progress and errors are logged to `/var/log/pi-arcade-setup.log` on the Pi. If you get disconnected, SSH back in and `tail -f /var/log/pi-arcade-setup.log` to watch progress.
 - The script is **safe to re-run**. Every phase is tracked in `/opt/pi-arcade-setup/state`; completed phases are skipped, so if something fails partway (flaky network, a package mirror hiccup) you can just run the same one-liner again.
 - By default it reboots into the finished arcade UI when everything is done (`AUTO_REBOOT_AT_END=true`).
+
+### Install time breakdown
+
+Timed end-to-end on the reference Pi (Pi 4, fresh flash) via the installer's own log timestamps:
+
+| Phase | Time | Notes |
+|---|---|---|
+| Base OS update + display setup | ~15 min | `apt full-upgrade` + one reboot. |
+| RetroPie core install (`basic_install`) | ~1h 20min | Once actually running uninterrupted — see caveat below. |
+| Emulator/MAME install | **~9 hours** | The dominant cost. This was `lr-mame` compiling from source on-device because no prebuilt binary was available for this platform/OS combo — MAME is a huge codebase and Pi-class hardware is slow at compiling it. If a binary install succeeds instead (depends on your exact OS/board), this phase is minutes, not hours. |
+| ES-DE build + everything else (themes, splash, autostart, hotkeys, polkit, custom menu) | ~20 min | |
+| **Total** | **~1.5–2 hours of real work, ~9+ hours unattended if MAME builds from source** | |
+
+That reference run's total wall-clock time was actually closer to 17 hours, but roughly 6 of those hours were an early stall/retry loop caused by a passwordless-sudo bug that's since been fixed in this script (see the sudo self-healing logic in `phase_preflight`) — it shouldn't recur on a fresh run. The 9-hour MAME source build is real compute, though, and will happen again on hardware/OS combos without a prebuilt `lr-mame` package.
 
 ## What it installs (phase by phase)
 
