@@ -55,6 +55,11 @@ CLASSIC_ES_SCREENROTATE="${CLASSIC_ES_SCREENROTATE:-3}" # SDL enum, classic ES c
 CLASSIC_ES_SCREENSIZE="${CLASSIC_ES_SCREENSIZE:-1280 800}"
 ESDE_THEME_ASPECT="${ESDE_THEME_ASPECT:-16:10}"
 CONSOLE_FONT_TWEAK="${CONSOLE_FONT_TWEAK:-$ENABLE_DSI_DISPLAY}"
+# RetroArch's own video_rotation (separate from SPLASH_TRANSFORM_TYPE/ES-DE's
+# --screenrotate - RetroArch has its own rotation convention entirely: the
+# value is <n> * 90 degrees counter-clockwise). Applied to both the global
+# config and the arcade/MAME system config in phase_video_rotation_setup.
+RETROARCH_VIDEO_ROTATION="${RETROARCH_VIDEO_ROTATION:-90}"
 SPLASH_TRANSFORM_TYPE="${SPLASH_TRANSFORM_TYPE:-90}"    # VLC --transform-type, only used if ENABLE_DSI_DISPLAY
 # Custom splash video. Defaults to the bundled reference-build splash
 # (splash/retro-splash.mp4 in this repo). NOTE: VLC's --video-filter=transform
@@ -157,6 +162,7 @@ CLASSIC_ES_SCREENROTATE=$CLASSIC_ES_SCREENROTATE
 CLASSIC_ES_SCREENSIZE=$CLASSIC_ES_SCREENSIZE
 ESDE_THEME_ASPECT=$ESDE_THEME_ASPECT
 CONSOLE_FONT_TWEAK=$CONSOLE_FONT_TWEAK
+RETROARCH_VIDEO_ROTATION=$RETROARCH_VIDEO_ROTATION
 SPLASH_TRANSFORM_TYPE=$SPLASH_TRANSFORM_TYPE
 SPLASH_VIDEO_URL=$SPLASH_VIDEO_URL
 DO_RPI_FIRMWARE_UPDATE=$DO_RPI_FIRMWARE_UPDATE
@@ -286,11 +292,39 @@ phase_preflight() {
 }
 
 phase_base_update() {
-    sudo raspi-config nonint do_change_locale "$LOCALE" 2>/dev/null || {
-        sudo sed -i "s/^# *\(${LOCALE} UTF-8\)/\1/" /etc/locale.gen 2>/dev/null || true
-        sudo locale-gen || true
-        sudo update-locale LANG="$LOCALE" || true
-    }
+    sudo sed -i "s/^# *\(${LOCALE} UTF-8\)/\1/" /etc/locale.gen 2>/dev/null || true
+    sudo locale-gen || true
+    # raspi-config's do_change_locale (and a plain update-locale) only ever
+    # set LANG, leaving LC_ALL and the individual LC_* categories unset.
+    # That's normally fine since unset LC_* falls back to LANG - but if an
+    # SSH client forwards a broken/incomplete LANG or LC_* value (a common
+    # terminal quirk; sshd's default `AcceptEnv LANG LC_*` lets it through),
+    # bash ends up spamming:
+    #   bash: warning: setlocale: LC_CTYPE: cannot change locale (UTF-8): No such file or directory
+    # LC_ALL has the highest precedence and overrides anything a client
+    # forwards, so setting it explicitly (in both /etc/default/locale and
+    # /etc/environment) sidesteps this regardless of what the SSH client sends.
+    local locale_lang="${LOCALE%%.*}"       # e.g. en_US
+    local locale_short="${locale_lang%%_*}" # e.g. en
+    sudo tee /etc/default/locale >/dev/null <<LOCEOF
+LANG=$LOCALE
+LANGUAGE=${locale_lang}:${locale_short}
+LC_CTYPE="$LOCALE"
+LC_NUMERIC="$LOCALE"
+LC_TIME="$LOCALE"
+LC_COLLATE="$LOCALE"
+LC_MONETARY="$LOCALE"
+LC_MESSAGES="$LOCALE"
+LC_PAPER="$LOCALE"
+LC_NAME="$LOCALE"
+LC_ADDRESS="$LOCALE"
+LC_TELEPHONE="$LOCALE"
+LC_MEASUREMENT="$LOCALE"
+LC_IDENTIFICATION="$LOCALE"
+LC_ALL=$LOCALE
+LOCEOF
+    grep -q "^LANG=$LOCALE" /etc/environment 2>/dev/null || echo "LANG=$LOCALE" | sudo tee -a /etc/environment >/dev/null
+    grep -q "^LC_ALL=$LOCALE" /etc/environment 2>/dev/null || echo "LC_ALL=$LOCALE" | sudo tee -a /etc/environment >/dev/null
     if [ -n "$TIMEZONE" ]; then
         sudo raspi-config nonint do_change_timezone "$TIMEZONE" 2>/dev/null || sudo timedatectl set-timezone "$TIMEZONE" 2>/dev/null || log_warn "Could not set timezone to $TIMEZONE"
     fi
@@ -420,6 +454,50 @@ phase_retroarch_autoconfig() {
     sudo cp -n "$preset_dir"/*.cfg "$active_dir"/ 2>/dev/null
     sudo chown "$PI_USER":"$PI_USER" "$active_dir"/*.cfg 2>/dev/null
     log "Populated RetroArch autoconfig directory with $(ls "$active_dir"/*.cfg 2>/dev/null | wc -l) controller profiles"
+    return 0
+}
+
+# Set the given key to the given value in a RetroArch cfg file - handles a
+# commented-out default, an existing set value, or the key being entirely
+# absent (appends it).
+_set_retroarch_key() {
+    local file="$1" key="$2" val="$3"
+    [ -f "$file" ] || return 0
+    if grep -q "^${key} *=" "$file"; then
+        sudo sed -i "s|^${key} *=.*|${key} = ${val}|" "$file"
+    elif grep -q "^# *${key} *=" "$file"; then
+        sudo sed -i "s|^# *${key} *=.*|${key} = ${val}|" "$file"
+    else
+        echo "${key} = ${val}" | sudo tee -a "$file" >/dev/null
+    fi
+}
+
+phase_video_rotation_setup() {
+    local all_cfg="/opt/retropie/configs/all/retroarch.cfg"
+    _set_retroarch_key "$all_cfg" "video_allow_rotate" "true"
+    _set_retroarch_key "$all_cfg" "video_rotation" "$RETROARCH_VIDEO_ROTATION"
+
+    # configs/arcade/retroarch.cfg #includes the global file above, and per
+    # its own header comment, keys placed *after* that #include line are
+    # ignored (RetroArch's config parser keeps the first assignment it
+    # sees) - so an override has to be inserted *above* the #include, not
+    # just appended to the end of the file.
+    local arcade_cfg="/opt/retropie/configs/arcade/retroarch.cfg"
+    if [ -f "$arcade_cfg" ]; then
+        if grep -q "^video_allow_rotate" "$arcade_cfg"; then
+            sudo sed -i "s|^video_allow_rotate.*|video_allow_rotate = true|" "$arcade_cfg"
+        else
+            sudo sed -i "/^#include/i video_allow_rotate = true" "$arcade_cfg"
+        fi
+        if grep -q "^video_rotation" "$arcade_cfg"; then
+            sudo sed -i "s|^video_rotation.*|video_rotation = $RETROARCH_VIDEO_ROTATION|" "$arcade_cfg"
+        else
+            sudo sed -i "/^#include/i video_rotation = $RETROARCH_VIDEO_ROTATION" "$arcade_cfg"
+        fi
+        log "Set video_allow_rotate=true, video_rotation=$RETROARCH_VIDEO_ROTATION in all/retroarch.cfg and arcade/retroarch.cfg"
+    else
+        log_warn "arcade/retroarch.cfg not found yet - set video_allow_rotate/video_rotation in all/retroarch.cfg only; the arcade system will still inherit it via #include"
+    fi
     return 0
 }
 
@@ -1456,6 +1534,7 @@ main() {
         retropie_install
         emulators_install
         retroarch_autoconfig
+        video_rotation_setup
         ftp_install
         disk_cleanup
         esde_build_deps
