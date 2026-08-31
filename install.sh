@@ -106,6 +106,28 @@ BTN_CIRCLE="${BTN_CIRCLE:-1}"
 BTN_TRIANGLE="${BTN_TRIANGLE:-3}"
 HOTKEY_STEP="${HOTKEY_STEP:-5}"
 
+# --- Addressable LED strip ---------------------------------------------------
+# WS2812B strip(s) on the reference build (two 14-LED strips wired in
+# parallel off one data line, so they mirror each other - 14 unique
+# addressable pixels total), driven via rpi_ws281x on GPIO21 (PCM_DOUT).
+# rpi_ws281x uses the Pi's PWM/PCM peripheral + DMA for genuine
+# hardware-timed output - the same class of approach WLED uses on ESP32
+# (RMT + DMA) rather than CPU bit-banging - which only works on pins wired
+# to that peripheral in silicon: GPIO 12/13/18/19 (PWM), 21 (PCM), or 10
+# (SPI0 MOSI). An earlier version of this build tried bit-banging GPIO4
+# directly (that's not one of those pins); it was unreliable on real
+# hardware and was dropped - see phase_led_strip_setup's comment for why.
+ENABLE_LED_STRIP="${ENABLE_LED_STRIP:-true}"
+LED_GPIO_PIN="${LED_GPIO_PIN:-21}"
+LED_COUNT="${LED_COUNT:-14}"
+# Upper bound the in-frontend LED Config tool can grow LED_COUNT to (it's
+# live-adjustable there, not just at install time - see led-config.py). The
+# strip driver is allocated for this many pixels once at startup regardless
+# of the live count, so it can go up or down instantly with no restart.
+LED_COUNT_MAX="${LED_COUNT_MAX:-150}"
+LED_DMA_CHANNEL="${LED_DMA_CHANNEL:-10}"
+LED_PWM_CHANNEL="${LED_PWM_CHANNEL:-0}"   # rpi_ws281x channel index: 0 for GPIO 12/18/21/10, 1 for GPIO 13/19
+
 AUTO_REBOOT_AT_END="${AUTO_REBOOT_AT_END:-true}"
 
 # --------------------------------------------------------------------------
@@ -182,6 +204,12 @@ BTN_X=$BTN_X
 BTN_CIRCLE=$BTN_CIRCLE
 BTN_TRIANGLE=$BTN_TRIANGLE
 HOTKEY_STEP=$HOTKEY_STEP
+ENABLE_LED_STRIP=$ENABLE_LED_STRIP
+LED_GPIO_PIN=$LED_GPIO_PIN
+LED_COUNT=$LED_COUNT
+LED_COUNT_MAX=$LED_COUNT_MAX
+LED_DMA_CHANNEL=$LED_DMA_CHANNEL
+LED_PWM_CHANNEL=$LED_PWM_CHANNEL
 AUTO_REBOOT_AT_END=$AUTO_REBOOT_AT_END
 EOF
 }
@@ -993,6 +1021,15 @@ $( [ "$ENABLE_CONTROLLER_HOTKEYS" = "true" ] && cat <<HOTKEY
 	</game>
 HOTKEY
 )
+$( [ "$ENABLE_LED_STRIP" = "true" ] && cat <<LEDCFG
+	<game>
+		<path>./ledconfig.rp</path>
+		<name>LED Config</name>
+		<desc>Set the LED strip's mode (solid, flash, breathe, wave, rainbow, chase), color, brightness, and animation speed.</desc>
+		<image>$icon_dir/configedit.png</image>
+	</game>
+LEDCFG
+)
 </gameList>
 EOF
     return 0
@@ -1497,6 +1534,572 @@ PYEOF
     return 0
 }
 
+phase_led_strip_setup() {
+    if [ "$ENABLE_LED_STRIP" != "true" ]; then
+        log "ENABLE_LED_STRIP=false, skipping"
+        return 0
+    fi
+    # rpi_ws281x is the standard hardware-DMA-timed WS2812 driver for the
+    # Pi - the direct equivalent of what WLED itself relies on (ESP32's RMT
+    # peripheral + DMA) rather than software bit-banging. It only works on
+    # the specific GPIOs wired to the SoC's PWM/PCM/SPI0 peripherals: 12,
+    # 13, 18, 19 (PWM), 21 (PCM), or 10 (SPI0 MOSI) - LED_GPIO_PIN must be
+    # one of these. An earlier version of this phase bit-banged GPIO4
+    # directly via pigpio/a custom C driver since that's where the
+    # reference build's strip was originally wired; that approach was
+    # dropped after live testing showed it was unreliable (confirmed
+    # root cause: GPIO4 has no PWM/PCM/SPI alternate function on the
+    # BCM2711 at all, so there's no hardware timing assist available for
+    # it, matching why WLED itself never bit-bangs this in software either).
+    # Installed for root specifically since led-strip.service runs as root
+    # (rpi_ws281x needs /dev/mem for DMA + clock manager access, not just
+    # /dev/gpiomem).
+    sudo python3 -m pip install rpi_ws281x --break-system-packages --root-user-action=ignore \
+        || { log_warn "rpi_ws281x install failed; skipping LED strip setup"; return 0; }
+
+    mkdir -p "$PI_HOME/scripts"
+    tee "$PI_HOME/scripts/led-strip.py" >/dev/null <<PYEOF
+#!/usr/bin/env python3
+"""
+WS2812B addressable LED strip daemon for pi-arcade-setup
+(https://github.com/Cr4zySh4rk/pi-arcade-setup).
+
+Drives the strip via rpi_ws281x, which uses the Pi's PWM/PCM peripheral +
+DMA to generate hardware-timed pulses - the same class of approach WLED
+itself uses on ESP32 (its RMT peripheral + DMA), rather than a CPU busy-loop
+bit-bang. This only works on GPIO$LED_GPIO_PIN because that's one of the
+few pins actually wired to that peripheral in silicon (12/13/18/19 for PWM,
+21 for PCM, 10 for SPI0 MOSI) - see the comment in phase_led_strip_setup in
+install.sh if you need to use a different pin.
+
+Reads the live effect config from CONFIG_FILE, written by the in-frontend
+"LED Config" tool (led-config.py) - polls it every frame (cheap mtime
+check) so color/brightness/speed/mode changes apply immediately, live,
+while led-config.py is open.
+"""
+import colorsys
+import json
+import math
+import os
+import time
+
+from rpi_ws281x import Color, PixelStrip
+
+GPIO = $LED_GPIO_PIN
+LED_COUNT_MAX = $LED_COUNT_MAX  # strip is always allocated at this size - see connect()
+LED_FREQ_HZ = 800000
+LED_DMA_CHANNEL = $LED_DMA_CHANNEL
+LED_CHANNEL = $LED_PWM_CHANNEL
+LED_INVERT = False
+CONFIG_FILE = "$PI_HOME/.led-strip-config.json"
+FPS = 40
+
+DEFAULT_CONFIG = {"power": True, "mode": "rainbow", "color": [255, 60, 0], "brightness": 70, "speed": 50, "led_count": $LED_COUNT}
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def scale(rgb, pct):
+    f = clamp(pct, 0, 100) / 100.0
+    return tuple(int(clamp(c, 0, 255) * f) for c in rgb)
+
+
+def connect():
+    # Always allocate for LED_COUNT_MAX, regardless of the *live* led_count
+    # in the config - rpi_ws281x needs its DMA buffer sized upfront and
+    # can't be resized on a running strip, so growing/shrinking led_count
+    # from the LED Config tool just changes how many of these pre-allocated
+    # pixels get lit each frame (see main()), with no restart needed.
+    #
+    # LED_BRIGHTNESS is fixed at 255 here - brightness is applied ourselves
+    # per-pixel in scale() instead, so the effect config's brightness value
+    # (0-100) is the single source of truth rather than fighting with the
+    # library's own separate brightness knob.
+    strip = PixelStrip(LED_COUNT_MAX, GPIO, LED_FREQ_HZ, LED_DMA_CHANNEL, LED_INVERT, 255, LED_CHANNEL)
+    strip.begin()
+    return strip
+
+
+def show(strip, pixels, live_count):
+    for i in range(LED_COUNT_MAX):
+        if i < live_count:
+            r, g, b = pixels[i]
+        else:
+            r, g, b = (0, 0, 0)  # blank out anything beyond the current live count
+        strip.setPixelColor(i, Color(int(clamp(r, 0, 255)), int(clamp(g, 0, 255)), int(clamp(b, 0, 255))))
+    strip.show()
+
+
+_last_mtime = None
+_cached_cfg = dict(DEFAULT_CONFIG)
+
+
+def load_config():
+    global _last_mtime, _cached_cfg
+    try:
+        mtime = os.path.getmtime(CONFIG_FILE)
+    except OSError:
+        return _cached_cfg
+    if mtime != _last_mtime:
+        try:
+            with open(CONFIG_FILE) as f:
+                data = json.load(f)
+            cfg = dict(DEFAULT_CONFIG)
+            cfg.update(data)
+            _cached_cfg = cfg
+            _last_mtime = mtime
+        except Exception:
+            pass
+    return _cached_cfg
+
+
+def render(mode, color, brightness, speed, t, led_count):
+    n = clamp(led_count, 1, LED_COUNT_MAX)
+    speed_f = clamp(speed, 0, 100) / 100.0
+
+    if mode == "off":
+        return [(0, 0, 0)] * n
+
+    if mode == "solid":
+        return [scale(color, brightness)] * n
+
+    if mode == "flash":
+        period = 1.4 - speed_f * 1.2  # 1.4s (slow) .. 0.2s (fast)
+        on = (t % period) < (period / 2)
+        return [scale(color, brightness) if on else (0, 0, 0)] * n
+
+    if mode == "breathe":
+        rate = 0.15 + speed_f * 1.35  # Hz
+        level = (math.sin(t * rate * 2 * math.pi) + 1) / 2
+        return [scale(color, brightness * level)] * n
+
+    if mode == "wave":
+        rate = 0.2 + speed_f * 2.3
+        pixels = []
+        for i in range(n):
+            phase = (i / max(1, n - 1)) * 2 * math.pi * 2 - t * rate * 2 * math.pi
+            level = (math.sin(phase) + 1) / 2
+            pixels.append(scale(color, brightness * (0.15 + 0.85 * level)))
+        return pixels
+
+    if mode == "rainbow":
+        rate = 0.05 + speed_f * 0.6
+        pixels = []
+        for i in range(n):
+            hue = ((i / n) + t * rate) % 1.0
+            r, g, b = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+            pixels.append(scale((int(r * 255), int(g * 255), int(b * 255)), brightness))
+        return pixels
+
+    if mode == "chase":
+        rate = 1.0 + speed_f * 14.0  # pixels/sec
+        tail = max(2, n // 4)
+        pos = (t * rate) % n
+        pixels = []
+        for i in range(n):
+            d = (pos - i) % n
+            level = 1.0 - (d / tail) if d < tail else 0.0
+            pixels.append(scale(color, brightness * level))
+        return pixels
+
+    return [(0, 0, 0)] * n
+
+
+def main():
+    strip = connect()
+    print(f"[led-strip] driving up to {LED_COUNT_MAX} LEDs on GPIO{GPIO} via rpi_ws281x (hardware-timed)")
+    t0 = time.monotonic()
+    try:
+        while True:
+            cfg = load_config()
+            live_count = clamp(int(cfg.get("led_count", LED_COUNT_MAX)), 1, LED_COUNT_MAX)
+            if not cfg.get("power", True):
+                show(strip, [(0, 0, 0)] * live_count, live_count)
+                time.sleep(0.2)
+                continue
+            t = time.monotonic() - t0
+            pixels = render(
+                cfg.get("mode", "solid"),
+                tuple(cfg.get("color", [255, 255, 255])),
+                cfg.get("brightness", 70),
+                cfg.get("speed", 50),
+                t,
+                live_count,
+            )
+            show(strip, pixels, live_count)
+            time.sleep(max(0.0, 1.0 / FPS))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            show(strip, [(0, 0, 0)] * LED_COUNT_MAX, LED_COUNT_MAX)
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+    chmod +x "$PI_HOME/scripts/led-strip.py"
+
+    if [ ! -f "$PI_HOME/.led-strip-config.json" ]; then
+        cat > "$PI_HOME/.led-strip-config.json" <<CFGEOF
+{"power": true, "mode": "rainbow", "color": [255, 60, 0], "brightness": 70, "speed": 50, "led_count": $LED_COUNT}
+CFGEOF
+    fi
+
+    sudo tee /etc/systemd/system/led-strip.service >/dev/null <<EOF
+[Unit]
+Description=WS2812B LED strip daemon (GPIO$LED_GPIO_PIN, rpi_ws281x)
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u $PI_HOME/scripts/led-strip.py
+Restart=always
+RestartSec=2
+User=root
+StandardOutput=append:/var/log/led-strip.log
+StandardError=append:/var/log/led-strip.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now led-strip.service
+    return 0
+}
+
+phase_led_config_tool() {
+    if [ "$ENABLE_LED_STRIP" != "true" ]; then
+        return 0
+    fi
+    mkdir -p "$PI_HOME/scripts"
+    tee "$PI_HOME/scripts/led-config.py" >/dev/null <<PYEOF
+#!/usr/bin/env python3
+"""
+Interactive LED strip configuration tool for pi-arcade-setup. Run from the
+RetroPie menu ("LED Config") or directly:
+    sudo python3 led-config.py
+Writes live to the config file the led-strip.py daemon polls, so changes
+apply to the physical strip immediately while this is open.
+
+Fully navigable by controller as well as keyboard: left stick (or D-pad, on
+controllers that report it as an axis) to move/adjust, X/Cross to confirm,
+Circle/B to exit - same button roles as the rest of the RetroPie menu.
+"""
+import curses
+import json
+import os
+import select
+import struct
+import sys
+
+CONFIG_FILE = "$PI_HOME/.led-strip-config.json"
+LED_COUNT_MAX = $LED_COUNT_MAX
+GPIO = $LED_GPIO_PIN
+
+JS_DEVICE = "/dev/input/js0"
+JS_EVENT_BUTTON = 0x01
+JS_EVENT_AXIS = 0x02
+JS_EVENT_INIT = 0x80
+EVENT_FORMAT = "IhBB"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+AXIS_THRESHOLD = 16000  # out of a signed 16-bit axis range (-32768..32767)
+BTN_CONFIRM = $BTN_X       # X / Cross / A - same role as the rest of the RetroPie menu
+BTN_BACK = $BTN_CIRCLE     # Circle / B - same role as the rest of the RetroPie menu
+
+MODES = ["solid", "flash", "breathe", "wave", "rainbow", "chase"]
+PRESETS = [
+    ("Red", (255, 0, 0)), ("Orange", (255, 60, 0)), ("Yellow", (255, 200, 0)),
+    ("Green", (0, 255, 0)), ("Cyan", (0, 255, 200)), ("Blue", (0, 80, 255)),
+    ("Purple", (160, 0, 255)), ("Pink", (255, 0, 120)), ("White", (255, 255, 255)),
+]
+
+DEFAULT_CONFIG = {"power": True, "mode": "rainbow", "color": [255, 60, 0], "brightness": 70, "speed": 50, "led_count": $LED_COUNT}
+
+COL_HEADER, COL_LABEL, COL_HINT, COL_GOOD, COL_BAD, COL_SEL = 1, 2, 3, 4, 5, 6
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE) as f:
+                cfg.update(json.load(f))
+        except Exception:
+            pass
+    cfg["color"] = list(cfg.get("color", DEFAULT_CONFIG["color"]))[:3]
+    cfg["led_count"] = clamp(int(cfg.get("led_count", DEFAULT_CONFIG["led_count"])), 1, LED_COUNT_MAX)
+    return cfg
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(cfg, f)
+    except Exception:
+        pass
+
+
+def cx(win, text):
+    _, w = win.getmaxyx()
+    return max(0, (w - len(text)) // 2)
+
+
+def safe_addstr(win, y, x, text, attr=0):
+    h, w = win.getmaxyx()
+    if 0 <= y < h:
+        try:
+            win.addstr(y, max(0, x), text[: max(0, w - x - 1)], attr)
+        except curses.error:
+            pass
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+ROWS = ["power", "mode", "led_count", "r", "g", "b", "preset", "brightness", "speed"]
+ROW_LABELS = {
+    "power": "Power", "mode": "Mode", "led_count": "LED count", "r": "Red", "g": "Green", "b": "Blue",
+    "preset": "Color preset", "brightness": "Brightness", "speed": "Speed",
+}
+
+
+def draw(win, cfg, sel, preset_idx, js_connected):
+    win.erase()
+    h, w = win.getmaxyx()
+    title = " LED STRIP CONFIGURATION "
+    safe_addstr(win, 1, cx(win, title), title, curses.color_pair(COL_HEADER) | curses.A_BOLD)
+    sub = f"WS2812B on GPIO{GPIO} - up to {LED_COUNT_MAX} LEDs"
+    safe_addstr(win, 2, cx(win, sub), sub, curses.A_DIM)
+
+    top = 5
+    for i, key in enumerate(ROWS):
+        y = top + i
+        is_sel = i == sel
+        prefix = "> " if is_sel else "  "
+        label = f"{prefix}{ROW_LABELS[key]:<14}"
+        if key == "power":
+            val = "ON" if cfg["power"] else "OFF"
+        elif key == "mode":
+            val = cfg["mode"].upper()
+        elif key == "led_count":
+            val = f"{cfg['led_count']:>3} / {LED_COUNT_MAX}"
+        elif key == "r":
+            val = f"{cfg['color'][0]:>3}"
+        elif key == "g":
+            val = f"{cfg['color'][1]:>3}"
+        elif key == "b":
+            val = f"{cfg['color'][2]:>3}"
+        elif key == "preset":
+            val = PRESETS[preset_idx][0]
+        elif key == "brightness":
+            val = f"{cfg['brightness']:>3}%"
+        elif key == "speed":
+            val = f"{cfg['speed']:>3}%"
+        attr = (curses.color_pair(COL_SEL) | curses.A_BOLD) if is_sel else curses.color_pair(COL_LABEL)
+        col = max(0, (w // 2) - 18)
+        safe_addstr(win, y, col, label, attr)
+        safe_addstr(win, y, col + 18, val, attr | (curses.A_BOLD if is_sel else 0))
+
+    color_line = f"RGB preview: ({cfg['color'][0]}, {cfg['color'][1]}, {cfg['color'][2]})"
+    safe_addstr(win, top + len(ROWS) + 1, cx(win, color_line), color_line, curses.A_DIM)
+
+    js_line = "Controller connected" if js_connected else "No controller detected - keyboard only"
+    safe_addstr(win, top + len(ROWS) + 2, cx(win, js_line), js_line, curses.color_pair(COL_GOOD if js_connected else COL_BAD) | curses.A_DIM)
+
+    footer1 = "UP/DOWN or stick: select   LEFT/RIGHT or stick: adjust"
+    footer2 = "ENTER/X: apply preset & toggle power   ESC/Circle: done - changes save automatically"
+    safe_addstr(win, h - 3, cx(win, footer1), footer1, curses.color_pair(COL_HINT))
+    safe_addstr(win, h - 2, cx(win, footer2), footer2, curses.A_DIM)
+    win.refresh()
+
+
+def open_joystick():
+    try:
+        return open(JS_DEVICE, "rb")
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def poll_action(stdscr, js_file, axis_state, timeout=0.08):
+    """Blocks up to `timeout` seconds for keyboard or joystick input, and
+    returns one of "up"/"down"/"left"/"right"/"confirm"/"back"/None.
+    axis_state tracks whether each stick axis is currently past the
+    threshold, so a held stick fires once per push rather than repeating
+    every poll - it must return to neutral before firing again."""
+    fds = [sys.stdin]
+    if js_file is not None:
+        fds.append(js_file)
+    try:
+        ready, _, _ = select.select(fds, [], [], timeout)
+    except (OSError, ValueError):
+        ready = []
+
+    if js_file is not None and js_file in ready:
+        data = js_file.read(EVENT_SIZE)
+        if data and len(data) == EVENT_SIZE:
+            _t, value, typ, number = struct.unpack(EVENT_FORMAT, data)
+            is_init = bool(typ & JS_EVENT_INIT)
+            typ &= ~JS_EVENT_INIT
+            if not is_init:
+                if typ == JS_EVENT_BUTTON and value == 1:
+                    if number == BTN_CONFIRM:
+                        return "confirm"
+                    if number == BTN_BACK:
+                        return "back"
+                elif typ == JS_EVENT_AXIS and number in (0, 1):
+                    past = abs(value) > AXIS_THRESHOLD
+                    was_past = axis_state.get(number, False)
+                    axis_state[number] = past
+                    if past and not was_past:
+                        if number == 0:
+                            return "right" if value > 0 else "left"
+                        else:
+                            return "down" if value > 0 else "up"
+
+    if sys.stdin in ready:
+        ch = stdscr.getch()
+        if ch == curses.KEY_UP:
+            return "up"
+        if ch == curses.KEY_DOWN:
+            return "down"
+        if ch == curses.KEY_LEFT:
+            return "left"
+        if ch == curses.KEY_RIGHT:
+            return "right"
+        if ch in (10, 13, ord(" ")):
+            return "confirm"
+        if ch in (27, ord("q"), ord("Q")):
+            return "back"
+    return None
+
+
+def run(stdscr):
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(COL_HEADER, curses.COLOR_YELLOW, -1)
+    curses.init_pair(COL_LABEL, curses.COLOR_CYAN, -1)
+    curses.init_pair(COL_HINT, curses.COLOR_YELLOW, -1)
+    curses.init_pair(COL_GOOD, curses.COLOR_GREEN, -1)
+    curses.init_pair(COL_BAD, curses.COLOR_RED, -1)
+    curses.init_pair(COL_SEL, curses.COLOR_GREEN, -1)
+    stdscr.nodelay(True)
+    stdscr.keypad(True)
+
+    js_file = open_joystick()
+    axis_state = {}
+
+    cfg = load_config()
+    sel = 0
+    preset_idx = 0
+    save_config(cfg)
+
+    try:
+        while True:
+            draw(stdscr, cfg, sel, preset_idx, js_file is not None)
+            action = poll_action(stdscr, js_file, axis_state)
+            if action is None:
+                continue
+
+            if action == "back":
+                break
+            elif action == "up":
+                sel = (sel - 1) % len(ROWS)
+            elif action == "down":
+                sel = (sel + 1) % len(ROWS)
+            else:
+                key = ROWS[sel]
+                step_dir = 1 if action == "right" else (-1 if action == "left" else 0)
+                if key == "power" and action in ("left", "right", "confirm"):
+                    cfg["power"] = not cfg["power"]
+                    save_config(cfg)
+                elif key == "mode" and step_dir:
+                    idx = MODES.index(cfg["mode"]) if cfg["mode"] in MODES else 0
+                    cfg["mode"] = MODES[(idx + step_dir) % len(MODES)]
+                    save_config(cfg)
+                elif key == "led_count" and step_dir:
+                    cfg["led_count"] = clamp(cfg["led_count"] + step_dir, 1, LED_COUNT_MAX)
+                    save_config(cfg)
+                elif key in ("r", "g", "b") and step_dir:
+                    i = {"r": 0, "g": 1, "b": 2}[key]
+                    cfg["color"][i] = clamp(cfg["color"][i] + step_dir * 5, 0, 255)
+                    save_config(cfg)
+                elif key == "preset":
+                    if step_dir:
+                        preset_idx = (preset_idx + step_dir) % len(PRESETS)
+                    if action == "confirm" or step_dir:
+                        cfg["color"] = list(PRESETS[preset_idx][1])
+                        save_config(cfg)
+                elif key == "brightness" and step_dir:
+                    cfg["brightness"] = clamp(cfg["brightness"] + step_dir * 5, 0, 100)
+                    save_config(cfg)
+                elif key == "speed" and step_dir:
+                    cfg["speed"] = clamp(cfg["speed"] + step_dir * 5, 0, 100)
+                    save_config(cfg)
+    finally:
+        if js_file is not None:
+            js_file.close()
+
+    return cfg
+
+
+def main():
+    cfg = curses.wrapper(run)
+    save_config(cfg)
+    print()
+    print("=" * 50)
+    print(" LED strip configuration saved:")
+    print(f"   Power:      {'ON' if cfg['power'] else 'OFF'}")
+    print(f"   Mode:       {cfg['mode']}")
+    print(f"   LED count:  {cfg['led_count']}")
+    print(f"   Color:      RGB({cfg['color'][0]}, {cfg['color'][1]}, {cfg['color'][2]})")
+    print(f"   Brightness: {cfg['brightness']}%")
+    print(f"   Speed:      {cfg['speed']}%")
+    print("=" * 50)
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+    chmod +x "$PI_HOME/scripts/led-config.py"
+
+    touch "$PI_HOME/RetroPie/retropiemenu/ledconfig.rp"
+
+    local menu_script="$PI_HOME/RetroPie-Setup/scriptmodules/supplementary/retropiemenu.sh"
+    if [ -f "$menu_script" ] && ! grep -q "ledconfig.rp)" "$menu_script"; then
+        sudo cp "$menu_script" "${menu_script}.bak.$(date +%s)"
+        sudo python3 - "$menu_script" "$PI_HOME" <<'PYEOF'
+import sys
+path, pi_home = sys.argv[1], sys.argv[2]
+text = open(path).read()
+anchor = "filemanager.rp)"
+idx = text.find(anchor)
+if idx == -1:
+    print("[ledconfig] anchor 'filemanager.rp)' not found in retropiemenu.sh; skipping menu wiring")
+    sys.exit(0)
+case_end = text.find(";;", idx)
+if case_end == -1:
+    print("[ledconfig] could not find end of filemanager.rp) case; skipping menu wiring")
+    sys.exit(0)
+insert_point = text.find("\n", case_end) + 1
+line_start = text.rfind("\n", 0, idx) + 1
+indent = text[line_start:idx]
+insert_block = f"{indent}ledconfig.rp)\n{indent}    python3 {pi_home}/scripts/led-config.py\n{indent}    ;;\n"
+new_text = text[:insert_point] + insert_block + text[insert_point:]
+open(path, "w").write(new_text)
+print("[ledconfig] wired into retropiemenu.sh")
+PYEOF
+    fi
+    return 0
+}
+
 phase_finalize() {
     log ""
     log "========================================================"
@@ -1549,6 +2152,8 @@ main() {
         polkit_fix
         controller_hotkeys
         hotkey_remap_tool
+        led_strip_setup
+        led_config_tool
         finalize
     )
 

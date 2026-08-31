@@ -63,6 +63,8 @@ That reference run's total wall-clock time was actually closer to 17 hours, but 
 17. **Polkit fix** — grants your user passwordless authorization to reboot/power off/suspend, which headless kiosk setups need (`sudo`'s `NOPASSWD` alone isn't enough — this is a separate polkit-layer permission).
 18. **Controller hotkey daemon** — holds L3+R3 while pressing Square/X/Triangle/Circle to adjust screen brightness and volume system-wide, regardless of what has input focus.
 19. **In-frontend "Hotkey Config" tool** — a full-screen wizard (reachable from the RetroPie Setup menu inside ES-DE, or `sudo python3 ~/scripts/hotkey-remap.py`) to re-capture your controller's button numbers without SSH.
+20. **LED strip daemon** — drives an addressable WS2812B strip via `rpi_ws281x` (hardware DMA-timed output, the same class of approach [WLED](https://kno.wled.ge) itself uses on ESP32 via its RMT peripheral, rather than CPU bit-banging) with six effects (solid, flash, breathe, wave, rainbow, chase), reading color/brightness/speed/LED-count live from a config file so changes from the LED Config tool apply instantly with no restart.
+21. **In-frontend "LED Config" tool** — a full-screen wizard (reachable from the RetroPie Setup menu inside ES-DE, or `sudo python3 ~/scripts/led-config.py`) to set the strip's effect, color, brightness, animation speed, and live LED count — fully navigable by controller (left stick to move/adjust, X/Cross to confirm, Circle/B to exit) as well as keyboard.
 
 ## Configuration
 
@@ -102,6 +104,12 @@ ENABLE_DSI_DISPLAY=false ENABLE_CONTROLLER_HOTKEYS=false \
 | `BTN_L3` / `BTN_R3` / `BTN_SQUARE` / `BTN_X` / `BTN_CIRCLE` / `BTN_TRIANGLE` | GP2040-CE mapping currently active on the reference build (`9`/`10`/`2`/`0`/`1`/`3`), captured live via the remap tool | Default joystick button numbers. Re-capture for your own controller with the in-frontend "Hotkey Config" tool after install — button numbering isn't standardized across controllers, and can shift even on the same controller across firmware/reconnects. |
 | `HOTKEY_STEP` | `5` | Brightness/volume step size per press, in percent. |
 | `AUTO_REBOOT_AT_END` | `true` | Reboot into the finished arcade UI once setup completes. |
+| `ENABLE_LED_STRIP` | `true` | Installs the WS2812B LED strip daemon and the in-frontend "LED Config" tool. |
+| `LED_GPIO_PIN` | `21` | Data pin for the strip. **Must** be one of GPIO 12/13/18/19 (PWM), 21 (PCM), or 10 (SPI0 MOSI) — the only pins with a hardware DMA-timed peripheral behind them; see [Known limitations](#known-limitations). |
+| `LED_COUNT` | `14` | Initial/default live pixel count (adjustable later from the LED Config tool without restarting). |
+| `LED_COUNT_MAX` | `150` | Upper bound the LED Config tool can grow the live count to — the strip driver allocates for this many pixels once at startup. |
+| `LED_DMA_CHANNEL` | `10` | DMA channel `rpi_ws281x` uses. Only change this if it conflicts with something else using DMA. |
+| `LED_PWM_CHANNEL` | `0` | `rpi_ws281x` channel index: `0` for GPIO 12/18/21/10, `1` for GPIO 13/19. |
 
 ## After install
 
@@ -120,6 +128,8 @@ ENABLE_DSI_DISPLAY=false ENABLE_CONTROLLER_HOTKEYS=false \
 - **The RetroPie-menu "Splash Screens" tool can silently drop the custom rotation flag.** `splashscreen.cfg`'s `--transform-type=$SPLASH_TRANSFORM_TYPE` is a hand-added option outside what that GUI tool manages: using it to pick/enable a splash video appears to regenerate the file and lose the custom flag (this happened on the reference Pi and was fixed by hand). If your splash video looks unrotated after using that menu, re-run `phase_splash_setup` logic manually or just re-apply the `CMD_OPTS` line shown in [install.sh](install.sh).
 - **`SPLASH_TRANSFORM_TYPE` only reliably rotates image splashes, not video ones.** Confirmed by running `vlc -vv` on the reference Pi: h264 video gets hardware-decoded straight to a DRM_PRIME buffer that VLC's `transform` video filter can't process (`Unsupported pixel size 0 (chroma DPV0)`), so VLC logs `removing all filters` and plays the video completely unrotated, regardless of `--transform-type`. This is why the bundled [`splash/retro-splash.mp4`](splash/retro-splash.mp4) has its correct orientation baked directly into the file instead (`ffmpeg -vf transpose=2`, a 90° counter-clockwise/270° clockwise correction for the source clip, verified visually on the reference Pi's actual panel). If you supply your own `SPLASH_VIDEO_URL`, pre-rotate the file the same way rather than relying on `SPLASH_TRANSFORM_TYPE` — it will silently have no effect on video.
 - Passwordless polkit reboot/power-off is deliberately granted to `PI_USER` (see below) — appropriate for a dedicated kiosk device, not for a Pi that's also used as a general multi-user machine.
+- **`LED_GPIO_PIN` must be one of GPIO 12, 13, 18, 19, 21, or 10.** These are the only pins on the BCM2711 actually wired in silicon to a PWM/PCM/SPI0 peripheral, which `rpi_ws281x` needs for hardware-DMA-timed output — the same class of approach [WLED](https://kno.wled.ge) itself relies on via ESP32's RMT peripheral (confirmed: WLED explicitly avoids pure software bit-banging for exactly this reason). An earlier version of this build tried driving the strip from GPIO4 via a custom CPU busy-loop bit-bang driver; it produced consistently wrong/flickering colors on real hardware regardless of how the software timing was tuned (three different implementations, including one deliberately 3x slower for more margin, all failed identically) - root-caused to GPIO4 having no such peripheral available at all, not a fixable software bug. If you need a pin outside that set, expect the same limitation.
+- **Two strips wired in parallel off one data line mirror each other**, not extend to more unique pixels. The reference build's two 14-LED strips share GPIO21, so `LED_COUNT`/`LED_COUNT_MAX` refer to the 14 *unique* addressable pixels both strips display identically — there's no way to address them independently over a single shared data line without daisy-chaining (strip A's data-out into strip B's data-in) instead of paralleling.
 
 ## Security notes
 
