@@ -1730,16 +1730,19 @@ def render(mode, color, brightness, speed, t, led_count):
         return pixels
 
     if mode == "color_wipe":
-        # Fills the strip one pixel at a time in the chosen color, then
-        # empties it the same way, looping.
+        # Fills the strip outward from the center in the chosen color, then
+        # empties back down to the center the same way, looping.
         rate = 3.0 + speed_f * 30.0  # pixels/sec
-        cycle = 2 * n
+        center = (n - 1) / 2.0
+        # +1 so the growing radius fully reaches (and clears) the end pixels
+        # even when the center falls between two LEDs (even LED counts).
+        max_radius = max(center, (n - 1) - center) + 1
+        cycle = 2 * max_radius
         pos = (t * rate) % cycle
-        filling = pos < n
-        lit = int(pos) if filling else n - int(pos - n)
+        radius = pos if pos < max_radius else cycle - pos
         pixels = []
         for i in range(n):
-            on = i < lit
+            on = abs(i - center) <= radius
             pixels.append(scale(color, brightness) if on else (0, 0, 0))
         return pixels
 
@@ -1779,13 +1782,17 @@ def render(mode, color, brightness, speed, t, led_count):
         # Lightweight flicker-fire simulation: a warm red/orange/yellow
         # ramp per pixel, with brightness driven by overlapping sine waves
         # (smooth flicker) plus light per-pixel randomness (crackle),
-        # hottest at the strip's start. Ignores the configured color -
-        # like rainbow, fire has its own fixed palette.
+        # hottest at the strip's center and cooler toward both ends.
+        # Ignores the configured color - like rainbow, fire has its own
+        # fixed palette.
         rate = 2.0 + speed_f * 10.0
         rng = random.Random(int(t * 30))  # coarse tick so crackle doesn't strobe every frame
+        center = (n - 1) / 2.0
+        max_dist = max(center, (n - 1) - center) or 1
         pixels = []
         for i in range(n):
-            base = 1.0 - (i / max(1, n - 1)) * 0.55  # hotter near the start
+            dist = abs(i - center)
+            base = 1.0 - (dist / max_dist) * 0.55  # hotter near the center
             flicker = (
                 math.sin(t * rate * 2 * math.pi + i * 0.9) * 0.2
                 + math.sin(t * rate * 4.3 * math.pi + i * 2.1) * 0.12
