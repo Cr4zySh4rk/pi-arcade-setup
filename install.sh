@@ -1025,7 +1025,7 @@ $( [ "$ENABLE_LED_STRIP" = "true" ] && cat <<LEDCFG
 	<game>
 		<path>./ledconfig.rp</path>
 		<name>LED Config</name>
-		<desc>Set the LED strip's mode (solid, flash, breathe, wave, rainbow, chase), color, brightness, and animation speed.</desc>
+		<desc>Set the LED strip's mode (solid, flash, breathe, wave, rainbow, chase, theater_chase, bounce, color_wipe, sparkle, confetti, fire), color, brightness, animation speed, and live LED count.</desc>
 		<image>$icon_dir/configedit.png</image>
 	</game>
 LEDCFG
@@ -1581,6 +1581,7 @@ import colorsys
 import json
 import math
 import os
+import random
 import time
 
 from rpi_ws281x import Color, PixelStrip
@@ -1704,6 +1705,100 @@ def render(mode, color, brightness, speed, t, led_count):
             pixels.append(scale(color, brightness * level))
         return pixels
 
+    if mode == "theater_chase":
+        # Classic marquee pattern: every 3rd pixel lit, the lit group
+        # shifting by one pixel per step.
+        rate = 2.0 + speed_f * 14.0  # steps/sec
+        step = int(t * rate) % 3
+        return [scale(color, brightness) if (i % 3 == step) else (0, 0, 0) for i in range(n)]
+
+    if mode == "bounce":
+        # A soft-edged lit segment ("Cylon"/Larson-scanner eye) sweeps back
+        # and forth between the two ends of the strip.
+        rate = 0.3 + speed_f * 3.2  # sweeps/sec across the full strip
+        span = max(1, n - 1)
+        # triangle wave 0..1..0 over one period, mapped across the strip
+        phase = (t * rate) % 2.0
+        frac = phase if phase <= 1.0 else 2.0 - phase
+        pos = frac * span
+        tail = max(1.5, n / 6)
+        pixels = []
+        for i in range(n):
+            d = abs(pos - i)
+            level = max(0.0, 1.0 - d / tail)
+            pixels.append(scale(color, brightness * level))
+        return pixels
+
+    if mode == "color_wipe":
+        # Fills the strip one pixel at a time in the chosen color, then
+        # empties it the same way, looping.
+        rate = 3.0 + speed_f * 30.0  # pixels/sec
+        cycle = 2 * n
+        pos = (t * rate) % cycle
+        filling = pos < n
+        lit = int(pos) if filling else n - int(pos - n)
+        pixels = []
+        for i in range(n):
+            on = i < lit
+            pixels.append(scale(color, brightness) if on else (0, 0, 0))
+        return pixels
+
+    if mode == "sparkle":
+        # Random pixels in the chosen color flash briefly against black.
+        # Reseeded on each discrete "tick" (not every frame) so a given
+        # instant looks the same across the couple of frames it spans,
+        # instead of pure per-frame noise.
+        rate = 4.0 + speed_f * 46.0  # ticks/sec
+        tick = int(t * rate)
+        rng = random.Random(tick)
+        density = 0.06 + speed_f * 0.10
+        pixels = []
+        for i in range(n):
+            lit = rng.random() < density
+            pixels.append(scale(color, brightness) if lit else (0, 0, 0))
+        return pixels
+
+    if mode == "confetti":
+        # Like sparkle, but each spark gets its own random hue instead of
+        # the configured color - livelier/more colorful.
+        rate = 4.0 + speed_f * 46.0
+        tick = int(t * rate)
+        rng = random.Random(tick * 7919 + 1)  # different stream than sparkle
+        density = 0.06 + speed_f * 0.10
+        pixels = []
+        for i in range(n):
+            if rng.random() < density:
+                hue = rng.random()
+                r, g, b = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+                pixels.append(scale((int(r * 255), int(g * 255), int(b * 255)), brightness))
+            else:
+                pixels.append((0, 0, 0))
+        return pixels
+
+    if mode == "fire":
+        # Lightweight flicker-fire simulation: a warm red/orange/yellow
+        # ramp per pixel, with brightness driven by overlapping sine waves
+        # (smooth flicker) plus light per-pixel randomness (crackle),
+        # hottest at the strip's start. Ignores the configured color -
+        # like rainbow, fire has its own fixed palette.
+        rate = 2.0 + speed_f * 10.0
+        rng = random.Random(int(t * 30))  # coarse tick so crackle doesn't strobe every frame
+        pixels = []
+        for i in range(n):
+            base = 1.0 - (i / max(1, n - 1)) * 0.55  # hotter near the start
+            flicker = (
+                math.sin(t * rate * 2 * math.pi + i * 0.9) * 0.2
+                + math.sin(t * rate * 4.3 * math.pi + i * 2.1) * 0.12
+            )
+            crackle = (rng.random() - 0.5) * 0.25
+            heat = clamp(base + flicker + crackle, 0.0, 1.0)
+            # heat -> color ramp: black -> red -> orange -> yellow
+            r = clamp(heat * 3.0, 0.0, 1.0)
+            g = clamp(heat * 3.0 - 1.0, 0.0, 1.0)
+            b = clamp(heat * 3.0 - 2.2, 0.0, 1.0)
+            pixels.append(scale((int(r * 255), int(g * 255), int(b * 200)), brightness))
+        return pixels
+
     return [(0, 0, 0)] * n
 
 
@@ -1812,7 +1907,10 @@ AXIS_THRESHOLD = 16000  # out of a signed 16-bit axis range (-32768..32767)
 BTN_CONFIRM = $BTN_X       # X / Cross / A - same role as the rest of the RetroPie menu
 BTN_BACK = $BTN_CIRCLE     # Circle / B - same role as the rest of the RetroPie menu
 
-MODES = ["solid", "flash", "breathe", "wave", "rainbow", "chase"]
+MODES = [
+    "solid", "flash", "breathe", "wave", "rainbow", "chase",
+    "theater_chase", "bounce", "color_wipe", "sparkle", "confetti", "fire",
+]
 PRESETS = [
     ("Red", (255, 0, 0)), ("Orange", (255, 60, 0)), ("Yellow", (255, 200, 0)),
     ("Green", (0, 255, 0)), ("Cyan", (0, 255, 200)), ("Blue", (0, 80, 255)),
@@ -1914,7 +2012,7 @@ def draw(win, cfg, sel, preset_idx, js_connected):
     safe_addstr(win, top + len(ROWS) + 2, cx(win, js_line), js_line, curses.color_pair(COL_GOOD if js_connected else COL_BAD) | curses.A_DIM)
 
     footer1 = "UP/DOWN or stick: select   LEFT/RIGHT or stick: adjust"
-    footer2 = "ENTER/X: apply preset & toggle power   ESC/Circle: done - changes save automatically"
+    footer2 = "Enter/A/X: apply preset & toggle power   ESC/B/Circle: done - changes save automatically"
     safe_addstr(win, h - 3, cx(win, footer1), footer1, curses.color_pair(COL_HINT))
     safe_addstr(win, h - 2, cx(win, footer2), footer2, curses.A_DIM)
     win.refresh()
