@@ -98,6 +98,11 @@ ENABLE_CONSOLE_AUTOSTART="${ENABLE_CONSOLE_AUTOSTART:-true}"
 # in-frontend "Hotkey Config" tool this script installs (see README).
 ENABLE_CONTROLLER_HOTKEYS="${ENABLE_CONTROLLER_HOTKEYS:-true}"
 ALSA_CARD_INDEX="${ALSA_CARD_INDEX:-0}"
+# Pins the aux/headphone jack as the default PipeWire/WirePlumber audio
+# output (see phase_audio_output_setup) - this build has no HDMI-audio
+# display, so HDMI should never be picked as the output even if something
+# later gets plugged into it.
+ENABLE_AUX_AUDIO_FORCE="${ENABLE_AUX_AUDIO_FORCE:-true}"
 BTN_L3="${BTN_L3:-9}"
 BTN_R3="${BTN_R3:-10}"
 BTN_SQUARE="${BTN_SQUARE:-2}"
@@ -127,6 +132,25 @@ LED_COUNT="${LED_COUNT:-14}"
 LED_COUNT_MAX="${LED_COUNT_MAX:-150}"
 LED_DMA_CHANNEL="${LED_DMA_CHANNEL:-10}"
 LED_PWM_CHANNEL="${LED_PWM_CHANNEL:-0}"   # rpi_ws281x channel index: 0 for GPIO 12/18/21/10, 1 for GPIO 13/19
+
+# --- MP3 player ---------------------------------------------------------------
+# Local music player (RetroPie menu -> "Music Player"), playing files from
+# MUSIC_DIR via VLC (python-vlc bindings). Runs as the normal Pi user - no
+# background service, it's a foreground tool like Hotkey Config/LED Config.
+ENABLE_MUSIC_PLAYER="${ENABLE_MUSIC_PLAYER:-true}"
+MUSIC_DIR="${MUSIC_DIR:-$PI_HOME/RetroPie/Music}"
+
+# --- Bluetooth speaker ---------------------------------------------------------
+# Turns the Pi into an always-on A2DP sink advertised as BT_SPEAKER_NAME, via
+# PipeWire/WirePlumber's native Bluetooth module (already the default audio
+# stack on this OS image - see phase_bt_speaker_setup for why bluealsa/
+# PulseAudio aren't used instead) plus a headless auto-accept pairing agent.
+# RetroPie menu -> "Bluetooth Audio" shows AVRCP now-playing metadata from
+# the connected phone and can send it play/pause/next/prev, car-head-unit
+# style. The A2DP sink itself keeps running in the background regardless of
+# whether that tool is open, same as the LED strip daemon.
+ENABLE_BT_SPEAKER="${ENABLE_BT_SPEAKER:-true}"
+BT_SPEAKER_NAME="${BT_SPEAKER_NAME:-RetroPieArcade}"
 
 AUTO_REBOOT_AT_END="${AUTO_REBOOT_AT_END:-true}"
 
@@ -197,6 +221,7 @@ INITIAL_FRONTEND=$INITIAL_FRONTEND
 ENABLE_CONSOLE_AUTOSTART=$ENABLE_CONSOLE_AUTOSTART
 ENABLE_CONTROLLER_HOTKEYS=$ENABLE_CONTROLLER_HOTKEYS
 ALSA_CARD_INDEX=$ALSA_CARD_INDEX
+ENABLE_AUX_AUDIO_FORCE=$ENABLE_AUX_AUDIO_FORCE
 BTN_L3=$BTN_L3
 BTN_R3=$BTN_R3
 BTN_SQUARE=$BTN_SQUARE
@@ -210,6 +235,10 @@ LED_COUNT=$LED_COUNT
 LED_COUNT_MAX=$LED_COUNT_MAX
 LED_DMA_CHANNEL=$LED_DMA_CHANNEL
 LED_PWM_CHANNEL=$LED_PWM_CHANNEL
+ENABLE_MUSIC_PLAYER=$ENABLE_MUSIC_PLAYER
+MUSIC_DIR=$MUSIC_DIR
+ENABLE_BT_SPEAKER=$ENABLE_BT_SPEAKER
+BT_SPEAKER_NAME=$BT_SPEAKER_NAME
 AUTO_REBOOT_AT_END=$AUTO_REBOOT_AT_END
 EOF
 }
@@ -935,83 +964,20 @@ EOF
 <?xml version="1.0"?>
 <gameList>
 	<game>
-		<path>./audiosettings.rp</path>
-		<name>Audio</name>
-		<desc>Configure audio settings. Choose default of auto, 3.5mm jack, or HDMI. Mixer controls, and apply default settings.</desc>
-		<image>$icon_dir/audiosettings.png</image>
-	</game>
-	<game>
-		<path>./bluetooth.rp</path>
-		<name>Bluetooth</name>
-		<desc>Register and connect to Bluetooth devices. Unregister and remove devices, and display registered and connected devices.</desc>
-		<image>$icon_dir/bluetooth.png</image>
-	</game>
-	<game>
-		<path>./configedit.rp</path>
-		<name>Configuration Editor</name>
-		<desc>Change common RetroArch options, and manually edit RetroArch configs, global configs, and non-RetroArch configs.</desc>
-		<image>$icon_dir/configedit.png</image>
-	</game>
-	<game>
-		<path>./esthemes.rp</path>
-		<name>ES Themes</name>
-		<desc>Install, uninstall, or update EmulationStation themes.</desc>
-		<image>$icon_dir/esthemes.png</image>
-	</game>
-	<game>
-		<path>./filemanager.rp</path>
-		<name>File Manager</name>
-		<desc>Basic ASCII file manager for Linux allowing you to browse, copy, delete, and move files.</desc>
-		<image>$icon_dir/filemanager.png</image>
-	</game>
-	<game>
-		<path>./raspiconfig.rp</path>
-		<name>Raspi-Config</name>
-		<desc>Change user password, boot options, internationalization, camera, overclock, overscan, memory split, SSH and more.</desc>
-		<image>$icon_dir/raspiconfig.png</image>
-	</game>
-	<game>
-		<path>./retroarch.rp</path>
-		<name>Retroarch</name>
-		<desc>Launches the RetroArch GUI so you can change RetroArch options.</desc>
-		<image>$icon_dir/retroarch.png</image>
-	</game>
-	<game>
-		<path>./retronetplay.rp</path>
-		<name>RetroArch Net Play</name>
-		<desc>Set up RetroArch Netplay options, choose host or client, port, host IP, delay frames, and your nickname.</desc>
-		<image>$icon_dir/retronetplay.png</image>
-	</game>
-	<game>
-		<path>./rpsetup.rp</path>
-		<name>RetroPie Setup</name>
-		<desc>Install RetroPie from binary or source, install experimental packages, additional drivers, edit Samba shares, custom scraper, and more.</desc>
-		<image>$icon_dir/rpsetup.png</image>
-	</game>
-	<game>
-		<path>./runcommand.rp</path>
-		<name>Run Command Configuration</name>
-		<desc>Change what appears on the runcommand screen.</desc>
-		<image>$icon_dir/runcommand.png</image>
-	</game>
-	<game>
 		<path>./showip.rp</path>
 		<name>Show IP</name>
 		<desc>Displays your current IP address and other network information.</desc>
 		<image>$icon_dir/showip.png</image>
 	</game>
+$( [ "$ENABLE_BT_SPEAKER" = "true" ] && cat <<BTPAIR
 	<game>
-		<path>./splashscreen.rp</path>
-		<name>Splash Screens</name>
-		<desc>Enable or disable the splashscreen on RetroPie boot.</desc>
-		<image>$icon_dir/splashscreen.png</image>
+		<path>./btpair.rp</path>
+		<name>Bluetooth</name>
+		<desc>Scan for and pair wireless controllers (or any Bluetooth device) - just select one and press confirm, pairing is accepted automatically.</desc>
+		<image>$icon_dir/bluetooth.png</image>
 	</game>
-	<game>
-		<path>./wifi.rp</path>
-		<name>WiFi</name>
-		<desc>Connect to or disconnect from a WiFi network and configure WiFi settings.</desc>
-		<image>$icon_dir/wifi.png</image>
-	</game>
+BTPAIR
+)
 $( [ "$ENABLE_CONTROLLER_HOTKEYS" = "true" ] && cat <<HOTKEY
 	<game>
 		<path>./hotkeyconfig.rp</path>
@@ -1020,6 +986,24 @@ $( [ "$ENABLE_CONTROLLER_HOTKEYS" = "true" ] && cat <<HOTKEY
 		<image>$icon_dir/configedit.png</image>
 	</game>
 HOTKEY
+)
+$( [ "$ENABLE_MUSIC_PLAYER" = "true" ] && cat <<MUSICPLAYER
+	<game>
+		<path>./musicplayer.rp</path>
+		<name>Audio Player</name>
+		<desc>Browse and play music from $MUSIC_DIR. Shows the current track, artist, and progress, fully controllable with the controller.</desc>
+		<image>$icon_dir/audiosettings.png</image>
+	</game>
+MUSICPLAYER
+)
+$( [ "$ENABLE_BT_SPEAKER" = "true" ] && cat <<BTAUDIO
+	<game>
+		<path>./btaudio.rp</path>
+		<name>Bluetooth Player</name>
+		<desc>Pair a phone to "$BT_SPEAKER_NAME" and stream music to the arcade's speakers. Shows the connected device's now-playing track, car-stereo style, and lets the controller play/pause/skip.</desc>
+		<image>$icon_dir/bluetooth.png</image>
+	</game>
+BTAUDIO
 )
 $( [ "$ENABLE_LED_STRIP" = "true" ] && cat <<LEDCFG
 	<game>
@@ -1030,6 +1014,24 @@ $( [ "$ENABLE_LED_STRIP" = "true" ] && cat <<LEDCFG
 	</game>
 LEDCFG
 )
+	<game>
+		<path>./wifigate.rp</path>
+		<name>Wifi settings</name>
+		<desc>Connect to a WiFi network. Asks first whether a keyboard is plugged in (needed to type the network name and password) before opening the configurator.</desc>
+		<image>$icon_dir/wifi.png</image>
+	</game>
+	<game>
+		<path>./avsettings.rp</path>
+		<name>Audio settings</name>
+		<desc>Switch the audio output between the 3.5mm jack and HDMI, and adjust master volume/mute.</desc>
+		<image>$icon_dir/audiosettings.png</image>
+	</game>
+	<game>
+		<path>./ftpsettings.rp</path>
+		<name>FTP settings</name>
+		<desc>Turn the FTP file transfer server on or off.</desc>
+		<image>$icon_dir/filemanager.png</image>
+	</game>
 </gameList>
 EOF
     return 0
@@ -2205,6 +2207,2499 @@ PYEOF
     return 0
 }
 
+phase_audio_output_setup() {
+    if [ "$ENABLE_AUX_AUDIO_FORCE" != "true" ]; then
+        log "ENABLE_AUX_AUDIO_FORCE=false, skipping"
+        return 0
+    fi
+    # This build drives its display over DSI (no HDMI audio capability), but
+    # the Pi's HDMI ports still expose PipeWire/ALSA sinks the moment
+    # anything gets plugged into them, and WirePlumber could then pick one
+    # as the default output instead of the 3.5mm jack. Pin the aux/
+    # headphone sink (the bcm2835 "mailbox" audio interface - the onboard
+    # analog jack on every Pi model that has one) as the default via
+    # wpctl, which persists the choice by node name (not a reboot-unstable
+    # numeric id) across reboots - so this survives even if a monitor with
+    # HDMI audio gets connected later.
+    local uid
+    uid="$(id -u "$PI_USER")"
+    sudo -u "$PI_USER" XDG_RUNTIME_DIR="/run/user/$uid" python3 - <<'PYEOF' || log_warn "could not select aux audio output (no headphone sink found?)"
+import re
+import subprocess
+import sys
+
+out = subprocess.run(["wpctl", "status"], capture_output=True, text=True).stdout
+in_sinks = False
+sink_ids = []
+for line in out.splitlines():
+    if "Sinks:" in line:
+        in_sinks = True
+        continue
+    if in_sinks:
+        if "Sources:" in line:
+            break
+        m = re.search(r"(\d+)\.\s", line)
+        if m:
+            sink_ids.append(m.group(1))
+
+target = None
+for sid in sink_ids:
+    info = subprocess.run(["wpctl", "inspect", sid], capture_output=True, text=True).stdout
+    if "mailbox" in info or "bcm2835 Headphones" in info:
+        target = sid
+        break
+
+if not target:
+    print("[audio] no aux/headphone sink found among:", sink_ids, file=sys.stderr)
+    sys.exit(1)
+
+subprocess.run(["wpctl", "set-default", target], check=True)
+print(f"[audio] default output set to aux/headphone jack (sink {target})")
+PYEOF
+    return 0
+}
+
+phase_music_player_setup() {
+    if [ "$ENABLE_MUSIC_PLAYER" != "true" ]; then
+        log "ENABLE_MUSIC_PLAYER=false, skipping"
+        return 0
+    fi
+    # Installed system-wide (sudo), not just for the calling user: the
+    # RetroPie menu actually launches this tool as root (retropiemenu.sh's
+    # dispatch runs under the outer `sudo openvt ...` from the custom
+    # system's <command>, regardless of whether the case entry itself says
+    # sudo), so a user-local `pip install` here would be invisible to it at
+    # runtime even though it works fine when tested directly as the Pi user.
+    sudo python3 -m pip install python-vlc mutagen --break-system-packages --root-user-action=ignore \
+        || { log_warn "python-vlc/mutagen install failed; skipping Music Player setup"; return 0; }
+
+    mkdir -p "$PI_HOME/scripts" "$MUSIC_DIR"
+
+    # Pre-created (and thus pi-owned) up front - this tool actually runs as
+    # root via the RetroPie menu (see the pip-install comment above), and a
+    # config file *first created* by a root process would end up root-owned,
+    # silently breaking writes if the tool is later also run directly as
+    # the Pi user over SSH.
+    if [ ! -f "$PI_HOME/.music-player-config.json" ]; then
+        cat > "$PI_HOME/.music-player-config.json" <<CFGEOF
+{"volume": 70, "last_index": 0}
+CFGEOF
+    fi
+
+    tee "$PI_HOME/scripts/music-player.py" >/dev/null <<PYEOF
+#!/usr/bin/env python3
+"""
+Apple-Music-style local MP3/FLAC/OGG player for pi-arcade-setup. Run from
+the RetroPie menu ("Music Player") or directly:
+    python3 music-player.py
+Plays audio files from MUSIC_DIR via VLC (python-vlc bindings), reading
+ID3/FLAC/OGG tags with mutagen when available (falls back to filenames).
+
+Fully navigable by controller as well as keyboard: left stick (or D-pad, on
+controllers that report it as an axis) to move/adjust, X/Cross to confirm,
+Circle/B to exit - same button roles as the rest of the RetroPie menu.
+"""
+import curses
+import json
+import os
+import select
+import struct
+import subprocess
+import sys
+import time
+
+PI_HOME = "$PI_HOME"
+MUSIC_DIR = "$MUSIC_DIR"
+CONFIG_FILE = "$PI_HOME/.music-player-config.json"
+EXTENSIONS = (".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".aac", ".wma", ".opus")
+
+JS_DEVICE = "/dev/input/js0"
+JS_EVENT_BUTTON = 0x01
+JS_EVENT_AXIS = 0x02
+JS_EVENT_INIT = 0x80
+EVENT_FORMAT = "IhBB"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+AXIS_THRESHOLD = 16000  # out of a signed 16-bit axis range (-32768..32767)
+BTN_CONFIRM = $BTN_X       # X / Cross / A - same role as the rest of the RetroPie menu
+BTN_BACK = $BTN_CIRCLE     # Circle / B - same role as the rest of the RetroPie menu
+
+DEFAULT_CONFIG = {"last_index": 0}
+
+COL_HEADER, COL_LABEL, COL_HINT, COL_GOOD, COL_BAD, COL_SEL, COL_ACCENT = 1, 2, 3, 4, 5, 6, 7
+
+try:
+    import vlc
+    VLC_AVAILABLE = True
+except Exception:
+    VLC_AVAILABLE = False
+
+try:
+    from mutagen import File as MutagenFile
+    MUTAGEN_AVAILABLE = True
+except Exception:
+    MUTAGEN_AVAILABLE = False
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def cx(win, text):
+    _, w = win.getmaxyx()
+    return max(0, (w - len(text)) // 2)
+
+
+def cx_in(width, text):
+    return max(0, (width - len(text)) // 2)
+
+
+def safe_addstr(win, y, x, text, attr=0):
+    h, w = win.getmaxyx()
+    if 0 <= y < h:
+        try:
+            win.addstr(y, max(0, x), text[: max(0, w - x - 1)], attr)
+        except curses.error:
+            pass
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE) as f:
+                cfg.update(json.load(f))
+        except Exception:
+            pass
+    return cfg
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(cfg, f)
+    except Exception:
+        pass
+
+
+def _wpctl_env():
+    """wpctl talks to the calling user's own PipeWire session over
+    $XDG_RUNTIME_DIR - but this tool actually runs as root when launched
+    from the RetroPie menu (see the pip-install comment above), which has
+    no PipeWire session of its own. Point it at the Pi user's session
+    (found via who owns their home directory, not a hardcoded uid) instead
+    of whatever - if anything - root's own XDG_RUNTIME_DIR resolves to."""
+    env = dict(os.environ)
+    try:
+        env["XDG_RUNTIME_DIR"] = f"/run/user/{os.stat(PI_HOME).st_uid}"
+    except Exception:
+        pass
+    return env
+
+
+def get_system_volume():
+    """Reads the Pi's actual output volume via wpctl - the same volume the
+    hardware brightness/volume hotkeys and every other pi-arcade-setup tool
+    control, so what's shown here always matches reality (unlike a
+    per-player software volume, which would drift out of sync with the
+    hotkeys and not reflect what you actually hear)."""
+    try:
+        out = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"],
+                              capture_output=True, text=True, timeout=2, env=_wpctl_env()).stdout
+        parts = out.strip().split()
+        if len(parts) >= 2:
+            vol = int(round(float(parts[1]) * 100))
+            return clamp(vol, 0, 100), "MUTED" in out
+    except Exception:
+        pass
+    return None, False
+
+
+def set_system_volume_step(step):
+    try:
+        sign = "+" if step > 0 else "-"
+        subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{abs(step)}%{sign}"],
+                        capture_output=True, timeout=2, env=_wpctl_env())
+    except Exception:
+        pass
+
+
+def humanize(path):
+    base = os.path.splitext(os.path.basename(path))[0]
+    base = base.replace("_", " ").replace("-", " - ")
+    return " ".join(base.split())
+
+
+def read_tags(path):
+    title, artist, album = humanize(path), "", ""
+    if MUTAGEN_AVAILABLE:
+        try:
+            f = MutagenFile(path, easy=True)
+            if f is not None:
+                if f.get("title"):
+                    title = str(f["title"][0])
+                if f.get("artist"):
+                    artist = str(f["artist"][0])
+                if f.get("album"):
+                    album = str(f["album"][0])
+        except Exception:
+            pass
+    return title, artist, album
+
+
+def scan_library(root):
+    tracks = []
+    if not os.path.isdir(root):
+        return tracks
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            if fn.lower().endswith(EXTENSIONS):
+                path = os.path.join(dirpath, fn)
+                title, artist, album = read_tags(path)
+                tracks.append({"path": path, "title": title, "artist": artist, "album": album})
+    tracks.sort(key=lambda tr: (tr["artist"].lower(), tr["album"].lower(), tr["title"].lower()))
+    return tracks
+
+
+def fmt_time(ms):
+    if ms is None or ms < 0:
+        return "--:--"
+    s = int(ms / 1000)
+    return f"{s // 60:02d}:{s % 60:02d}"
+
+
+def marquee(text, width, t, speed=3.0):
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text.center(width)
+    pad = text + "     " + text
+    offset = int(t * speed) % (len(text) + 5)
+    return pad[offset: offset + width]
+
+
+def open_joystick():
+    try:
+        return open(JS_DEVICE, "rb")
+    except (FileNotFoundError, OSError):
+        return None
+
+
+CONFIRM_DEBOUNCE_S = 0.25
+# Guards "confirm"/"back" specifically (not directional movement) against
+# switch/contact bounce on cheap arcade buttons and joystick encoders, which
+# can report two or more rapid press events for what is physically a single
+# tap. Without this, a bounced confirm press toggles play/pause twice in
+# quick succession - looking, from the user's side, like the button "did
+# nothing" on the second real press (it actually played, paused, and
+# resumed all within one press). Directional actions don't need this: they
+# already debounce via the axis-crossing edge check below, and repeating
+# them on a held button/key is the desired behavior for menu navigation.
+
+
+def poll_action(stdscr, js_file, axis_state, action_debounce, timeout=0.1):
+    """Blocks up to `timeout` seconds for keyboard or joystick input, and
+    returns one of "up"/"down"/"left"/"right"/"confirm"/"back"/None.
+    `action_debounce` is a dict (persisted by the caller across calls) used
+    to suppress bounced repeats of "confirm"/"back"."""
+    fds = [sys.stdin]
+    if js_file is not None:
+        fds.append(js_file)
+    try:
+        ready, _, _ = select.select(fds, [], [], timeout)
+    except (OSError, ValueError):
+        ready = []
+
+    action = None
+
+    if js_file is not None and js_file in ready:
+        data = js_file.read(EVENT_SIZE)
+        if data and len(data) == EVENT_SIZE:
+            _t, value, typ, number = struct.unpack(EVENT_FORMAT, data)
+            is_init = bool(typ & JS_EVENT_INIT)
+            typ &= ~JS_EVENT_INIT
+            if not is_init:
+                if typ == JS_EVENT_BUTTON and value == 1:
+                    if number == BTN_CONFIRM:
+                        action = "confirm"
+                    elif number == BTN_BACK:
+                        action = "back"
+                elif typ == JS_EVENT_AXIS and number in (0, 1):
+                    past = abs(value) > AXIS_THRESHOLD
+                    was_past = axis_state.get(number, False)
+                    axis_state[number] = past
+                    if past and not was_past:
+                        if number == 0:
+                            return "right" if value > 0 else "left"
+                        else:
+                            return "down" if value > 0 else "up"
+
+    if action is None and sys.stdin in ready:
+        ch = stdscr.getch()
+        if ch == curses.KEY_UP:
+            return "up"
+        if ch == curses.KEY_DOWN:
+            return "down"
+        if ch == curses.KEY_LEFT:
+            return "left"
+        if ch == curses.KEY_RIGHT:
+            return "right"
+        if ch in (10, 13, ord(" ")):
+            action = "confirm"
+        elif ch in (27, ord("q"), ord("Q")):
+            action = "back"
+
+    if action in ("confirm", "back"):
+        now = time.monotonic()
+        if now - action_debounce.get(action, 0.0) < CONFIRM_DEBOUNCE_S:
+            return None
+        action_debounce[action] = now
+
+    return action
+
+
+class Player:
+    """Thin wrapper around python-vlc for single-track audio playback.
+    Runs at a fixed 100% internal volume - actual loudness is controlled
+    entirely by the system mixer (see get_system_volume/
+    set_system_volume_step) so it's the same volume the hardware hotkeys
+    and every other pi-arcade-setup tool control, not a separate
+    per-player level that can drift out of sync with them."""
+
+    def __init__(self):
+        self.instance = vlc.Instance("--no-video", "--quiet")
+        self.mp = self.instance.media_player_new()
+        self.mp.audio_set_volume(100)
+        # Tracked ourselves rather than solely inferred from
+        # mp.get_state(): libVLC's own pause() *toggles*, and get_state()
+        # can briefly report "Opening"/"Buffering" (neither Playing nor
+        # Paused) right after play()/load(), which made a confirm press
+        # that landed in that window silently do the wrong thing. Explicit
+        # set_pause(0/1) plus our own intent flag makes play/pause
+        # deterministic instead of racing VLC's transitional states.
+        self._wants_playing = False
+
+    def load(self, path):
+        media = self.instance.media_new(path)
+        self.mp.set_media(media)
+        self._wants_playing = False
+
+    def play(self):
+        self.mp.play()
+        self._wants_playing = True
+
+    def pause(self):
+        self.mp.set_pause(1)
+        self._wants_playing = False
+
+    def toggle_play_pause(self):
+        if self._wants_playing:
+            self.pause()
+        else:
+            self.play()
+
+    def stop(self):
+        self.mp.stop()
+        self._wants_playing = False
+
+    def is_playing(self):
+        return self._wants_playing
+
+    def is_ended(self):
+        return self.mp.get_state() in (vlc.State.Ended, vlc.State.Error)
+
+    def get_time(self):
+        return self.mp.get_time()
+
+    def get_length(self):
+        return self.mp.get_length()
+
+    def release(self):
+        try:
+            self.mp.stop()
+            self.mp.release()
+            self.instance.release()
+        except Exception:
+            pass
+
+
+def draw(win, tracks, sel, now_idx, player, vol, muted, js_connected, t):
+    win.erase()
+    h, w = win.getmaxyx()
+
+    title_bar = "♪  M U S I C   P L A Y E R  ♪"
+    safe_addstr(win, 0, cx(win, title_bar), title_bar, curses.color_pair(COL_HEADER) | curses.A_BOLD)
+
+    card_w = min(w - 4, 66)
+    card_x = max(0, (w - card_w) // 2)
+    top = 2
+    card_h = 8
+
+    safe_addstr(win, top, card_x, "┌" + "─" * (card_w - 2) + "┐", curses.color_pair(COL_ACCENT))
+    for row in range(1, card_h):
+        safe_addstr(win, top + row, card_x, "│", curses.color_pair(COL_ACCENT))
+        safe_addstr(win, top + row, card_x + card_w - 1, "│", curses.color_pair(COL_ACCENT))
+    safe_addstr(win, top + card_h, card_x, "└" + "─" * (card_w - 2) + "┘", curses.color_pair(COL_ACCENT))
+
+    inner_w = card_w - 4
+    playing = bool(player and player.is_playing())
+    if now_idx is not None and 0 <= now_idx < len(tracks):
+        tr = tracks[now_idx]
+        title_line = marquee(tr["title"], inner_w, t) if playing else tr["title"].center(inner_w)[:inner_w]
+        sub = tr["artist"] + ("  •  " + tr["album"] if tr["album"] else "") if tr["artist"] else tr["album"]
+        state = "▶ Playing" if playing else "❚❚ Paused"
+        elapsed = player.get_time() if player else -1
+        total = player.get_length() if player else -1
+    else:
+        title_line = "Select a track and press Enter/X".center(inner_w)[:inner_w]
+        sub = ""
+        state = "■ Stopped"
+        elapsed, total = -1, -1
+
+    safe_addstr(win, top + 2, card_x + 2, title_line, curses.color_pair(COL_LABEL) | curses.A_BOLD)
+    safe_addstr(win, top + 3, card_x + 2, sub.center(inner_w)[:inner_w], curses.A_DIM)
+
+    bar_w = max(4, inner_w - 12)
+    if total and total > 0 and elapsed is not None and elapsed >= 0:
+        frac = clamp(elapsed / total, 0.0, 1.0)
+        filled = int(frac * bar_w)
+        bar = "━" * filled + "●" + "─" * max(0, bar_w - filled - 1)
+    else:
+        bar = "─" * bar_w
+    prog_line = f"{fmt_time(elapsed):>5} {bar} {fmt_time(total):<5}"
+    safe_addstr(win, top + 5, card_x + 2 + cx_in(inner_w, prog_line), prog_line, curses.color_pair(COL_LABEL))
+
+    ctrl_line = f"◄◄        {state}        ►►"
+    ctrl_attr = curses.color_pair(COL_GOOD if playing else COL_HINT) | curses.A_BOLD
+    safe_addstr(win, top + 7, card_x + cx_in(inner_w, ctrl_line), ctrl_line, ctrl_attr)
+
+    list_top = top + card_h + 2
+    header = "── Library " + "─" * max(0, inner_w - 10)
+    safe_addstr(win, list_top, card_x + 2, header[:inner_w], curses.A_DIM)
+
+    list_h = max(1, h - list_top - 4)
+    if len(tracks) <= list_h:
+        start = 0
+    else:
+        start = clamp(sel - list_h // 2, 0, max(0, len(tracks) - list_h))
+    for row in range(list_h):
+        idx = start + row
+        y = list_top + 1 + row
+        if idx >= len(tracks):
+            break
+        tr = tracks[idx]
+        marker = "▸ " if idx == sel else "  "
+        playing_marker = "♪ " if idx == now_idx else "  "
+        label = f"{marker}{playing_marker}{tr['title']}"
+        if tr["artist"]:
+            label += f"  —  {tr['artist']}"
+        attr = (curses.color_pair(COL_SEL) | curses.A_BOLD) if idx == sel else curses.color_pair(COL_LABEL)
+        safe_addstr(win, y, card_x + 2, label[:inner_w], attr)
+
+    if vol is not None:
+        vol_w = 20
+        vol_filled = int((vol / 100) * vol_w)
+        vol_bar = "▮" * vol_filled + "▯" * (vol_w - vol_filled)
+        mute_tag = " (muted)" if muted else ""
+        vol_line = f"Vol {vol_bar} {vol:>3}%{mute_tag}"
+        safe_addstr(win, h - 3, cx(win, vol_line), vol_line, curses.color_pair(COL_HINT))
+
+    js_line = "Controller connected" if js_connected else "No controller detected - keyboard only"
+    safe_addstr(win, h - 2, cx(win, js_line), js_line, curses.color_pair(COL_GOOD if js_connected else COL_BAD) | curses.A_DIM)
+
+    footer = "UP/DOWN: browse   LEFT/RIGHT: volume   Enter/A/X: play-pause   ESC/B/Circle: exit"
+    safe_addstr(win, h - 1, cx(win, footer), footer, curses.A_DIM)
+    win.refresh()
+
+
+def show_message(stdscr, lines):
+    stdscr.nodelay(False)
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+    title = "MUSIC PLAYER"
+    safe_addstr(stdscr, 1, cx(stdscr, title), title, curses.color_pair(COL_HEADER) | curses.A_BOLD)
+    y = max(3, h // 2 - len(lines) // 2)
+    for i, (text, attr) in enumerate(lines):
+        safe_addstr(stdscr, y + i, cx(stdscr, text), text, attr)
+    hint = "Press any key to exit"
+    safe_addstr(stdscr, y + len(lines) + 2, cx(stdscr, hint), hint, curses.A_DIM)
+    stdscr.refresh()
+    stdscr.getch()
+
+
+def run(stdscr):
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(COL_HEADER, curses.COLOR_MAGENTA, -1)
+    curses.init_pair(COL_LABEL, curses.COLOR_WHITE, -1)
+    curses.init_pair(COL_HINT, curses.COLOR_YELLOW, -1)
+    curses.init_pair(COL_GOOD, curses.COLOR_GREEN, -1)
+    curses.init_pair(COL_BAD, curses.COLOR_RED, -1)
+    curses.init_pair(COL_SEL, curses.COLOR_CYAN, -1)
+    curses.init_pair(COL_ACCENT, curses.COLOR_MAGENTA, -1)
+    stdscr.nodelay(True)
+    stdscr.keypad(True)
+
+    if not VLC_AVAILABLE:
+        show_message(stdscr, [
+            ("python-vlc is not installed", curses.color_pair(COL_BAD) | curses.A_BOLD),
+            ("Run: pip install python-vlc --break-system-packages", curses.A_DIM),
+        ])
+        return
+
+    tracks = scan_library(MUSIC_DIR)
+    if not tracks:
+        show_message(stdscr, [
+            (f"No music found in {MUSIC_DIR}", curses.color_pair(COL_BAD) | curses.A_BOLD),
+            ("Add MP3/FLAC/OGG/WAV files and reopen this tool.", curses.A_DIM),
+        ])
+        return
+
+    cfg = load_config()
+    sel = clamp(cfg.get("last_index", 0), 0, len(tracks) - 1)
+    now_idx = None
+
+    js_file = open_joystick()
+    axis_state = {}
+    action_debounce = {}
+    player = Player()
+
+    t0 = time.monotonic()
+    last_vol_poll = 0.0
+    vol, muted = get_system_volume()
+    try:
+        while True:
+            t = time.monotonic() - t0
+
+            # Re-read every second or so rather than every frame, so this
+            # also picks up changes made by the hardware hotkeys or another
+            # tool while this screen is open, without hammering wpctl.
+            if t - last_vol_poll > 1.0:
+                vol, muted = get_system_volume()
+                last_vol_poll = t
+
+            if now_idx is not None and player.is_ended():
+                nxt = now_idx + 1
+                if nxt < len(tracks):
+                    now_idx = nxt
+                    sel = now_idx
+                    player.load(tracks[now_idx]["path"])
+                    player.play()
+                else:
+                    now_idx = None
+
+            draw(stdscr, tracks, sel, now_idx, player, vol, muted, js_file is not None, t)
+            action = poll_action(stdscr, js_file, axis_state, action_debounce)
+            if action is None:
+                continue
+
+            if action == "back":
+                break
+            elif action == "up":
+                sel = (sel - 1) % len(tracks)
+            elif action == "down":
+                sel = (sel + 1) % len(tracks)
+            elif action in ("left", "right"):
+                step = 1 if action == "right" else -1
+                set_system_volume_step(step * 5)
+                vol, muted = get_system_volume()
+                last_vol_poll = t
+            elif action == "confirm":
+                if sel == now_idx:
+                    player.toggle_play_pause()
+                else:
+                    now_idx = sel
+                    player.load(tracks[now_idx]["path"])
+                    player.play()
+                cfg["last_index"] = sel
+                save_config(cfg)
+    finally:
+        player.release()
+        if js_file is not None:
+            js_file.close()
+        cfg["last_index"] = sel
+        save_config(cfg)
+
+
+def main():
+    curses.wrapper(run)
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+    chmod +x "$PI_HOME/scripts/music-player.py"
+
+    touch "$PI_HOME/RetroPie/retropiemenu/musicplayer.rp"
+
+    local menu_script="$PI_HOME/RetroPie-Setup/scriptmodules/supplementary/retropiemenu.sh"
+    if [ -f "$menu_script" ] && ! grep -q "musicplayer.rp)" "$menu_script"; then
+        sudo cp "$menu_script" "${menu_script}.bak.$(date +%s)"
+        sudo python3 - "$menu_script" "$PI_HOME" <<'PYEOF'
+import sys
+path, pi_home = sys.argv[1], sys.argv[2]
+text = open(path).read()
+anchor = "filemanager.rp)"
+idx = text.find(anchor)
+if idx == -1:
+    print("[musicplayer] anchor 'filemanager.rp)' not found in retropiemenu.sh; skipping menu wiring")
+    sys.exit(0)
+case_end = text.find(";;", idx)
+if case_end == -1:
+    print("[musicplayer] could not find end of filemanager.rp) case; skipping menu wiring")
+    sys.exit(0)
+insert_point = text.find("\n", case_end) + 1
+line_start = text.rfind("\n", 0, idx) + 1
+indent = text[line_start:idx]
+insert_block = f"{indent}musicplayer.rp)\n{indent}    python3 {pi_home}/scripts/music-player.py\n{indent}    ;;\n"
+new_text = text[:insert_point] + insert_block + text[insert_point:]
+open(path, "w").write(new_text)
+print("[musicplayer] wired into retropiemenu.sh")
+PYEOF
+    fi
+    return 0
+}
+
+phase_bt_speaker_setup() {
+    if [ "$ENABLE_BT_SPEAKER" != "true" ]; then
+        log "ENABLE_BT_SPEAKER=false, skipping"
+        return 0
+    fi
+    # Turns the Pi into an always-on A2DP sink via PipeWire/WirePlumber's
+    # native Bluetooth module (libspa-0.2-bluetooth) - this OS image already
+    # runs PipeWire by default (see phase_audio_output_setup), so this is
+    # the native path rather than pulling in bluealsa (not packaged for
+    # this Debian release) or a whole separate PulseAudio stack. bt-agent
+    # (bluez-tools) is a headless "NoInputNoOutput" pairing agent so phones
+    # (and controllers, for the Bluetooth pairing tool) can pair without
+    # any PIN prompt.
+    sudo apt-get install -y bluez-tools python3-dbus python3-gi libspa-0.2-bluetooth \
+        || { log_warn "Bluetooth speaker dependency install failed; skipping"; return 0; }
+
+    # BlueZ's "hostname" plugin (loaded by default) overrides main.conf's
+    # Name= with the system's pretty hostname, so that - not main.conf - is
+    # what actually controls the name phones see when scanning.
+    echo "PRETTY_HOSTNAME=$BT_SPEAKER_NAME" | sudo tee /etc/machine-info >/dev/null
+
+    # Idempotent: only inserts once, guarded by a marker comment.
+    if ! sudo grep -q "# pi-arcade-setup" /etc/bluetooth/main.conf 2>/dev/null; then
+        sudo python3 - /etc/bluetooth/main.conf <<'PYEOF'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+anchor = "[General]"
+idx = text.find(anchor)
+insert_at = idx + len(anchor) if idx != -1 else 0
+block = (
+    "\n# pi-arcade-setup: always-discoverable/pairable speaker, identifies as\n"
+    "# an Audio/Video Loudspeaker (Rendering + Audio service bits, per the\n"
+    "# Bluetooth CoD spec) so it shows up sensibly in phone BT device lists.\n"
+    "Class = 0x240414\n"
+    "DiscoverableTimeout = 0\n"
+    "PairableTimeout = 0\n"
+    "AlwaysPairable = true\n"
+)
+new_text = text[:insert_at] + block + text[insert_at:]
+open(path, "w").write(new_text)
+print("[bt-speaker] patched /etc/bluetooth/main.conf")
+PYEOF
+    fi
+
+    sudo systemctl restart bluetooth
+    sleep 1
+    sudo bluetoothctl power on >/dev/null 2>&1 || true
+
+    # Persist the pi user's PipeWire/WirePlumber session across reboots so
+    # the A2DP sink is always up, independent of whether a console/graphical
+    # session is active.
+    sudo loginctl enable-linger "$PI_USER" || log_warn "could not enable linger for $PI_USER"
+
+    local uid
+    uid="$(id -u "$PI_USER")"
+    sudo -u "$PI_USER" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user restart wireplumber pipewire pipewire-pulse 2>/dev/null \
+        || log_warn "could not restart pipewire/wireplumber user services; Bluetooth audio will apply on next login"
+
+    mkdir -p "$PI_HOME/scripts"
+    tee "$PI_HOME/scripts/bt-nowplaying-daemon.py" >/dev/null <<PYEOF
+#!/usr/bin/env python3
+"""
+Background daemon for pi-arcade-setup's Bluetooth speaker mode. Polls BlueZ
+over D-Bus (no GLib mainloop needed - plain synchronous ObjectManager
+polling) for the connected device and its AVRCP MediaPlayer1 metadata,
+writes it to STATUS_FILE for the "Bluetooth Player" RetroPie menu tool to
+read, and executes playback commands the same tool writes to COMMAND_FILE
+(play_pause/next/previous). Also auto-trusts newly paired devices so
+reconnects don't need re-pairing.
+
+Runs as a systemd service (bt-nowplaying-daemon.service), independent of
+whether the "Bluetooth Player" UI is open - same pattern as the LED strip
+daemon.
+"""
+import json
+import os
+import time
+
+import dbus
+
+STATUS_FILE = "$PI_HOME/.bt-nowplaying-status.json"
+COMMAND_FILE = "$PI_HOME/.bt-nowplaying-command.json"
+POLL_INTERVAL = 1.0
+
+BLUEZ_SERVICE = "org.bluez"
+DEVICE_IFACE = "org.bluez.Device1"
+PLAYER_IFACE = "org.bluez.MediaPlayer1"
+PROPS_IFACE = "org.freedesktop.DBus.Properties"
+
+
+def get_managed_objects(bus):
+    try:
+        manager = dbus.Interface(
+            bus.get_object(BLUEZ_SERVICE, "/"), "org.freedesktop.DBus.ObjectManager"
+        )
+        return manager.GetManagedObjects()
+    except Exception:
+        return {}
+
+
+def find_connected_device_and_player(objects):
+    device_path, device_props = None, None
+    for path, ifaces in objects.items():
+        dev = ifaces.get(DEVICE_IFACE)
+        if dev and bool(dev.get("Connected")):
+            device_path, device_props = path, dev
+            break
+
+    if device_path is None:
+        return None, None, None
+
+    player_path, player_props = None, None
+    for path, ifaces in objects.items():
+        if path.startswith(device_path) and PLAYER_IFACE in ifaces:
+            player_path, player_props = path, ifaces[PLAYER_IFACE]
+            break
+
+    return device_props, player_path, player_props
+
+
+def auto_trust(bus, objects):
+    for path, ifaces in objects.items():
+        dev = ifaces.get(DEVICE_IFACE)
+        if dev and bool(dev.get("Paired")) and not bool(dev.get("Trusted")):
+            try:
+                props = dbus.Interface(bus.get_object(BLUEZ_SERVICE, path), PROPS_IFACE)
+                props.Set(DEVICE_IFACE, "Trusted", True)
+                print(f"[bt-nowplaying] auto-trusted {path}")
+            except Exception as e:
+                print(f"[bt-nowplaying] failed to trust {path}: {e}")
+
+
+def jstr(v, default=""):
+    try:
+        return str(v)
+    except Exception:
+        return default
+
+
+def write_status(device_props, player_path, player_props):
+    status = {"connected": False, "device_name": "", "device_address": ""}
+    if device_props is not None:
+        status["connected"] = True
+        status["device_name"] = jstr(device_props.get("Name", device_props.get("Alias", "")))
+        status["device_address"] = jstr(device_props.get("Address", ""))
+
+    status["has_player"] = player_path is not None
+    if player_props is not None:
+        track = player_props.get("Track", {})
+        status["title"] = jstr(track.get("Title", ""))
+        status["artist"] = jstr(track.get("Artist", ""))
+        status["album"] = jstr(track.get("Album", ""))
+        duration = track.get("Duration")
+        status["duration_ms"] = int(duration) if duration is not None else -1
+        status["position_ms"] = int(player_props.get("Position", -1))
+        status["status"] = jstr(player_props.get("Status", "stopped")).lower()
+    else:
+        status["title"] = ""
+        status["artist"] = ""
+        status["album"] = ""
+        status["duration_ms"] = -1
+        status["position_ms"] = -1
+        status["status"] = "stopped"
+
+    status["updated"] = time.time()
+    try:
+        tmp = STATUS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(status, f)
+        os.replace(tmp, STATUS_FILE)
+    except Exception:
+        pass
+
+
+def read_command():
+    if not os.path.exists(COMMAND_FILE):
+        return None
+    try:
+        with open(COMMAND_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def clear_command():
+    try:
+        os.remove(COMMAND_FILE)
+    except Exception:
+        pass
+
+
+def run_command(bus, player_path, cmd):
+    if not player_path or not cmd:
+        return
+    action = cmd.get("cmd")
+    if action not in ("play_pause", "next", "previous"):
+        return
+    try:
+        player = dbus.Interface(bus.get_object(BLUEZ_SERVICE, player_path), PLAYER_IFACE)
+        if action == "play_pause":
+            props = dbus.Interface(bus.get_object(BLUEZ_SERVICE, player_path), PROPS_IFACE)
+            status = jstr(props.Get(PLAYER_IFACE, "Status")).lower()
+            if status == "playing":
+                player.Pause()
+            else:
+                player.Play()
+        elif action == "next":
+            player.Next()
+        elif action == "previous":
+            player.Previous()
+    except Exception as e:
+        print(f"[bt-nowplaying] command '{action}' failed: {e}")
+
+
+def main():
+    bus = dbus.SystemBus()
+    last_seq = None
+    while True:
+        objects = get_managed_objects(bus)
+        auto_trust(bus, objects)
+        device_props, player_path, player_props = find_connected_device_and_player(objects)
+        write_status(device_props, player_path, player_props)
+
+        cmd = read_command()
+        if cmd is not None and cmd.get("seq") != last_seq:
+            last_seq = cmd.get("seq")
+            run_command(bus, player_path, cmd)
+            clear_command()
+
+        time.sleep(POLL_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+    chmod +x "$PI_HOME/scripts/bt-nowplaying-daemon.py"
+
+    sudo tee /etc/systemd/system/bt-agent.service >/dev/null <<EOF
+[Unit]
+Description=Headless Bluetooth pairing agent (auto-accept, NoInputNoOutput)
+After=bluetooth.service
+Requires=bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/bt-agent -c NoInputNoOutput
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # Clean up the old always-discoverable service from earlier versions of
+    # this script, if present (upgrade path) - superseded by bt-power-on.service.
+    if [ -f /etc/systemd/system/bt-discoverable.service ]; then
+        sudo systemctl disable --now bt-discoverable.service 2>/dev/null || true
+        sudo rm -f /etc/systemd/system/bt-discoverable.service
+    fi
+
+    # Powers the adapter on at boot only - deliberately does NOT enable
+    # discoverable/pairable here. Being discoverable to new devices is
+    # scoped to the "Bluetooth Player" app's own lifetime (it turns
+    # discoverable/pairable on when opened and off again when closed, see
+    # bt-nowplaying.py) so the Pi doesn't sit there permanently advertising
+    # itself as $BT_SPEAKER_NAME to every phone in range. Already-paired/
+    # trusted devices can still reconnect at any time - only *first-time*
+    # pairing requires the app to be open.
+    sudo tee /etc/systemd/system/bt-power-on.service >/dev/null <<EOF
+[Unit]
+Description=Power on the Bluetooth adapter at boot (not discoverable/pairable by default)
+After=bluetooth.service
+Requires=bluetooth.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bash -c 'bluetoothctl power on; bluetoothctl discoverable off; bluetoothctl pairable off'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    sudo tee /etc/systemd/system/bt-nowplaying-daemon.service >/dev/null <<EOF
+[Unit]
+Description=Bluetooth AVRCP now-playing status/control daemon
+After=bluetooth.service dbus.service
+Requires=bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u $PI_HOME/scripts/bt-nowplaying-daemon.py
+Restart=always
+RestartSec=2
+User=root
+StandardOutput=append:/var/log/bt-nowplaying-daemon.log
+StandardError=append:/var/log/bt-nowplaying-daemon.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now bt-agent.service bt-power-on.service bt-nowplaying-daemon.service
+    return 0
+}
+
+phase_bt_pair_tool() {
+    if [ "$ENABLE_BT_SPEAKER" != "true" ]; then
+        log "ENABLE_BT_SPEAKER=false, skipping"
+        return 0
+    fi
+    mkdir -p "$PI_HOME/scripts"
+    tee "$PI_HOME/scripts/bt-controller-pair.py" >/dev/null <<PYEOF
+#!/usr/bin/env python3
+"""
+Seamless Bluetooth device pairing wizard for pi-arcade-setup - mainly for
+wireless controllers, but works for any discoverable device. Run from the
+RetroPie menu ("Bluetooth") or directly:
+    python3 bt-controller-pair.py
+Drives BlueZ directly over D-Bus (no bluetoothctl text-parsing): scans for
+nearby devices and lists them live, and pairs/trusts/connects the selected
+one with a single button press. Pairing confirmation is handled
+automatically in the background by pi-arcade-setup's own bt-agent service
+(NoInputNoOutput/"Just Works"), so no PIN entry is needed here.
+
+Fully navigable by controller as well as keyboard: left stick (or D-pad) to
+move, X/Cross to pair the selected device, Circle/B to exit - same button
+roles as the rest of the RetroPie menu.
+"""
+import curses
+import select
+import struct
+import sys
+import time
+
+import dbus
+
+JS_DEVICE = "/dev/input/js0"
+JS_EVENT_BUTTON = 0x01
+JS_EVENT_AXIS = 0x02
+JS_EVENT_INIT = 0x80
+EVENT_FORMAT = "IhBB"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+AXIS_THRESHOLD = 16000
+BTN_CONFIRM = $BTN_X       # X / Cross / A - same role as the rest of the RetroPie menu
+BTN_BACK = $BTN_CIRCLE     # Circle / B - same role as the rest of the RetroPie menu
+
+BLUEZ_SERVICE = "org.bluez"
+ADAPTER_IFACE = "org.bluez.Adapter1"
+DEVICE_IFACE = "org.bluez.Device1"
+PROPS_IFACE = "org.freedesktop.DBus.Properties"
+
+COL_HEADER, COL_LABEL, COL_HINT, COL_GOOD, COL_BAD, COL_SEL = 1, 2, 3, 4, 5, 6
+
+
+def cx(win, text):
+    _, w = win.getmaxyx()
+    return max(0, (w - len(text)) // 2)
+
+
+def safe_addstr(win, y, x, text, attr=0):
+    h, w = win.getmaxyx()
+    if 0 <= y < h:
+        try:
+            win.addstr(y, max(0, x), text[: max(0, w - x - 1)], attr)
+        except curses.error:
+            pass
+
+
+def find_adapter_path(bus):
+    manager = dbus.Interface(bus.get_object(BLUEZ_SERVICE, "/"), "org.freedesktop.DBus.ObjectManager")
+    for path, ifaces in manager.GetManagedObjects().items():
+        if ADAPTER_IFACE in ifaces:
+            return path
+    return None
+
+
+def list_devices(bus, adapter_path):
+    manager = dbus.Interface(bus.get_object(BLUEZ_SERVICE, "/"), "org.freedesktop.DBus.ObjectManager")
+    devices = []
+    for path, ifaces in manager.GetManagedObjects().items():
+        dev = ifaces.get(DEVICE_IFACE)
+        if dev is None or not path.startswith(adapter_path + "/"):
+            continue
+        name = str(dev.get("Name", dev.get("Alias", "")))
+        addr = str(dev.get("Address", ""))
+        devices.append({
+            "path": path,
+            "name": name or "(unnamed device)",
+            "address": addr,
+            "paired": bool(dev.get("Paired")),
+            "connected": bool(dev.get("Connected")),
+            "rssi": int(dev.get("RSSI", -999)),
+        })
+    # connected/paired first, then by signal strength
+    devices.sort(key=lambda d: (not d["connected"], not d["paired"], -d["rssi"]))
+    return devices
+
+
+def open_joystick():
+    try:
+        return open(JS_DEVICE, "rb")
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def poll_action(stdscr, js_file, axis_state, timeout=0.15):
+    fds = [sys.stdin]
+    if js_file is not None:
+        fds.append(js_file)
+    try:
+        ready, _, _ = select.select(fds, [], [], timeout)
+    except (OSError, ValueError):
+        ready = []
+
+    if js_file is not None and js_file in ready:
+        data = js_file.read(EVENT_SIZE)
+        if data and len(data) == EVENT_SIZE:
+            _t, value, typ, number = struct.unpack(EVENT_FORMAT, data)
+            is_init = bool(typ & JS_EVENT_INIT)
+            typ &= ~JS_EVENT_INIT
+            if not is_init:
+                if typ == JS_EVENT_BUTTON and value == 1:
+                    if number == BTN_CONFIRM:
+                        return "confirm"
+                    if number == BTN_BACK:
+                        return "back"
+                elif typ == JS_EVENT_AXIS and number in (0, 1):
+                    past = abs(value) > AXIS_THRESHOLD
+                    was_past = axis_state.get(number, False)
+                    axis_state[number] = past
+                    if past and not was_past:
+                        if number == 0:
+                            return "right" if value > 0 else "left"
+                        else:
+                            return "down" if value > 0 else "up"
+
+    if sys.stdin in ready:
+        ch = stdscr.getch()
+        if ch == curses.KEY_UP:
+            return "up"
+        if ch == curses.KEY_DOWN:
+            return "down"
+        if ch in (10, 13, ord(" ")):
+            return "confirm"
+        if ch in (27, ord("q"), ord("Q")):
+            return "back"
+    return None
+
+
+def draw(win, devices, sel, js_connected, status_line, status_attr, scanning):
+    win.erase()
+    h, w = win.getmaxyx()
+    title = " BLUETOOTH PAIRING "
+    safe_addstr(win, 1, cx(win, title), title, curses.color_pair(COL_HEADER) | curses.A_BOLD)
+    sub = "Scanning for nearby devices..." if scanning else "Scan paused"
+    safe_addstr(win, 2, cx(win, sub), sub, curses.A_DIM)
+
+    top = 4
+    if not devices:
+        empty = "No devices found yet - put your controller in pairing mode"
+        safe_addstr(win, top + 1, cx(win, empty), empty, curses.A_DIM)
+    else:
+        list_h = max(1, h - top - 6)
+        start = 0
+        if len(devices) > list_h:
+            start = max(0, min(sel - list_h // 2, len(devices) - list_h))
+        for row in range(list_h):
+            idx = start + row
+            if idx >= len(devices):
+                break
+            d = devices[idx]
+            marker = "▸ " if idx == sel else "  "
+            tags = []
+            if d["connected"]:
+                tags.append("connected")
+            elif d["paired"]:
+                tags.append("paired")
+            tag_str = f" [{', '.join(tags)}]" if tags else ""
+            label = f"{marker}{d['name']} ({d['address']}){tag_str}"
+            attr = (curses.color_pair(COL_SEL) | curses.A_BOLD) if idx == sel else curses.color_pair(COL_LABEL)
+            if d["connected"]:
+                attr = curses.color_pair(COL_GOOD) | (curses.A_BOLD if idx == sel else 0)
+            safe_addstr(win, top + row, cx(win, label) if len(label) < w - 4 else 2, label, attr)
+
+    if status_line:
+        safe_addstr(win, h - 5, cx(win, status_line), status_line, status_attr | curses.A_BOLD)
+
+    js_line = "Controller connected" if js_connected else "No controller detected - keyboard only"
+    safe_addstr(win, h - 3, cx(win, js_line), js_line, curses.color_pair(COL_GOOD if js_connected else COL_BAD) | curses.A_DIM)
+
+    footer = "UP/DOWN: select   Enter/A/X: pair & connect   ESC/B/Circle: exit"
+    safe_addstr(win, h - 2, cx(win, footer), footer, curses.color_pair(COL_HINT))
+    win.refresh()
+
+
+def pair_device(bus, path):
+    device = bus.get_object(BLUEZ_SERVICE, path)
+    device_iface = dbus.Interface(device, DEVICE_IFACE)
+    props = dbus.Interface(device, PROPS_IFACE)
+    try:
+        if not bool(props.Get(DEVICE_IFACE, "Paired")):
+            device_iface.Pair(timeout=15000)
+        props.Set(DEVICE_IFACE, "Trusted", True)
+        device_iface.Connect(timeout=15000)
+        return True, "Paired and connected!"
+    except dbus.exceptions.DBusException as e:
+        msg = str(e)
+        if "AlreadyExists" in msg or "Already Exists" in msg:
+            try:
+                device_iface.Connect(timeout=15000)
+                return True, "Connected!"
+            except Exception as e2:
+                return False, f"Connect failed: {e2}"
+        return False, f"Pairing failed: {msg.split(':')[-1].strip()}"
+    except Exception as e:
+        return False, f"Pairing failed: {e}"
+
+
+def run(stdscr):
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(COL_HEADER, curses.COLOR_YELLOW, -1)
+    curses.init_pair(COL_LABEL, curses.COLOR_CYAN, -1)
+    curses.init_pair(COL_HINT, curses.COLOR_YELLOW, -1)
+    curses.init_pair(COL_GOOD, curses.COLOR_GREEN, -1)
+    curses.init_pair(COL_BAD, curses.COLOR_RED, -1)
+    curses.init_pair(COL_SEL, curses.COLOR_GREEN, -1)
+    stdscr.nodelay(True)
+    stdscr.keypad(True)
+
+    js_file = open_joystick()
+    axis_state = {}
+
+    bus = dbus.SystemBus()
+    adapter_path = find_adapter_path(bus)
+    scanning = False
+    status_line, status_attr = "", 0
+
+    if adapter_path is None:
+        safe_addstr(stdscr, 2, 2, "No Bluetooth adapter found.", curses.color_pair(COL_BAD))
+        stdscr.refresh()
+        stdscr.nodelay(False)
+        stdscr.getch()
+        if js_file:
+            js_file.close()
+        return
+
+    adapter_props = dbus.Interface(bus.get_object(BLUEZ_SERVICE, adapter_path), PROPS_IFACE)
+    adapter_iface = dbus.Interface(bus.get_object(BLUEZ_SERVICE, adapter_path), ADAPTER_IFACE)
+    try:
+        if not bool(adapter_props.Get(ADAPTER_IFACE, "Powered")):
+            adapter_props.Set(ADAPTER_IFACE, "Powered", True)
+        adapter_iface.StartDiscovery()
+        scanning = True
+    except Exception as e:
+        status_line, status_attr = f"Could not start scan: {e}", curses.color_pair(COL_BAD)
+
+    sel = 0
+    devices = []
+    t0 = time.monotonic()
+    last_scan_poll = 0.0
+
+    try:
+        while True:
+            t = time.monotonic() - t0
+            if t - last_scan_poll > 1.0:
+                devices = list_devices(bus, adapter_path)
+                sel = max(0, min(sel, len(devices) - 1)) if devices else 0
+                last_scan_poll = t
+
+            draw(stdscr, devices, sel, js_file is not None, status_line, status_attr, scanning)
+            action = poll_action(stdscr, js_file, axis_state)
+            if action is None:
+                continue
+
+            if action == "back":
+                break
+            elif action == "up" and devices:
+                sel = (sel - 1) % len(devices)
+            elif action == "down" and devices:
+                sel = (sel + 1) % len(devices)
+            elif action == "confirm" and devices:
+                target = devices[sel]
+                status_line, status_attr = f"Pairing with {target['name']}...", curses.color_pair(COL_HINT)
+                draw(stdscr, devices, sel, js_file is not None, status_line, status_attr, scanning)
+                ok, msg = pair_device(bus, target["path"])
+                status_line = msg
+                status_attr = curses.color_pair(COL_GOOD) if ok else curses.color_pair(COL_BAD)
+                devices = list_devices(bus, adapter_path)
+    finally:
+        try:
+            adapter_iface.StopDiscovery()
+        except Exception:
+            pass
+        if js_file is not None:
+            js_file.close()
+
+
+def main():
+    curses.wrapper(run)
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+    chmod +x "$PI_HOME/scripts/bt-controller-pair.py"
+
+    touch "$PI_HOME/RetroPie/retropiemenu/btpair.rp"
+
+    local menu_script="$PI_HOME/RetroPie-Setup/scriptmodules/supplementary/retropiemenu.sh"
+    if [ -f "$menu_script" ] && ! grep -q "btpair.rp)" "$menu_script"; then
+        sudo cp "$menu_script" "${menu_script}.bak.$(date +%s)"
+        sudo python3 - "$menu_script" "$PI_HOME" <<'PYEOF'
+import sys
+path, pi_home = sys.argv[1], sys.argv[2]
+text = open(path).read()
+anchor = "filemanager.rp)"
+idx = text.find(anchor)
+if idx == -1:
+    print("[btpair] anchor 'filemanager.rp)' not found in retropiemenu.sh; skipping menu wiring")
+    sys.exit(0)
+case_end = text.find(";;", idx)
+if case_end == -1:
+    print("[btpair] could not find end of filemanager.rp) case; skipping menu wiring")
+    sys.exit(0)
+insert_point = text.find("\n", case_end) + 1
+line_start = text.rfind("\n", 0, idx) + 1
+indent = text[line_start:idx]
+insert_block = f"{indent}btpair.rp)\n{indent}    sudo python3 {pi_home}/scripts/bt-controller-pair.py\n{indent}    ;;\n"
+new_text = text[:insert_point] + insert_block + text[insert_point:]
+open(path, "w").write(new_text)
+print("[btpair] wired into retropiemenu.sh")
+PYEOF
+    fi
+    return 0
+}
+
+phase_bt_player_tool() {
+    if [ "$ENABLE_BT_SPEAKER" != "true" ]; then
+        log "ENABLE_BT_SPEAKER=false, skipping"
+        return 0
+    fi
+    mkdir -p "$PI_HOME/scripts"
+    tee "$PI_HOME/scripts/bt-nowplaying.py" >/dev/null <<PYEOF
+#!/usr/bin/env python3
+"""
+Car-infotainment-style "now playing" screen for pi-arcade-setup's
+Bluetooth speaker mode. Run from the RetroPie menu ("Bluetooth Player") or
+directly:
+    python3 bt-nowplaying.py
+Shows the track currently streaming from a connected phone via AVRCP
+metadata, and can send play/pause/next/previous back to the phone - the
+audio itself is handled entirely by the always-on background daemon and
+PipeWire, so this tool is only a display+remote (closing it does not stop
+playback). Also adjusts the Pi's own output volume.
+
+The Pi only shows up as a connectable Bluetooth device to a NEW phone
+while this screen is open (discoverable/pairable are switched on when it
+starts and off when it exits) - a phone that's already paired can still
+reconnect and stream at any time.
+
+Fully navigable by controller as well as keyboard: left stick (or D-pad) to
+skip tracks or adjust volume, X/Cross to confirm, Circle/B to exit - same
+button roles as the rest of the RetroPie menu.
+"""
+import curses
+import json
+import os
+import select
+import struct
+import subprocess
+import sys
+import time
+
+PI_HOME = "$PI_HOME"
+STATUS_FILE = "$PI_HOME/.bt-nowplaying-status.json"
+COMMAND_FILE = "$PI_HOME/.bt-nowplaying-command.json"
+SPEAKER_NAME = "$BT_SPEAKER_NAME"
+
+JS_DEVICE = "/dev/input/js0"
+JS_EVENT_BUTTON = 0x01
+JS_EVENT_AXIS = 0x02
+JS_EVENT_INIT = 0x80
+EVENT_FORMAT = "IhBB"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+AXIS_THRESHOLD = 16000
+BTN_CONFIRM = $BTN_X       # X / Cross / A - same role as the rest of the RetroPie menu
+BTN_BACK = $BTN_CIRCLE     # Circle / B - same role as the rest of the RetroPie menu
+
+COL_HEADER, COL_LABEL, COL_HINT, COL_GOOD, COL_BAD, COL_ACCENT = 1, 2, 3, 4, 5, 6
+
+_cmd_seq = 0
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def cx(win, text):
+    _, w = win.getmaxyx()
+    return max(0, (w - len(text)) // 2)
+
+
+def cx_in(width, text):
+    return max(0, (width - len(text)) // 2)
+
+
+def safe_addstr(win, y, x, text, attr=0):
+    h, w = win.getmaxyx()
+    if 0 <= y < h:
+        try:
+            win.addstr(y, max(0, x), text[: max(0, w - x - 1)], attr)
+        except curses.error:
+            pass
+
+
+def read_status():
+    default = {
+        "connected": False, "device_name": "", "has_player": False,
+        "title": "", "artist": "", "album": "", "status": "stopped",
+        "position_ms": -1, "duration_ms": -1,
+    }
+    if os.path.exists(STATUS_FILE):
+        try:
+            with open(STATUS_FILE) as f:
+                default.update(json.load(f))
+        except Exception:
+            pass
+    return default
+
+
+def send_command(cmd):
+    global _cmd_seq
+    _cmd_seq += 1
+    try:
+        with open(COMMAND_FILE, "w") as f:
+            json.dump({"cmd": cmd, "seq": _cmd_seq}, f)
+    except Exception:
+        pass
+
+
+def _wpctl_env():
+    """wpctl talks to the calling user's own PipeWire session over
+    $XDG_RUNTIME_DIR - but this tool actually runs as root when launched
+    from the RetroPie menu (retropiemenu.sh's dispatch inherits that from
+    the custom system's `sudo openvt` wrapper), which has no PipeWire
+    session of its own. Point it at the Pi user's session (found via who
+    owns their home directory, not a hardcoded uid) instead of whatever -
+    if anything - root's own XDG_RUNTIME_DIR resolves to."""
+    env = dict(os.environ)
+    try:
+        env["XDG_RUNTIME_DIR"] = f"/run/user/{os.stat(PI_HOME).st_uid}"
+    except Exception:
+        pass
+    return env
+
+
+def get_volume():
+    try:
+        out = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"],
+                              capture_output=True, text=True, timeout=2, env=_wpctl_env()).stdout
+        # format: "Volume: 0.40" or "Volume: 0.40 [MUTED]"
+        parts = out.strip().split()
+        if len(parts) >= 2:
+            vol = int(round(float(parts[1]) * 100))
+            muted = "MUTED" in out
+            return clamp(vol, 0, 100), muted
+    except Exception:
+        pass
+    return None, False
+
+
+def set_volume_step(step):
+    try:
+        sign = "+" if step > 0 else "-"
+        subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{abs(step)}%{sign}"],
+                        capture_output=True, timeout=2, env=_wpctl_env())
+    except Exception:
+        pass
+
+
+def fmt_time(ms):
+    if ms is None or ms < 0:
+        return "--:--"
+    s = int(ms / 1000)
+    return f"{s // 60:02d}:{s % 60:02d}"
+
+
+def marquee(text, width, t, speed=3.0):
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text.center(width)
+    pad = text + "     " + text
+    offset = int(t * speed) % (len(text) + 5)
+    return pad[offset: offset + width]
+
+
+def open_joystick():
+    try:
+        return open(JS_DEVICE, "rb")
+    except (FileNotFoundError, OSError):
+        return None
+
+
+CONFIRM_DEBOUNCE_S = 0.25
+# Guards "confirm"/"back" specifically (not directional movement) against
+# switch/contact bounce on cheap arcade buttons and joystick encoders, which
+# can report two or more rapid press events for what is physically a single
+# tap - without this a bounced confirm press could fire play_pause twice in
+# quick succession and look like the button "did nothing".
+
+
+def poll_action(stdscr, js_file, axis_state, action_debounce, timeout=0.2):
+    fds = [sys.stdin]
+    if js_file is not None:
+        fds.append(js_file)
+    try:
+        ready, _, _ = select.select(fds, [], [], timeout)
+    except (OSError, ValueError):
+        ready = []
+
+    action = None
+
+    if js_file is not None and js_file in ready:
+        data = js_file.read(EVENT_SIZE)
+        if data and len(data) == EVENT_SIZE:
+            _t, value, typ, number = struct.unpack(EVENT_FORMAT, data)
+            is_init = bool(typ & JS_EVENT_INIT)
+            typ &= ~JS_EVENT_INIT
+            if not is_init:
+                if typ == JS_EVENT_BUTTON and value == 1:
+                    if number == BTN_CONFIRM:
+                        action = "confirm"
+                    elif number == BTN_BACK:
+                        action = "back"
+                elif typ == JS_EVENT_AXIS and number in (0, 1):
+                    past = abs(value) > AXIS_THRESHOLD
+                    was_past = axis_state.get(number, False)
+                    axis_state[number] = past
+                    if past and not was_past:
+                        if number == 0:
+                            return "right" if value > 0 else "left"
+                        else:
+                            return "down" if value > 0 else "up"
+
+    if action is None and sys.stdin in ready:
+        ch = stdscr.getch()
+        if ch == curses.KEY_UP:
+            return "up"
+        if ch == curses.KEY_DOWN:
+            return "down"
+        if ch == curses.KEY_LEFT:
+            return "left"
+        if ch == curses.KEY_RIGHT:
+            return "right"
+        if ch in (10, 13, ord(" ")):
+            action = "confirm"
+        elif ch in (27, ord("q"), ord("Q")):
+            action = "back"
+
+    if action in ("confirm", "back"):
+        now = time.monotonic()
+        if now - action_debounce.get(action, 0.0) < CONFIRM_DEBOUNCE_S:
+            return None
+        action_debounce[action] = now
+
+    return action
+
+
+def set_discoverable(enabled):
+    """Toggles whether the Pi shows up as a connectable Bluetooth device to
+    *new* phones. Deliberately scoped to this app's lifetime rather than
+    left on permanently (see bt-power-on.service): the Pi shouldn't sit
+    there always advertising itself to every phone in range. Devices that
+    are already paired/trusted can still reconnect at any time regardless
+    of this setting - it only gates first-time pairing."""
+    state = "on" if enabled else "off"
+    try:
+        subprocess.run(["bluetoothctl", "discoverable", state], capture_output=True, timeout=3)
+        subprocess.run(["bluetoothctl", "pairable", state], capture_output=True, timeout=3)
+    except Exception:
+        pass
+
+
+def draw(win, status, vol, muted, js_connected, t):
+    win.erase()
+    h, w = win.getmaxyx()
+
+    title_bar = f"🔊  {SPEAKER_NAME}  🔊"
+    safe_addstr(win, 0, cx(win, title_bar), title_bar, curses.color_pair(COL_HEADER) | curses.A_BOLD)
+
+    card_w = min(w - 4, 66)
+    card_x = max(0, (w - card_w) // 2)
+    top = 2
+    card_h = 8
+
+    safe_addstr(win, top, card_x, "┌" + "─" * (card_w - 2) + "┐", curses.color_pair(COL_ACCENT))
+    for row in range(1, card_h):
+        safe_addstr(win, top + row, card_x, "│", curses.color_pair(COL_ACCENT))
+        safe_addstr(win, top + row, card_x + card_w - 1, "│", curses.color_pair(COL_ACCENT))
+    safe_addstr(win, top + card_h, card_x, "└" + "─" * (card_w - 2) + "┘", curses.color_pair(COL_ACCENT))
+
+    inner_w = card_w - 4
+    connected = status.get("connected", False)
+    playing = status.get("status") == "playing"
+
+    if not connected:
+        conn_line = "No device connected".center(inner_w)[:inner_w]
+        safe_addstr(win, top + 2, card_x + 2, conn_line, curses.color_pair(COL_BAD) | curses.A_BOLD)
+        hint = f'Pair a phone to "{SPEAKER_NAME}" to stream music here'
+        safe_addstr(win, top + 4, card_x + 2, hint.center(inner_w)[:inner_w], curses.A_DIM)
+    else:
+        dev_line = f"Connected: {status.get('device_name') or status.get('device_address', '?')}"
+        safe_addstr(win, top + 1, card_x + 2, dev_line.center(inner_w)[:inner_w], curses.color_pair(COL_GOOD))
+
+        if status.get("has_player") and (status.get("title") or status.get("artist")):
+            title = status.get("title") or "(unknown track)"
+            title_line = marquee(title, inner_w, t) if playing else title.center(inner_w)[:inner_w]
+            sub = status.get("artist", "") + ("  •  " + status["album"] if status.get("album") else "")
+            state = "▶ Playing" if playing else "❚❚ Paused"
+            elapsed = status.get("position_ms", -1)
+            total = status.get("duration_ms", -1)
+        else:
+            title_line = "No track metadata yet".center(inner_w)[:inner_w]
+            sub = "(play something on your phone)"
+            state = "■ Idle"
+            elapsed, total = -1, -1
+
+        safe_addstr(win, top + 3, card_x + 2, title_line, curses.color_pair(COL_LABEL) | curses.A_BOLD)
+        safe_addstr(win, top + 4, card_x + 2, sub.center(inner_w)[:inner_w], curses.A_DIM)
+
+        bar_w = max(4, inner_w - 12)
+        if total and total > 0 and elapsed is not None and elapsed >= 0:
+            frac = clamp(elapsed / total, 0.0, 1.0)
+            filled = int(frac * bar_w)
+            bar = "━" * filled + "●" + "─" * max(0, bar_w - filled - 1)
+        else:
+            bar = "─" * bar_w
+        prog_line = f"{fmt_time(elapsed):>5} {bar} {fmt_time(total):<5}"
+        safe_addstr(win, top + 5, card_x + 2 + cx_in(inner_w, prog_line), prog_line, curses.color_pair(COL_LABEL))
+
+        ctrl_line = f"◄◄        {state}        ►►"
+        ctrl_attr = curses.color_pair(COL_GOOD if playing else COL_HINT) | curses.A_BOLD
+        safe_addstr(win, top + 7, card_x + cx_in(inner_w, ctrl_line), ctrl_line, ctrl_attr)
+
+    if vol is not None:
+        vol_w = 20
+        vol_filled = int((vol / 100) * vol_w)
+        vol_bar = "▮" * vol_filled + "▯" * (vol_w - vol_filled)
+        mute_tag = " (muted)" if muted else ""
+        vol_line = f"Vol {vol_bar} {vol:>3}%{mute_tag}"
+        safe_addstr(win, h - 4, cx(win, vol_line), vol_line, curses.color_pair(COL_HINT))
+
+    js_line = "Controller connected" if js_connected else "No controller detected - keyboard only"
+    safe_addstr(win, h - 3, cx(win, js_line), js_line, curses.color_pair(COL_GOOD if js_connected else COL_BAD) | curses.A_DIM)
+
+    footer1 = "LEFT/RIGHT: prev/next track   UP/DOWN: volume"
+    footer2 = "Enter/A/X: play-pause   ESC/B/Circle: exit (music keeps playing)"
+    safe_addstr(win, h - 2, cx(win, footer1), footer1, curses.A_DIM)
+    safe_addstr(win, h - 1, cx(win, footer2), footer2, curses.A_DIM)
+    win.refresh()
+
+
+def run(stdscr):
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(COL_HEADER, curses.COLOR_CYAN, -1)
+    curses.init_pair(COL_LABEL, curses.COLOR_WHITE, -1)
+    curses.init_pair(COL_HINT, curses.COLOR_YELLOW, -1)
+    curses.init_pair(COL_GOOD, curses.COLOR_GREEN, -1)
+    curses.init_pair(COL_BAD, curses.COLOR_RED, -1)
+    curses.init_pair(COL_ACCENT, curses.COLOR_CYAN, -1)
+    stdscr.nodelay(True)
+    stdscr.keypad(True)
+
+    js_file = open_joystick()
+    axis_state = {}
+    action_debounce = {}
+
+    t0 = time.monotonic()
+    last_poll = 0.0
+    status = read_status()
+    vol, muted = get_volume()
+
+    # Only advertise the Pi to new phones while this screen is open (see
+    # set_discoverable's docstring) - always turned back off in the
+    # `finally` block below, however this loop exits.
+    set_discoverable(True)
+
+    try:
+        while True:
+            t = time.monotonic() - t0
+            if t - last_poll > 1.0:
+                status = read_status()
+                vol, muted = get_volume()
+                last_poll = t
+
+            draw(stdscr, status, vol, muted, js_file is not None, t)
+            action = poll_action(stdscr, js_file, axis_state, action_debounce)
+            if action is None:
+                continue
+
+            if action == "back":
+                break
+            elif action == "confirm":
+                send_command("play_pause")
+            elif action == "left":
+                send_command("previous")
+            elif action == "right":
+                send_command("next")
+            elif action == "up":
+                set_volume_step(5)
+                vol, muted = get_volume()
+            elif action == "down":
+                set_volume_step(-5)
+                vol, muted = get_volume()
+    finally:
+        set_discoverable(False)
+        if js_file is not None:
+            js_file.close()
+
+
+def main():
+    curses.wrapper(run)
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+    chmod +x "$PI_HOME/scripts/bt-nowplaying.py"
+
+    touch "$PI_HOME/RetroPie/retropiemenu/btaudio.rp"
+
+    local menu_script="$PI_HOME/RetroPie-Setup/scriptmodules/supplementary/retropiemenu.sh"
+    if [ -f "$menu_script" ] && ! grep -q "btaudio.rp)" "$menu_script"; then
+        sudo cp "$menu_script" "${menu_script}.bak.$(date +%s)"
+        sudo python3 - "$menu_script" "$PI_HOME" <<'PYEOF'
+import sys
+path, pi_home = sys.argv[1], sys.argv[2]
+text = open(path).read()
+anchor = "filemanager.rp)"
+idx = text.find(anchor)
+if idx == -1:
+    print("[btaudio] anchor 'filemanager.rp)' not found in retropiemenu.sh; skipping menu wiring")
+    sys.exit(0)
+case_end = text.find(";;", idx)
+if case_end == -1:
+    print("[btaudio] could not find end of filemanager.rp) case; skipping menu wiring")
+    sys.exit(0)
+insert_point = text.find("\n", case_end) + 1
+line_start = text.rfind("\n", 0, idx) + 1
+indent = text[line_start:idx]
+insert_block = f"{indent}btaudio.rp)\n{indent}    python3 {pi_home}/scripts/bt-nowplaying.py\n{indent}    ;;\n"
+new_text = text[:insert_point] + insert_block + text[insert_point:]
+open(path, "w").write(new_text)
+print("[btaudio] wired into retropiemenu.sh")
+PYEOF
+    fi
+    return 0
+}
+
+phase_audio_settings_tool() {
+    mkdir -p "$PI_HOME/scripts"
+    tee "$PI_HOME/scripts/audio-settings.py" >/dev/null <<PYEOF
+#!/usr/bin/env python3
+"""
+Audio output + mixer settings for pi-arcade-setup. Run from the RetroPie
+menu ("Audio settings") or directly:
+    python3 audio-settings.py
+Lets you switch the default PipeWire/WirePlumber output between the aux
+(3.5mm) jack and any HDMI output, and adjust master volume/mute - a
+controller-navigable front end for `wpctl`.
+
+Fully navigable by controller as well as keyboard: left stick (or D-pad) to
+move/adjust, X/Cross to confirm, Circle/B to exit - same button roles as
+the rest of the RetroPie menu.
+"""
+import curses
+import os
+import re
+import select
+import struct
+import subprocess
+import sys
+
+PI_HOME = "$PI_HOME"
+
+JS_DEVICE = "/dev/input/js0"
+JS_EVENT_BUTTON = 0x01
+JS_EVENT_AXIS = 0x02
+JS_EVENT_INIT = 0x80
+EVENT_FORMAT = "IhBB"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+AXIS_THRESHOLD = 16000
+BTN_CONFIRM = $BTN_X       # X / Cross / A - same role as the rest of the RetroPie menu
+BTN_BACK = $BTN_CIRCLE     # Circle / B - same role as the rest of the RetroPie menu
+
+COL_HEADER, COL_LABEL, COL_HINT, COL_GOOD, COL_BAD, COL_SEL = 1, 2, 3, 4, 5, 6
+
+ROWS = ["output", "volume", "mute"]
+ROW_LABELS = {"output": "Output", "volume": "Volume", "mute": "Mute"}
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def cx(win, text):
+    _, w = win.getmaxyx()
+    return max(0, (w - len(text)) // 2)
+
+
+def safe_addstr(win, y, x, text, attr=0):
+    h, w = win.getmaxyx()
+    if 0 <= y < h:
+        try:
+            win.addstr(y, max(0, x), text[: max(0, w - x - 1)], attr)
+        except curses.error:
+            pass
+
+
+def _wpctl_env():
+    """wpctl talks to the calling user's own PipeWire session over
+    $XDG_RUNTIME_DIR - but this tool actually runs as root when launched
+    from the RetroPie menu (retropiemenu.sh's dispatch inherits that from
+    the custom system's `sudo openvt` wrapper), which has no PipeWire
+    session of its own. Point it at the Pi user's session (found via who
+    owns their home directory, not a hardcoded uid) instead of whatever -
+    if anything - root's own XDG_RUNTIME_DIR resolves to."""
+    env = dict(os.environ)
+    try:
+        env["XDG_RUNTIME_DIR"] = f"/run/user/{os.stat(PI_HOME).st_uid}"
+    except Exception:
+        pass
+    return env
+
+
+def friendly_name(info):
+    if "mailbox" in info or "bcm2835 Headphones" in info:
+        return "Aux / Headphone jack"
+    m = re.search(r'alsa\.card_name\s*=\s*"([^"]+)"', info)
+    card = m.group(1) if m else "Unknown"
+    if "hdmi" in info.lower() or "hdmi" in card.lower():
+        if "vc4-hdmi-0" in info or "vc4hdmi0" in info:
+            return "HDMI 1"
+        if "vc4-hdmi-1" in info or "vc4hdmi1" in info:
+            return "HDMI 2"
+        return f"HDMI ({card})"
+    return card
+
+
+def list_sinks():
+    """Returns [{"id": str, "name": str, "default": bool}, ...]."""
+    try:
+        out = subprocess.run(["wpctl", "status"], capture_output=True, text=True, timeout=3, env=_wpctl_env()).stdout
+    except Exception:
+        return []
+    sinks = []
+    in_sinks = False
+    for line in out.splitlines():
+        if "Sinks:" in line:
+            in_sinks = True
+            continue
+        if in_sinks:
+            if "Sources:" in line:
+                break
+            m = re.search(r"(\*?)\s*(\d+)\.\s+(.+?)\s*\[vol", line)
+            if m:
+                sinks.append({"id": m.group(2), "default": m.group(1) == "*", "raw": line})
+    for s in sinks:
+        try:
+            info = subprocess.run(["wpctl", "inspect", s["id"]], capture_output=True, text=True, timeout=3, env=_wpctl_env()).stdout
+        except Exception:
+            info = ""
+        s["name"] = friendly_name(info)
+    return sinks
+
+
+def set_default_sink(sink_id):
+    try:
+        subprocess.run(["wpctl", "set-default", sink_id], capture_output=True, timeout=3, env=_wpctl_env())
+    except Exception:
+        pass
+
+
+def get_volume():
+    try:
+        out = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"],
+                              capture_output=True, text=True, timeout=2, env=_wpctl_env()).stdout
+        parts = out.strip().split()
+        vol = int(round(float(parts[1]) * 100)) if len(parts) >= 2 else 0
+        muted = "MUTED" in out
+        return clamp(vol, 0, 100), muted
+    except Exception:
+        return 0, False
+
+
+def set_volume_step(step):
+    try:
+        sign = "+" if step > 0 else "-"
+        subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{abs(step)}%{sign}"],
+                        capture_output=True, timeout=2, env=_wpctl_env())
+    except Exception:
+        pass
+
+
+def toggle_mute():
+    try:
+        subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"], capture_output=True, timeout=2, env=_wpctl_env())
+    except Exception:
+        pass
+
+
+def open_joystick():
+    try:
+        return open(JS_DEVICE, "rb")
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def poll_action(stdscr, js_file, axis_state, timeout=0.1):
+    fds = [sys.stdin]
+    if js_file is not None:
+        fds.append(js_file)
+    try:
+        ready, _, _ = select.select(fds, [], [], timeout)
+    except (OSError, ValueError):
+        ready = []
+
+    if js_file is not None and js_file in ready:
+        data = js_file.read(EVENT_SIZE)
+        if data and len(data) == EVENT_SIZE:
+            _t, value, typ, number = struct.unpack(EVENT_FORMAT, data)
+            is_init = bool(typ & JS_EVENT_INIT)
+            typ &= ~JS_EVENT_INIT
+            if not is_init:
+                if typ == JS_EVENT_BUTTON and value == 1:
+                    if number == BTN_CONFIRM:
+                        return "confirm"
+                    if number == BTN_BACK:
+                        return "back"
+                elif typ == JS_EVENT_AXIS and number in (0, 1):
+                    past = abs(value) > AXIS_THRESHOLD
+                    was_past = axis_state.get(number, False)
+                    axis_state[number] = past
+                    if past and not was_past:
+                        if number == 0:
+                            return "right" if value > 0 else "left"
+                        else:
+                            return "down" if value > 0 else "up"
+
+    if sys.stdin in ready:
+        ch = stdscr.getch()
+        if ch == curses.KEY_UP:
+            return "up"
+        if ch == curses.KEY_DOWN:
+            return "down"
+        if ch == curses.KEY_LEFT:
+            return "left"
+        if ch == curses.KEY_RIGHT:
+            return "right"
+        if ch in (10, 13, ord(" ")):
+            return "confirm"
+        if ch in (27, ord("q"), ord("Q")):
+            return "back"
+    return None
+
+
+def draw(win, sinks, out_idx, vol, muted, sel, js_connected):
+    win.erase()
+    h, w = win.getmaxyx()
+    title = " AUDIO SETTINGS "
+    safe_addstr(win, 1, cx(win, title), title, curses.color_pair(COL_HEADER) | curses.A_BOLD)
+
+    top = 5
+    for i, key in enumerate(ROWS):
+        y = top + i
+        is_sel = i == sel
+        prefix = "> " if is_sel else "  "
+        label = f"{prefix}{ROW_LABELS[key]:<10}"
+        if key == "output":
+            val = sinks[out_idx]["name"] if sinks else "(no sinks found)"
+        elif key == "volume":
+            val = f"{vol:>3}%"
+        elif key == "mute":
+            val = "MUTED" if muted else "off"
+        attr = (curses.color_pair(COL_SEL) | curses.A_BOLD) if is_sel else curses.color_pair(COL_LABEL)
+        col = max(0, (w // 2) - 20)
+        safe_addstr(win, y, col, label, attr)
+        safe_addstr(win, y, col + 16, val, attr | (curses.A_BOLD if is_sel else 0))
+
+    vol_w = 24
+    vol_filled = int((vol / 100) * vol_w)
+    vol_bar = "▮" * vol_filled + "▯" * (vol_w - vol_filled)
+    safe_addstr(win, top + len(ROWS) + 2, cx(win, vol_bar), vol_bar, curses.color_pair(COL_HINT))
+
+    js_line = "Controller connected" if js_connected else "No controller detected - keyboard only"
+    safe_addstr(win, h - 3, cx(win, js_line), js_line, curses.color_pair(COL_GOOD if js_connected else COL_BAD) | curses.A_DIM)
+
+    footer1 = "UP/DOWN: select   LEFT/RIGHT: change/adjust"
+    footer2 = "Enter/A/X: apply   ESC/B/Circle: done"
+    safe_addstr(win, h - 2, cx(win, footer1), footer1, curses.color_pair(COL_HINT))
+    safe_addstr(win, h - 1, cx(win, footer2), footer2, curses.A_DIM)
+    win.refresh()
+
+
+def run(stdscr):
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(COL_HEADER, curses.COLOR_YELLOW, -1)
+    curses.init_pair(COL_LABEL, curses.COLOR_CYAN, -1)
+    curses.init_pair(COL_HINT, curses.COLOR_YELLOW, -1)
+    curses.init_pair(COL_GOOD, curses.COLOR_GREEN, -1)
+    curses.init_pair(COL_BAD, curses.COLOR_RED, -1)
+    curses.init_pair(COL_SEL, curses.COLOR_GREEN, -1)
+    stdscr.nodelay(True)
+    stdscr.keypad(True)
+
+    js_file = open_joystick()
+    axis_state = {}
+
+    sinks = list_sinks()
+    out_idx = 0
+    for i, s in enumerate(sinks):
+        if s.get("default"):
+            out_idx = i
+            break
+    vol, muted = get_volume()
+    sel = 0
+
+    try:
+        while True:
+            draw(stdscr, sinks, out_idx, vol, muted, sel, js_file is not None)
+            action = poll_action(stdscr, js_file, axis_state)
+            if action is None:
+                continue
+
+            if action == "back":
+                break
+            elif action == "up":
+                sel = (sel - 1) % len(ROWS)
+            elif action == "down":
+                sel = (sel + 1) % len(ROWS)
+            else:
+                key = ROWS[sel]
+                step_dir = 1 if action == "right" else (-1 if action == "left" else 0)
+                if key == "output" and sinks:
+                    if step_dir:
+                        out_idx = (out_idx + step_dir) % len(sinks)
+                    if action == "confirm" or step_dir:
+                        set_default_sink(sinks[out_idx]["id"])
+                        sinks = list_sinks()
+                        for i, s in enumerate(sinks):
+                            if s.get("default"):
+                                out_idx = i
+                                break
+                elif key == "volume" and step_dir:
+                    set_volume_step(step_dir * 5)
+                    vol, muted = get_volume()
+                elif key == "mute" and action in ("left", "right", "confirm"):
+                    toggle_mute()
+                    vol, muted = get_volume()
+    finally:
+        if js_file is not None:
+            js_file.close()
+
+
+def main():
+    curses.wrapper(run)
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+    chmod +x "$PI_HOME/scripts/audio-settings.py"
+
+    touch "$PI_HOME/RetroPie/retropiemenu/avsettings.rp"
+
+    local menu_script="$PI_HOME/RetroPie-Setup/scriptmodules/supplementary/retropiemenu.sh"
+    if [ -f "$menu_script" ] && ! grep -q "avsettings.rp)" "$menu_script"; then
+        sudo cp "$menu_script" "${menu_script}.bak.$(date +%s)"
+        sudo python3 - "$menu_script" "$PI_HOME" <<'PYEOF'
+import sys
+path, pi_home = sys.argv[1], sys.argv[2]
+text = open(path).read()
+anchor = "filemanager.rp)"
+idx = text.find(anchor)
+if idx == -1:
+    print("[avsettings] anchor 'filemanager.rp)' not found in retropiemenu.sh; skipping menu wiring")
+    sys.exit(0)
+case_end = text.find(";;", idx)
+if case_end == -1:
+    print("[avsettings] could not find end of filemanager.rp) case; skipping menu wiring")
+    sys.exit(0)
+insert_point = text.find("\n", case_end) + 1
+line_start = text.rfind("\n", 0, idx) + 1
+indent = text[line_start:idx]
+insert_block = f"{indent}avsettings.rp)\n{indent}    python3 {pi_home}/scripts/audio-settings.py\n{indent}    ;;\n"
+new_text = text[:insert_point] + insert_block + text[insert_point:]
+open(path, "w").write(new_text)
+print("[avsettings] wired into retropiemenu.sh")
+PYEOF
+    fi
+    return 0
+}
+
+phase_wifi_settings_tool() {
+    mkdir -p "$PI_HOME/scripts"
+    tee "$PI_HOME/scripts/wifi-settings.py" >/dev/null <<PYEOF
+#!/usr/bin/env python3
+"""
+WiFi settings gate for pi-arcade-setup. Run from the RetroPie menu
+("WiFi settings") or directly:
+    python3 wifi-settings.py
+WiFi setup (entering an SSID/password) needs a real keyboard, so this asks
+first rather than silently dropping the controller-only user into a screen
+they can't use. Answering "Yes" launches `nmtui` (NetworkManager's text UI)
+for the actual configuration.
+
+Confirming here works with the controller (X/Cross toggles the highlighted
+answer to Yes) as well as a keyboard, matching the rest of the RetroPie
+menu.
+"""
+import curses
+import os
+import select
+import struct
+import sys
+
+JS_DEVICE = "/dev/input/js0"
+JS_EVENT_BUTTON = 0x01
+JS_EVENT_AXIS = 0x02
+JS_EVENT_INIT = 0x80
+EVENT_FORMAT = "IhBB"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+AXIS_THRESHOLD = 16000
+BTN_CONFIRM = $BTN_X       # X / Cross / A - same role as the rest of the RetroPie menu
+BTN_BACK = $BTN_CIRCLE     # Circle / B - same role as the rest of the RetroPie menu
+
+COL_HEADER, COL_LABEL, COL_HINT, COL_SEL = 1, 2, 3, 4
+
+
+def cx(win, text):
+    _, w = win.getmaxyx()
+    return max(0, (w - len(text)) // 2)
+
+
+def safe_addstr(win, y, x, text, attr=0):
+    h, w = win.getmaxyx()
+    if 0 <= y < h:
+        try:
+            win.addstr(y, max(0, x), text[: max(0, w - x - 1)], attr)
+        except curses.error:
+            pass
+
+
+def open_joystick():
+    try:
+        return open(JS_DEVICE, "rb")
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def poll_action(stdscr, js_file, axis_state, timeout=0.15):
+    fds = [sys.stdin]
+    if js_file is not None:
+        fds.append(js_file)
+    try:
+        ready, _, _ = select.select(fds, [], [], timeout)
+    except (OSError, ValueError):
+        ready = []
+
+    if js_file is not None and js_file in ready:
+        data = js_file.read(EVENT_SIZE)
+        if data and len(data) == EVENT_SIZE:
+            _t, value, typ, number = struct.unpack(EVENT_FORMAT, data)
+            is_init = bool(typ & JS_EVENT_INIT)
+            typ &= ~JS_EVENT_INIT
+            if not is_init:
+                if typ == JS_EVENT_BUTTON and value == 1:
+                    if number == BTN_CONFIRM:
+                        return "confirm"
+                    if number == BTN_BACK:
+                        return "back"
+                elif typ == JS_EVENT_AXIS and number == 0:
+                    past = abs(value) > AXIS_THRESHOLD
+                    was_past = axis_state.get(0, False)
+                    axis_state[0] = past
+                    if past and not was_past:
+                        return "right" if value > 0 else "left"
+
+    if sys.stdin in ready:
+        ch = stdscr.getch()
+        if ch == curses.KEY_LEFT:
+            return "left"
+        if ch == curses.KEY_RIGHT:
+            return "right"
+        if ch in (10, 13, ord(" ")):
+            return "confirm"
+        if ch in (27, ord("q"), ord("Q")):
+            return "back"
+    return None
+
+
+def draw(win, yes_selected, js_connected):
+    win.erase()
+    h, w = win.getmaxyx()
+    title = " WIFI SETTINGS "
+    safe_addstr(win, 2, cx(win, title), title, curses.color_pair(COL_HEADER) | curses.A_BOLD)
+
+    q = "Do you have a keyboard plugged in?"
+    safe_addstr(win, h // 2 - 2, cx(win, q), q, curses.color_pair(COL_LABEL) | curses.A_BOLD)
+    note = "WiFi setup needs one to type your network name and password."
+    safe_addstr(win, h // 2 - 1, cx(win, note), note, curses.A_DIM)
+
+    yes_attr = (curses.color_pair(COL_SEL) | curses.A_BOLD | curses.A_REVERSE) if yes_selected else curses.color_pair(COL_LABEL)
+    no_attr = (curses.color_pair(COL_SEL) | curses.A_BOLD | curses.A_REVERSE) if not yes_selected else curses.color_pair(COL_LABEL)
+    options = "  Yes  " + "   " + "  No  "
+    mid = h // 2 + 1
+    yes_x = cx(win, options)
+    safe_addstr(win, mid, yes_x, "  Yes  ", yes_attr)
+    safe_addstr(win, mid, yes_x + 10, "  No  ", no_attr)
+
+    js_line = "Controller connected" if js_connected else "No controller detected - keyboard only"
+    safe_addstr(win, h - 3, cx(win, js_line), js_line, curses.A_DIM)
+
+    footer = "LEFT/RIGHT: choose   Enter/A/X: confirm   ESC/B/Circle: cancel"
+    safe_addstr(win, h - 2, cx(win, footer), footer, curses.color_pair(COL_HINT))
+    win.refresh()
+
+
+def run(stdscr):
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(COL_HEADER, curses.COLOR_YELLOW, -1)
+    curses.init_pair(COL_LABEL, curses.COLOR_CYAN, -1)
+    curses.init_pair(COL_HINT, curses.COLOR_YELLOW, -1)
+    curses.init_pair(COL_SEL, curses.COLOR_GREEN, -1)
+    stdscr.nodelay(True)
+    stdscr.keypad(True)
+
+    js_file = open_joystick()
+    axis_state = {}
+    yes_selected = True
+
+    result = False
+    try:
+        while True:
+            draw(stdscr, yes_selected, js_file is not None)
+            action = poll_action(stdscr, js_file, axis_state)
+            if action is None:
+                continue
+            if action == "back":
+                result = False
+                break
+            if action in ("left", "right"):
+                yes_selected = not yes_selected
+            if action == "confirm":
+                result = yes_selected
+                break
+    finally:
+        if js_file is not None:
+            js_file.close()
+
+    return result
+
+
+def main():
+    has_keyboard = curses.wrapper(run)
+    if has_keyboard:
+        os.execvp("nmtui", ["nmtui"])
+    else:
+        print()
+        print("Plug in a keyboard and reopen WiFi settings to configure WiFi.")
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+    chmod +x "$PI_HOME/scripts/wifi-settings.py"
+
+    touch "$PI_HOME/RetroPie/retropiemenu/wifigate.rp"
+
+    local menu_script="$PI_HOME/RetroPie-Setup/scriptmodules/supplementary/retropiemenu.sh"
+    if [ -f "$menu_script" ] && ! grep -q "wifigate.rp)" "$menu_script"; then
+        sudo cp "$menu_script" "${menu_script}.bak.$(date +%s)"
+        sudo python3 - "$menu_script" "$PI_HOME" <<'PYEOF'
+import sys
+path, pi_home = sys.argv[1], sys.argv[2]
+text = open(path).read()
+anchor = "filemanager.rp)"
+idx = text.find(anchor)
+if idx == -1:
+    print("[wifigate] anchor 'filemanager.rp)' not found in retropiemenu.sh; skipping menu wiring")
+    sys.exit(0)
+case_end = text.find(";;", idx)
+if case_end == -1:
+    print("[wifigate] could not find end of filemanager.rp) case; skipping menu wiring")
+    sys.exit(0)
+insert_point = text.find("\n", case_end) + 1
+line_start = text.rfind("\n", 0, idx) + 1
+indent = text[line_start:idx]
+insert_block = f"{indent}wifigate.rp)\n{indent}    python3 {pi_home}/scripts/wifi-settings.py\n{indent}    ;;\n"
+new_text = text[:insert_point] + insert_block + text[insert_point:]
+open(path, "w").write(new_text)
+print("[wifigate] wired into retropiemenu.sh")
+PYEOF
+    fi
+    return 0
+}
+
+phase_ftp_settings_tool() {
+    mkdir -p "$PI_HOME/scripts"
+    tee "$PI_HOME/scripts/ftp-settings.py" >/dev/null <<PYEOF
+#!/usr/bin/env python3
+"""
+FTP server on/off switch for pi-arcade-setup. Run from the RetroPie menu
+("FTP settings") or directly:
+    python3 ftp-settings.py
+Toggles the proftpd service pi-arcade-setup installs (enable+start /
+disable+stop), so file transfer only runs when you actually want it.
+
+Works with the controller as well as the keyboard: X/Cross toggles,
+Circle/B exits - same button roles as the rest of the RetroPie menu.
+"""
+import curses
+import select
+import struct
+import subprocess
+import sys
+
+JS_DEVICE = "/dev/input/js0"
+JS_EVENT_BUTTON = 0x01
+JS_EVENT_INIT = 0x80
+EVENT_FORMAT = "IhBB"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+BTN_CONFIRM = $BTN_X       # X / Cross / A - same role as the rest of the RetroPie menu
+BTN_BACK = $BTN_CIRCLE     # Circle / B - same role as the rest of the RetroPie menu
+
+SERVICE = "proftpd"
+
+COL_HEADER, COL_LABEL, COL_HINT, COL_GOOD, COL_BAD = 1, 2, 3, 4, 5
+
+
+def cx(win, text):
+    _, w = win.getmaxyx()
+    return max(0, (w - len(text)) // 2)
+
+
+def safe_addstr(win, y, x, text, attr=0):
+    h, w = win.getmaxyx()
+    if 0 <= y < h:
+        try:
+            win.addstr(y, max(0, x), text[: max(0, w - x - 1)], attr)
+        except curses.error:
+            pass
+
+
+def is_enabled():
+    try:
+        r = subprocess.run(["systemctl", "is-enabled", SERVICE], capture_output=True, text=True, timeout=3)
+        return r.stdout.strip() == "enabled"
+    except Exception:
+        return False
+
+
+def is_active():
+    try:
+        r = subprocess.run(["systemctl", "is-active", SERVICE], capture_output=True, text=True, timeout=3)
+        return r.stdout.strip() == "active"
+    except Exception:
+        return False
+
+
+def set_enabled(enable):
+    if enable:
+        subprocess.run(["sudo", "systemctl", "enable", "--now", SERVICE], capture_output=True, timeout=10)
+    else:
+        subprocess.run(["sudo", "systemctl", "disable", "--now", SERVICE], capture_output=True, timeout=10)
+
+
+def get_ip():
+    try:
+        r = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=3)
+        return r.stdout.strip().split()[0] if r.stdout.strip() else "?"
+    except Exception:
+        return "?"
+
+
+def open_joystick():
+    try:
+        return open(JS_DEVICE, "rb")
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def poll_action(stdscr, js_file, timeout=0.15):
+    fds = [sys.stdin]
+    if js_file is not None:
+        fds.append(js_file)
+    try:
+        ready, _, _ = select.select(fds, [], [], timeout)
+    except (OSError, ValueError):
+        ready = []
+
+    if js_file is not None and js_file in ready:
+        data = js_file.read(EVENT_SIZE)
+        if data and len(data) == EVENT_SIZE:
+            _t, value, typ, number = struct.unpack(EVENT_FORMAT, data)
+            is_init = bool(typ & JS_EVENT_INIT)
+            typ &= ~JS_EVENT_INIT
+            if not is_init and typ == JS_EVENT_BUTTON and value == 1:
+                if number == BTN_CONFIRM:
+                    return "confirm"
+                if number == BTN_BACK:
+                    return "back"
+
+    if sys.stdin in ready:
+        ch = stdscr.getch()
+        if ch in (10, 13, ord(" ")):
+            return "confirm"
+        if ch in (27, ord("q"), ord("Q")):
+            return "back"
+    return None
+
+
+def draw(win, enabled, active, busy, js_connected):
+    win.erase()
+    h, w = win.getmaxyx()
+    title = " FTP SETTINGS "
+    safe_addstr(win, 2, cx(win, title), title, curses.color_pair(COL_HEADER) | curses.A_BOLD)
+
+    status = "ON" if enabled else "OFF"
+    attr = curses.color_pair(COL_GOOD) if enabled else curses.color_pair(COL_BAD)
+    line = f"FTP server: {status}"
+    safe_addstr(win, h // 2 - 2, cx(win, line), line, attr | curses.A_BOLD)
+
+    if busy:
+        sub = "Applying..."
+    elif enabled and active:
+        sub = "Running - connect with any FTP client using the Pi user login."
+    elif enabled and not active:
+        sub = "Enabled but not running yet."
+    else:
+        sub = "Disabled."
+    safe_addstr(win, h // 2 - 1, cx(win, sub), sub, curses.A_DIM)
+
+    if enabled:
+        ip_line = f"ftp://{get_ip()}"
+        safe_addstr(win, h // 2 + 1, cx(win, ip_line), ip_line, curses.color_pair(COL_LABEL))
+
+    js_line = "Controller connected" if js_connected else "No controller detected - keyboard only"
+    safe_addstr(win, h - 3, cx(win, js_line), js_line, curses.A_DIM)
+
+    footer = "Enter/A/X: toggle on/off   ESC/B/Circle: exit"
+    safe_addstr(win, h - 2, cx(win, footer), footer, curses.color_pair(COL_HINT))
+    win.refresh()
+
+
+def run(stdscr):
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(COL_HEADER, curses.COLOR_YELLOW, -1)
+    curses.init_pair(COL_LABEL, curses.COLOR_CYAN, -1)
+    curses.init_pair(COL_HINT, curses.COLOR_YELLOW, -1)
+    curses.init_pair(COL_GOOD, curses.COLOR_GREEN, -1)
+    curses.init_pair(COL_BAD, curses.COLOR_RED, -1)
+    stdscr.nodelay(True)
+    stdscr.keypad(True)
+
+    js_file = open_joystick()
+    enabled = is_enabled()
+    active = is_active()
+
+    try:
+        while True:
+            draw(stdscr, enabled, active, False, js_file is not None)
+            action = poll_action(stdscr, js_file)
+            if action is None:
+                continue
+            if action == "back":
+                break
+            if action == "confirm":
+                draw(stdscr, enabled, active, True, js_file is not None)
+                set_enabled(not enabled)
+                enabled = is_enabled()
+                active = is_active()
+    finally:
+        if js_file is not None:
+            js_file.close()
+
+
+def main():
+    curses.wrapper(run)
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+    chmod +x "$PI_HOME/scripts/ftp-settings.py"
+
+    touch "$PI_HOME/RetroPie/retropiemenu/ftpsettings.rp"
+
+    local menu_script="$PI_HOME/RetroPie-Setup/scriptmodules/supplementary/retropiemenu.sh"
+    if [ -f "$menu_script" ] && ! grep -q "ftpsettings.rp)" "$menu_script"; then
+        sudo cp "$menu_script" "${menu_script}.bak.$(date +%s)"
+        sudo python3 - "$menu_script" "$PI_HOME" <<'PYEOF'
+import sys
+path, pi_home = sys.argv[1], sys.argv[2]
+text = open(path).read()
+anchor = "filemanager.rp)"
+idx = text.find(anchor)
+if idx == -1:
+    print("[ftpsettings] anchor 'filemanager.rp)' not found in retropiemenu.sh; skipping menu wiring")
+    sys.exit(0)
+case_end = text.find(";;", idx)
+if case_end == -1:
+    print("[ftpsettings] could not find end of filemanager.rp) case; skipping menu wiring")
+    sys.exit(0)
+insert_point = text.find("\n", case_end) + 1
+line_start = text.rfind("\n", 0, idx) + 1
+indent = text[line_start:idx]
+insert_block = f"{indent}ftpsettings.rp)\n{indent}    python3 {pi_home}/scripts/ftp-settings.py\n{indent}    ;;\n"
+new_text = text[:insert_point] + insert_block + text[insert_point:]
+open(path, "w").write(new_text)
+print("[ftpsettings] wired into retropiemenu.sh")
+PYEOF
+    fi
+    return 0
+}
+
 phase_finalize() {
     log ""
     log "========================================================"
@@ -2259,6 +4754,14 @@ main() {
         hotkey_remap_tool
         led_strip_setup
         led_config_tool
+        audio_output_setup
+        music_player_setup
+        bt_speaker_setup
+        bt_pair_tool
+        bt_player_tool
+        audio_settings_tool
+        wifi_settings_tool
+        ftp_settings_tool
         finalize
     )
 
