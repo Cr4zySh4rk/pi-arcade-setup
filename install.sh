@@ -4982,6 +4982,32 @@ def poll_action(stdscr, js_file, action_debounce, timeout=0.15):
     return action
 
 
+def settle_input(stdscr, js_file, duration=0.5):
+    """Discards any keyboard/joystick input that arrives during the
+    settle window - called right after toggling the service. Time-based
+    debounce alone only catches a second press within CONFIRM_DEBOUNCE_S;
+    this additionally sweeps up anything still queued from the same
+    physical press (or arriving while the blocking systemctl call above
+    was running), so it can't be misread as a second, unintended toggle
+    once the loop resumes."""
+    deadline = time.monotonic() + duration
+    fds = [sys.stdin] + ([js_file] if js_file is not None else [])
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            ready, _, _ = select.select(fds, [], [], remaining)
+        except (OSError, ValueError):
+            break
+        if not ready:
+            break
+        if js_file is not None and js_file in ready:
+            js_file.read(EVENT_SIZE)
+        if sys.stdin in ready:
+            stdscr.getch()
+
+
 def draw(win, enabled, active, busy, js_connected):
     win.erase()
     h, w = win.getmaxyx()
@@ -5045,6 +5071,7 @@ def run(stdscr):
                 set_enabled(not enabled)
                 enabled = is_enabled()
                 active = is_active()
+                settle_input(stdscr, js_file)
     finally:
         if js_file is not None:
             js_file.close()
