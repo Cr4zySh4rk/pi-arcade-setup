@@ -947,6 +947,47 @@ PROFEOF
 
 phase_custom_retropie_system() {
     mkdir -p "$PI_HOME/ES-DE/custom_systems" "$PI_HOME/ES-DE/gamelists/retropie"
+
+    local keep=(showip.rp avsettings.rp wifigate.rp ftpsettings.rp)
+    [ "$ENABLE_BT_SPEAKER" = "true" ] && keep+=(btpair.rp btaudio.rp)
+    [ "$ENABLE_CONTROLLER_HOTKEYS" = "true" ] && keep+=(hotkeyconfig.rp)
+    [ "$ENABLE_MUSIC_PLAYER" = "true" ] && keep+=(musicplayer.rp)
+    [ "$ENABLE_LED_STRIP" = "true" ] && keep+=(ledconfig.rp)
+
+    # RetroPie-Setup's own basic_install seeds this same directory with a
+    # full set of classic-EmulationStation menu stub files (filemanager.rp,
+    # raspiconfig.rp, retroarch.rp, runcommand.rp, esthemes.rp,
+    # splashscreen.rp, retronetplay.rp, rpsetup.rp, wifi.rp, bluetooth.rp,
+    # configedit.rp, and more depending on version) - this custom ES-DE
+    # system points at that same directory with the same .rp extension, so
+    # any of those (or a file left over from an earlier run of this script
+    # under an old name, e.g. this tool's own audiosettings.rp before it
+    # was renamed to avsettings.rp) can get silently picked up by ES-DE's
+    # own gamelist scanner and added to the menu as a bare, undescribed
+    # entry - even though it was never in the curated gamelist.xml below.
+    # Delete anything in the directory that isn't one of this build's own
+    # tools so that can't happen; this runs every time this phase runs, so
+    # a rename here (like avsettings.rp's own history) cleans up after
+    # itself on the next re-run too.
+    if [ -d "$PI_HOME/RetroPie/retropiemenu" ]; then
+        local f base found k
+        for f in "$PI_HOME"/RetroPie/retropiemenu/*.rp; do
+            [ -e "$f" ] || continue
+            base="$(basename "$f")"
+            found=false
+            for k in "${keep[@]}"; do
+                if [ "$base" = "$k" ]; then
+                    found=true
+                    break
+                fi
+            done
+            if [ "$found" = false ]; then
+                rm -f "$f"
+                log "removed stray/obsolete RetroPie menu stub: $base"
+            fi
+        done
+    fi
+
     tee "$PI_HOME/ES-DE/custom_systems/es_systems.xml" >/dev/null <<EOF
 <?xml version="1.0"?>
 <systemList>
