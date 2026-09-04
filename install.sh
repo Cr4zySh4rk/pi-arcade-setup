@@ -2865,15 +2865,22 @@ phase_bt_speaker_setup() {
         log "ENABLE_BT_SPEAKER=false, skipping"
         return 0
     fi
-    # Turns the Pi into an always-on A2DP sink via PipeWire/WirePlumber's
-    # native Bluetooth module (libspa-0.2-bluetooth) - this OS image already
-    # runs PipeWire by default (see phase_audio_output_setup), so this is
-    # the native path rather than pulling in bluealsa (not packaged for
-    # this Debian release) or a whole separate PulseAudio stack. bt-agent
-    # (bluez-tools) is a headless "NoInputNoOutput" pairing agent so phones
-    # (and controllers, for the Bluetooth pairing tool) can pair without
-    # any PIN prompt.
-    sudo apt-get install -y bluez-tools python3-dbus python3-gi libspa-0.2-bluetooth \
+    # Turns the Pi into an A2DP sink using BlueALSA (bluez-alsa-utils), not
+    # PipeWire/WirePlumber's own bluez5 SPA monitor. That was the original
+    # design (this OS image already runs PipeWire for everything else), but
+    # it turned out unreliable specifically for A2DP on this Pi's onboard
+    # Bluetooth chip: media endpoints got registered/unregistered per
+    # connection attempt instead of staying up, and profile connections
+    # consistently failed as NotAvailable even once a phone was paired -
+    # confirmed live via btmon HCI captures across many repeated attempts.
+    # BlueALSA registers the Audio Sink profile with bluetoothd once,
+    # persistently, at its own startup, and its companion bluealsa-aplay
+    # plays the decoded audio into the Pi's normal "default" ALSA device -
+    # which still resolves through PipeWire (see phase_audio_output_setup),
+    # so it comes out the same pinned aux/HDMI output as everything else.
+    # python3-dbus/python3-gi back this project's own pairing agent and the
+    # AVRCP now-playing daemon below.
+    sudo apt-get install -y bluez-alsa-utils python3-dbus python3-gi \
         || { log_warn "Bluetooth speaker dependency install failed; skipping"; return 0; }
 
     # BlueZ's "hostname" plugin (loaded by default) overrides main.conf's
@@ -2891,9 +2898,13 @@ anchor = "[General]"
 idx = text.find(anchor)
 insert_at = idx + len(anchor) if idx != -1 else 0
 block = (
-    "\n# pi-arcade-setup: always-discoverable/pairable speaker, identifies as\n"
-    "# an Audio/Video Loudspeaker (Rendering + Audio service bits, per the\n"
-    "# Bluetooth CoD spec) so it shows up sensibly in phone BT device lists.\n"
+    "\n# pi-arcade-setup: speaker, identifies as an Audio/Video Loudspeaker\n"
+    "# (Rendering + Audio service bits, per the Bluetooth CoD spec) so it\n"
+    "# shows up sensibly in phone BT device lists. Discoverable/pairable are\n"
+    "# toggled at runtime by bt-power-on.service (off, at boot) and\n"
+    "# bt-nowplaying.py (on, only while the \"Bluetooth Player\" screen is\n"
+    "# open) - these timeouts just mean \"stay in whatever state you're put\n"
+    "# in\" rather than auto-reverting on their own.\n"
     "Class = 0x240414\n"
     "DiscoverableTimeout = 0\n"
     "PairableTimeout = 0\n"
@@ -2909,17 +2920,144 @@ PYEOF
     sleep 1
     sudo bluetoothctl power on >/dev/null 2>&1 || true
 
-    # Persist the pi user's PipeWire/WirePlumber session across reboots so
-    # the A2DP sink is always up, independent of whether a console/graphical
-    # session is active.
+    # Persist the pi user's PipeWire session across reboots - bluealsa-aplay
+    # plays into its "default" ALSA device, which resolves through this
+    # session's PipeWire (for the aux-pinned output, see
+    # phase_audio_output_setup), so it needs to always be up, independent of
+    # whether a console/graphical session is active.
     sudo loginctl enable-linger "$PI_USER" || log_warn "could not enable linger for $PI_USER"
 
     local uid
     uid="$(id -u "$PI_USER")"
+
+    # Disable PipeWire's own bluez5 SPA monitor entirely now that BlueALSA
+    # owns A2DP - otherwise the two would both try to register the same
+    # Bluetooth audio profile with bluetoothd.
+    sudo -u "$PI_USER" mkdir -p "$PI_HOME/.config/wireplumber/wireplumber.conf.d"
+    sudo -u "$PI_USER" tee "$PI_HOME/.config/wireplumber/wireplumber.conf.d/51-disable-bluez-monitor.conf" >/dev/null <<'CONF'
+# pi-arcade-setup: BlueALSA (bluealsa.service) owns A2DP, not PipeWire's own
+# bluez5 SPA monitor - disable the latter so they don't both try to
+# register the same Bluetooth audio profile with bluetoothd. See
+# phase_bt_speaker_setup in install.sh for why.
+wireplumber.profiles = {
+  main = {
+    hardware.bluetooth = disabled
+  }
+}
+CONF
     sudo -u "$PI_USER" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user restart wireplumber pipewire pipewire-pulse 2>/dev/null \
-        || log_warn "could not restart pipewire/wireplumber user services; Bluetooth audio will apply on next login"
+        || log_warn "could not restart pipewire/wireplumber user services; apply on next login"
 
     mkdir -p "$PI_HOME/scripts"
+
+    tee "$PI_HOME/scripts/bt-pairing-agent.py" >/dev/null <<PYEOF
+#!/usr/bin/env python3
+"""
+Headless Bluetooth pairing agent for pi-arcade-setup, run as a systemd
+service (bt-agent.service). Auto-accepts every pairing request with no PIN
+prompt on either side ("Just Works"/"NoInputNoOutput" capability) - the
+same policy `bt-agent` from bluez-tools was supposed to provide, but that
+binary turned out to be unreliable on this BlueZ/D-Bus version: it printed
+"Agent registered" at startup and then hung - its GLib main loop never
+actually pumped, so it never answered a single RequestConfirmation call
+(confirmed live: its own journal stayed completely empty across several
+real pairing attempts, and it needed SIGKILL on every stop/restart because
+it was wedged, not just slow). BlueZ has no fallback for an agent that's
+registered-but-unresponsive: it rejects the confirmation in under a
+millisecond rather than waiting on a dead process, which looked exactly
+like a rejected pairing to every phone that tried.
+
+This replaces it with a small, direct implementation of BlueZ's
+org.bluez.Agent1 D-Bus interface (the same approach already used
+elsewhere in this project - see bt-controller-pair.py and
+bt-nowplaying-daemon.py - rather than depending on a third-party binary).
+"""
+import dbus
+import dbus.mainloop.glib
+import dbus.service
+from gi.repository import GLib
+
+BUS_NAME = "org.bluez"
+AGENT_MANAGER_IFACE = "org.bluez.AgentManager1"
+AGENT_IFACE = "org.bluez.Agent1"
+AGENT_PATH = "/pi_arcade_setup/pairing_agent"
+# Advertised as DisplayYesNo, not NoInputNoOutput, even though this agent
+# never actually displays anything or asks a human - confirmed live (via
+# btmon HCI capture) that phones requesting MITM-protected "Dedicated
+# Bonding" during pairing get auto-rejected by BlueZ itself before the
+# agent is ever consulted, specifically because NoInputNoOutput cannot
+# satisfy that MITM requirement (bluetoothd won't silently downgrade
+# security below what the peer asked for). DisplayYesNo can satisfy it,
+# and RequestConfirmation below still auto-accepts unconditionally, so
+# pairing stays fully unattended either way.
+CAPABILITY = "DisplayYesNo"
+
+
+class PairingAgent(dbus.service.Object):
+    @dbus.service.method(AGENT_IFACE, in_signature="", out_signature="")
+    def Release(self):
+        print("[bt-pairing-agent] Release()")
+
+    @dbus.service.method(AGENT_IFACE, in_signature="os", out_signature="")
+    def AuthorizeService(self, device, uuid):
+        # Accept every profile/service a paired-or-pairing device asks for -
+        # this Pi is a dedicated speaker/controller-pairing kiosk, not a
+        # multi-tenant machine that needs a human gatekeeping each profile.
+        print(f"[bt-pairing-agent] AuthorizeService({device}, {uuid}) -> accept")
+        return
+
+    @dbus.service.method(AGENT_IFACE, in_signature="o", out_signature="s")
+    def RequestPinCode(self, device):
+        return "0000"
+
+    @dbus.service.method(AGENT_IFACE, in_signature="o", out_signature="u")
+    def RequestPasskey(self, device):
+        return dbus.UInt32(0)
+
+    @dbus.service.method(AGENT_IFACE, in_signature="ouq", out_signature="")
+    def DisplayPasskey(self, device, passkey, entered):
+        pass
+
+    @dbus.service.method(AGENT_IFACE, in_signature="os", out_signature="")
+    def DisplayPinCode(self, device, pincode):
+        pass
+
+    @dbus.service.method(AGENT_IFACE, in_signature="ou", out_signature="")
+    def RequestConfirmation(self, device, passkey):
+        # The auto-accept: no comparison, no prompt, matching a
+        # NoInputNoOutput/"Just Works" capability on both this and every
+        # other pi-arcade-setup Bluetooth tool.
+        print(f"[bt-pairing-agent] RequestConfirmation({device}, {passkey}) -> accept")
+        return
+
+    @dbus.service.method(AGENT_IFACE, in_signature="o", out_signature="")
+    def RequestAuthorization(self, device):
+        print(f"[bt-pairing-agent] RequestAuthorization({device}) -> accept")
+        return
+
+    @dbus.service.method(AGENT_IFACE, in_signature="", out_signature="")
+    def Cancel(self):
+        print("[bt-pairing-agent] Cancel()")
+
+
+def main():
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    agent = PairingAgent(bus, AGENT_PATH)
+
+    manager = dbus.Interface(bus.get_object(BUS_NAME, "/org/bluez"), AGENT_MANAGER_IFACE)
+    manager.RegisterAgent(AGENT_PATH, CAPABILITY)
+    manager.RequestDefaultAgent(AGENT_PATH)
+
+    print(f"[bt-pairing-agent] registered as default agent (capability={CAPABILITY})")
+    GLib.MainLoop().run()
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+    chmod +x "$PI_HOME/scripts/bt-pairing-agent.py"
+
     tee "$PI_HOME/scripts/bt-nowplaying-daemon.py" >/dev/null <<PYEOF
 #!/usr/bin/env python3
 """
@@ -2943,12 +3081,34 @@ import dbus
 
 STATUS_FILE = "$PI_HOME/.bt-nowplaying-status.json"
 COMMAND_FILE = "$PI_HOME/.bt-nowplaying-command.json"
+# Touched by bt-nowplaying.py on start and removed on exit - lets this
+# always-on daemon know whether the "Bluetooth Player" screen is currently
+# open, so the Pi only actively behaves as a Bluetooth *audio* device
+# (proactively connecting A2DP, staying connected) while that screen is
+# up, and reverts to a plain Bluetooth host - explicitly disconnecting any
+# connected phone - the moment it's closed. This is what keeps game/UI
+# audio on the Pi's own output and keeps the single Bluetooth radio's time
+# free for a paired game controller the rest of the time, rather than the
+# Pi silently remaining an audio sink in the background forever.
+ACTIVE_FLAG_FILE = "$PI_HOME/.bt-nowplaying-active"
 POLL_INTERVAL = 1.0
 
 BLUEZ_SERVICE = "org.bluez"
 DEVICE_IFACE = "org.bluez.Device1"
 PLAYER_IFACE = "org.bluez.MediaPlayer1"
 PROPS_IFACE = "org.freedesktop.DBus.Properties"
+AUDIO_SINK_UUID = "0000110b-0000-1000-8000-00805f9b34fb"
+RECONNECT_RETRY_S = 5.0
+# A2DP is provided by BlueALSA (bluealsa.service + bluealsa-aplay.service),
+# which registers the Audio Sink profile with bluetoothd persistently at
+# its own startup - not PipeWire's bluez5 SPA monitor, which turned out
+# unreliable for this specific onboard-Bluetooth-chip + A2DP combination
+# (endpoints registered/unregistered per-connection instead of staying up,
+# profile connections consistently failing as NotAvailable even once
+# paired - confirmed live via btmon). Retried on a short interval mainly
+# so a phone that doesn't proactively reopen A2DP on its own gets pulled
+# back in automatically rather than sitting paired-but-silent.
+_last_connect_attempt = {}
 
 
 def get_managed_objects(bus):
@@ -2991,6 +3151,46 @@ def auto_trust(bus, objects):
                 print(f"[bt-nowplaying] auto-trusted {path}")
             except Exception as e:
                 print(f"[bt-nowplaying] failed to trust {path}: {e}")
+
+
+def reconnect_paired_devices(bus, objects):
+    """While the Bluetooth Player screen is open: for every paired/trusted
+    device that isn't currently connected, (re)request the Audio Sink
+    profile specifically - not a generic Device1.Connect(), which also
+    tries the complementary a2dp-source profile and hard-fails the whole
+    attempt with br-connection-profile-unavailable if that role isn't
+    registered. Throttled per-device rather than hammered every poll."""
+    now = time.time()
+    for path, ifaces in objects.items():
+        dev = ifaces.get(DEVICE_IFACE)
+        if not dev or not bool(dev.get("Paired")) or bool(dev.get("Connected")):
+            continue
+        if now - _last_connect_attempt.get(path, 0.0) < RECONNECT_RETRY_S:
+            continue
+        _last_connect_attempt[path] = now
+        try:
+            device = dbus.Interface(bus.get_object(BLUEZ_SERVICE, path), DEVICE_IFACE)
+            device.ConnectProfile(AUDIO_SINK_UUID)
+            print(f"[bt-nowplaying] reconnected {path}")
+        except Exception as e:
+            print(f"[bt-nowplaying] reconnect attempt for {path} failed: {e}")
+
+
+def disconnect_all(bus, objects):
+    """Explicitly drops any connected phone - used when the Bluetooth
+    Player screen closes, so the Pi stops being a Bluetooth audio device
+    the instant the user leaves that screen rather than leaving a phone
+    connected (and holding radio time a paired game controller needs) in
+    the background indefinitely."""
+    for path, ifaces in objects.items():
+        dev = ifaces.get(DEVICE_IFACE)
+        if dev and bool(dev.get("Connected")):
+            try:
+                device = dbus.Interface(bus.get_object(BLUEZ_SERVICE, path), DEVICE_IFACE)
+                device.Disconnect()
+                print(f"[bt-nowplaying] disconnected {path} (Bluetooth Player closed)")
+            except Exception as e:
+                print(f"[bt-nowplaying] disconnect of {path} failed: {e}")
 
 
 def jstr(v, default=""):
@@ -3078,9 +3278,22 @@ def run_command(bus, player_path, cmd):
 def main():
     bus = dbus.SystemBus()
     last_seq = None
+    was_active = False
     while True:
         objects = get_managed_objects(bus)
-        auto_trust(bus, objects)
+        is_active = os.path.exists(ACTIVE_FLAG_FILE)
+
+        if is_active:
+            auto_trust(bus, objects)
+            reconnect_paired_devices(bus, objects)
+        elif was_active:
+            # Bluetooth Player just closed - drop any connected phone so
+            # the Pi goes back to being a plain host device immediately,
+            # not whenever that phone eventually times out on its own.
+            disconnect_all(bus, objects)
+            objects = get_managed_objects(bus)
+        was_active = is_active
+
         device_props, player_path, player_props = find_connected_device_and_player(objects)
         write_status(device_props, player_path, player_props)
 
@@ -3098,28 +3311,43 @@ if __name__ == "__main__":
 PYEOF
     chmod +x "$PI_HOME/scripts/bt-nowplaying-daemon.py"
 
+    # BlueALSA defaults to advertising both a2dp-sink and a2dp-source; this
+    # Pi only ever needs to be a sink, so trim it to just that.
+    sudo mkdir -p /etc/systemd/system/bluealsa.service.d
+    sudo tee /etc/systemd/system/bluealsa.service.d/override.conf >/dev/null <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/bin/bluealsa -S --keep-alive=5 -p a2dp-sink
+EOF
+
     sudo tee /etc/systemd/system/bt-agent.service >/dev/null <<EOF
 [Unit]
-Description=Headless Bluetooth pairing agent (auto-accept, NoInputNoOutput)
-After=bluetooth.service
+Description=Headless Bluetooth pairing agent (auto-accept, DisplayYesNo)
+After=bluetooth.service dbus.service
 Requires=bluetooth.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/bt-agent -c NoInputNoOutput
+ExecStart=/usr/bin/python3 -u $PI_HOME/scripts/bt-pairing-agent.py
 Restart=always
 RestartSec=2
+User=root
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    # Clean up the old always-discoverable service from earlier versions of
-    # this script, if present (upgrade path) - superseded by bt-power-on.service.
+    # Clean up the old always-discoverable service and third-party bt-agent
+    # binary from earlier versions of this script, if present (upgrade
+    # path) - superseded by bt-power-on.service and bt-pairing-agent.py
+    # respectively (bluez-tools' own bt-agent turned out to hang and never
+    # actually answer a pairing request - confirmed live via its own empty
+    # journal across several real attempts).
     if [ -f /etc/systemd/system/bt-discoverable.service ]; then
         sudo systemctl disable --now bt-discoverable.service 2>/dev/null || true
         sudo rm -f /etc/systemd/system/bt-discoverable.service
     fi
+    sudo pkill -9 -f "bt-agent -c" 2>/dev/null || true
 
     # Powers the adapter on at boot only - deliberately does NOT enable
     # discoverable/pairable here. Being discoverable to new devices is
@@ -3164,6 +3392,7 @@ WantedBy=multi-user.target
 EOF
 
     sudo systemctl daemon-reload
+    sudo systemctl enable --now bluealsa.service bluealsa-aplay.service
     sudo systemctl enable --now bt-agent.service bt-power-on.service bt-nowplaying-daemon.service
     return 0
 }
@@ -3517,13 +3746,18 @@ directly:
 Shows the track currently streaming from a connected phone via AVRCP
 metadata, and can send play/pause/next/previous back to the phone - the
 audio itself is handled entirely by the always-on background daemon and
-PipeWire, so this tool is only a display+remote (closing it does not stop
-playback). Also adjusts the Pi's own output volume.
+PipeWire, so this tool is only a display+remote. Also adjusts the Pi's
+own output volume.
 
-The Pi only shows up as a connectable Bluetooth device to a NEW phone
-while this screen is open (discoverable/pairable are switched on when it
-starts and off when it exits) - a phone that's already paired can still
-reconnect and stream at any time.
+The Pi behaves as a Bluetooth *audio* device - discoverable/pairable to
+new phones, and actively holding/reconnecting a paired phone's A2DP link -
+only while this screen is open. Closing it disconnects any connected
+phone and turns discoverable/pairable back off, so game/UI audio stays on
+the Pi's own output the rest of the time and a paired Bluetooth game
+controller isn't sharing the single Bluetooth radio with an idle audio
+link. None of this touches controller pairing/input at all - that's a
+separate Bluetooth profile (HID, handled by the kernel) from the A2DP
+audio profile this screen manages.
 
 Fully navigable by controller as well as keyboard: left stick (or D-pad) to
 skip tracks or adjust volume, X/Cross to confirm, Circle/B to exit - same
@@ -3541,6 +3775,11 @@ import time
 PI_HOME = "$PI_HOME"
 STATUS_FILE = "$PI_HOME/.bt-nowplaying-status.json"
 COMMAND_FILE = "$PI_HOME/.bt-nowplaying-command.json"
+# Tells the always-on background daemon (bt-nowplaying-daemon.py) that this
+# screen is open, so it only actively behaves as a Bluetooth audio device -
+# proactively connecting/holding a phone's A2DP link - while it's up. See
+# ACTIVE_FLAG_FILE in that daemon's source for the full reasoning.
+ACTIVE_FLAG_FILE = "$PI_HOME/.bt-nowplaying-active"
 SPEAKER_NAME = "$BT_SPEAKER_NAME"
 
 JS_DEVICE = "/dev/input/js0"
@@ -3753,7 +3992,7 @@ def draw(win, status, vol, muted, js_connected, t):
     win.erase()
     h, w = win.getmaxyx()
 
-    title_bar = f"🔊  {SPEAKER_NAME}  🔊"
+    title_bar = "🔊  Bluetooth Player  🔊"
     safe_addstr(win, 0, cx(win, title_bar), title_bar, curses.color_pair(COL_HEADER) | curses.A_BOLD)
 
     card_w = min(w - 4, 66)
@@ -3852,8 +4091,15 @@ def run(stdscr):
 
     # Only advertise the Pi to new phones while this screen is open (see
     # set_discoverable's docstring) - always turned back off in the
-    # `finally` block below, however this loop exits.
+    # `finally` block below, however this loop exits. Same idea for the
+    # active-flag file: it tells the background daemon to actively hold/
+    # reconnect a phone's audio link only while this screen is up.
     set_discoverable(True)
+    try:
+        with open(ACTIVE_FLAG_FILE, "w") as f:
+            f.write("1")
+    except Exception:
+        pass
 
     try:
         while True:
@@ -3884,6 +4130,10 @@ def run(stdscr):
                 vol, muted = get_volume()
     finally:
         set_discoverable(False)
+        try:
+            os.remove(ACTIVE_FLAG_FILE)
+        except Exception:
+            pass
         if js_file is not None:
             js_file.close()
 
