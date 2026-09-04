@@ -4943,7 +4943,17 @@ def open_joystick():
         return None
 
 
-def poll_action(stdscr, js_file, action_debounce, timeout=0.15):
+def poll_action(stdscr, js_file, button_state, action_debounce, timeout=0.15):
+    """button_state tracks whether BTN_CONFIRM/BTN_BACK are currently held,
+    so an action only fires on the press edge (0->1). This is the primary
+    defense against a double-fire: some controllers/drivers report a
+    repeat "still held" button-down event for what a person experiences as
+    a single tap (not just true switch bounce, which is normally sub-50ms)
+    - a fixed debounce window can't reliably tell that apart from a
+    genuine second press, but requiring an intervening release (value=0)
+    can, regardless of timing. action_debounce is kept as a secondary
+    safety net, mainly for the keyboard path below, where a raw terminal
+    read can't distinguish a held key from a fresh one the same way."""
     fds = [sys.stdin]
     if js_file is not None:
         fds.append(js_file)
@@ -4960,11 +4970,14 @@ def poll_action(stdscr, js_file, action_debounce, timeout=0.15):
             _t, value, typ, number = struct.unpack(EVENT_FORMAT, data)
             is_init = bool(typ & JS_EVENT_INIT)
             typ &= ~JS_EVENT_INIT
-            if not is_init and typ == JS_EVENT_BUTTON and value == 1:
-                if number == BTN_CONFIRM:
-                    action = "confirm"
-                elif number == BTN_BACK:
-                    action = "back"
+            if not is_init and typ == JS_EVENT_BUTTON and number in (BTN_CONFIRM, BTN_BACK):
+                was_held = button_state.get(number, False)
+                button_state[number] = bool(value)
+                if value == 1 and not was_held:
+                    if number == BTN_CONFIRM:
+                        action = "confirm"
+                    elif number == BTN_BACK:
+                        action = "back"
 
     if action is None and sys.stdin in ready:
         ch = stdscr.getch()
@@ -5054,6 +5067,7 @@ def run(stdscr):
     stdscr.keypad(True)
 
     js_file = open_joystick()
+    button_state = {}
     action_debounce = {}
     enabled = is_enabled()
     active = is_active()
@@ -5061,7 +5075,7 @@ def run(stdscr):
     try:
         while True:
             draw(stdscr, enabled, active, False, js_file is not None)
-            action = poll_action(stdscr, js_file, action_debounce)
+            action = poll_action(stdscr, js_file, button_state, action_debounce)
             if action is None:
                 continue
             if action == "back":
