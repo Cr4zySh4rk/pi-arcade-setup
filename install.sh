@@ -141,14 +141,17 @@ ENABLE_MUSIC_PLAYER="${ENABLE_MUSIC_PLAYER:-true}"
 MUSIC_DIR="${MUSIC_DIR:-$PI_HOME/RetroPie/Music}"
 
 # --- Bluetooth speaker ---------------------------------------------------------
-# Turns the Pi into an always-on A2DP sink advertised as BT_SPEAKER_NAME, via
-# PipeWire/WirePlumber's native Bluetooth module (already the default audio
-# stack on this OS image - see phase_bt_speaker_setup for why bluealsa/
-# PulseAudio aren't used instead) plus a headless auto-accept pairing agent.
-# RetroPie menu -> "Bluetooth Audio" shows AVRCP now-playing metadata from
-# the connected phone and can send it play/pause/next/prev, car-head-unit
-# style. The A2DP sink itself keeps running in the background regardless of
-# whether that tool is open, same as the LED strip daemon.
+# Turns the Pi into an A2DP sink advertised as BT_SPEAKER_NAME, via BlueALSA
+# (bluealsa + bluealsa-aplay - see phase_bt_speaker_setup for why PipeWire/
+# WirePlumber's own bluez5 monitor isn't used instead) plus this project's
+# own headless auto-accept pairing agent. RetroPie menu -> "Bluetooth Player"
+# shows AVRCP now-playing metadata from the connected phone and can send it
+# play/pause/next/prev, car-head-unit style. Unlike the LED strip daemon, the
+# Pi only actively behaves as a Bluetooth audio device - discoverable to new
+# phones, holding/reconnecting a paired phone's A2DP link - while that tool
+# is open; closing it disconnects any phone and reverts the Pi to a plain
+# Bluetooth host, so a paired game controller isn't sharing the radio with
+# an idle audio link the rest of the time.
 ENABLE_BT_SPEAKER="${ENABLE_BT_SPEAKER:-true}"
 BT_SPEAKER_NAME="${BT_SPEAKER_NAME:-RetroPieArcade}"
 
