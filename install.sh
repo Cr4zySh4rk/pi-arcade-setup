@@ -1945,6 +1945,7 @@ import os
 import select
 import struct
 import sys
+import time
 
 CONFIG_FILE = "$PI_HOME/.led-strip-config.json"
 LED_COUNT_MAX = $LED_COUNT_MAX
@@ -2078,7 +2079,16 @@ def open_joystick():
         return None
 
 
-def poll_action(stdscr, js_file, axis_state, timeout=0.08):
+CONFIRM_DEBOUNCE_S = 0.25
+# Guards confirm/back specifically (not directional movement) against
+# switch/contact bounce on cheap arcade buttons and joystick encoders, which
+# can report two or more rapid press events for what is physically a single
+# tap - without this a bounced confirm press on "power" could toggle the LED
+# strip on and then immediately back off again, which looks to the user like
+# the button "did nothing".
+
+
+def poll_action(stdscr, js_file, axis_state, action_debounce, timeout=0.08):
     """Blocks up to `timeout` seconds for keyboard or joystick input, and
     returns one of "up"/"down"/"left"/"right"/"confirm"/"back"/None.
     axis_state tracks whether each stick axis is currently past the
@@ -2092,6 +2102,8 @@ def poll_action(stdscr, js_file, axis_state, timeout=0.08):
     except (OSError, ValueError):
         ready = []
 
+    action = None
+
     if js_file is not None and js_file in ready:
         data = js_file.read(EVENT_SIZE)
         if data and len(data) == EVENT_SIZE:
@@ -2101,9 +2113,9 @@ def poll_action(stdscr, js_file, axis_state, timeout=0.08):
             if not is_init:
                 if typ == JS_EVENT_BUTTON and value == 1:
                     if number == BTN_CONFIRM:
-                        return "confirm"
-                    if number == BTN_BACK:
-                        return "back"
+                        action = "confirm"
+                    elif number == BTN_BACK:
+                        action = "back"
                 elif typ == JS_EVENT_AXIS and number in (0, 1):
                     past = abs(value) > AXIS_THRESHOLD
                     was_past = axis_state.get(number, False)
@@ -2114,7 +2126,7 @@ def poll_action(stdscr, js_file, axis_state, timeout=0.08):
                         else:
                             return "down" if value > 0 else "up"
 
-    if sys.stdin in ready:
+    if action is None and sys.stdin in ready:
         ch = stdscr.getch()
         if ch == curses.KEY_UP:
             return "up"
@@ -2125,10 +2137,17 @@ def poll_action(stdscr, js_file, axis_state, timeout=0.08):
         if ch == curses.KEY_RIGHT:
             return "right"
         if ch in (10, 13, ord(" ")):
-            return "confirm"
-        if ch in (27, ord("q"), ord("Q")):
-            return "back"
-    return None
+            action = "confirm"
+        elif ch in (27, ord("q"), ord("Q")):
+            action = "back"
+
+    if action in ("confirm", "back"):
+        now = time.monotonic()
+        if now - action_debounce.get(action, 0.0) < CONFIRM_DEBOUNCE_S:
+            return None
+        action_debounce[action] = now
+
+    return action
 
 
 def run(stdscr):
@@ -2146,6 +2165,7 @@ def run(stdscr):
 
     js_file = open_joystick()
     axis_state = {}
+    action_debounce = {}
 
     cfg = load_config()
     sel = 0
@@ -2155,7 +2175,7 @@ def run(stdscr):
     try:
         while True:
             draw(stdscr, cfg, sel, preset_idx, js_file is not None)
-            action = poll_action(stdscr, js_file, axis_state)
+            action = poll_action(stdscr, js_file, axis_state, action_debounce)
             if action is None:
                 continue
 
@@ -3541,7 +3561,15 @@ def open_joystick():
         return None
 
 
-def poll_action(stdscr, js_file, axis_state, timeout=0.15):
+CONFIRM_DEBOUNCE_S = 0.25
+# Guards confirm/back specifically (not directional movement) against
+# switch/contact bounce on cheap arcade buttons and joystick encoders, which
+# can report two or more rapid press events for what is physically a single
+# tap - without this a bounced confirm press could fire pair_device() twice
+# in quick succession for the same target.
+
+
+def poll_action(stdscr, js_file, axis_state, action_debounce, timeout=0.15):
     fds = [sys.stdin]
     if js_file is not None:
         fds.append(js_file)
@@ -3549,6 +3577,8 @@ def poll_action(stdscr, js_file, axis_state, timeout=0.15):
         ready, _, _ = select.select(fds, [], [], timeout)
     except (OSError, ValueError):
         ready = []
+
+    action = None
 
     if js_file is not None and js_file in ready:
         data = js_file.read(EVENT_SIZE)
@@ -3559,9 +3589,9 @@ def poll_action(stdscr, js_file, axis_state, timeout=0.15):
             if not is_init:
                 if typ == JS_EVENT_BUTTON and value == 1:
                     if number == BTN_CONFIRM:
-                        return "confirm"
-                    if number == BTN_BACK:
-                        return "back"
+                        action = "confirm"
+                    elif number == BTN_BACK:
+                        action = "back"
                 elif typ == JS_EVENT_AXIS and number in (0, 1):
                     past = abs(value) > AXIS_THRESHOLD
                     was_past = axis_state.get(number, False)
@@ -3572,17 +3602,24 @@ def poll_action(stdscr, js_file, axis_state, timeout=0.15):
                         else:
                             return "down" if value > 0 else "up"
 
-    if sys.stdin in ready:
+    if action is None and sys.stdin in ready:
         ch = stdscr.getch()
         if ch == curses.KEY_UP:
             return "up"
         if ch == curses.KEY_DOWN:
             return "down"
         if ch in (10, 13, ord(" ")):
-            return "confirm"
-        if ch in (27, ord("q"), ord("Q")):
-            return "back"
-    return None
+            action = "confirm"
+        elif ch in (27, ord("q"), ord("Q")):
+            action = "back"
+
+    if action in ("confirm", "back"):
+        now = time.monotonic()
+        if now - action_debounce.get(action, 0.0) < CONFIRM_DEBOUNCE_S:
+            return None
+        action_debounce[action] = now
+
+    return action
 
 
 def draw(win, devices, sel, js_connected, status_line, status_attr, scanning):
@@ -3669,6 +3706,7 @@ def run(stdscr):
 
     js_file = open_joystick()
     axis_state = {}
+    action_debounce = {}
 
     bus = dbus.SystemBus()
     adapter_path = find_adapter_path(bus)
@@ -3708,7 +3746,7 @@ def run(stdscr):
                 last_scan_poll = t
 
             draw(stdscr, devices, sel, js_file is not None, status_line, status_attr, scanning)
-            action = poll_action(stdscr, js_file, axis_state)
+            action = poll_action(stdscr, js_file, axis_state, action_debounce)
             if action is None:
                 continue
 
@@ -4244,6 +4282,7 @@ import select
 import struct
 import subprocess
 import sys
+import time
 
 PI_HOME = "$PI_HOME"
 
@@ -4380,7 +4419,16 @@ def open_joystick():
         return None
 
 
-def poll_action(stdscr, js_file, axis_state, timeout=0.1):
+CONFIRM_DEBOUNCE_S = 0.25
+# Guards confirm/back specifically (not directional movement) against
+# switch/contact bounce on cheap arcade buttons and joystick encoders, which
+# can report two or more rapid press events for what is physically a single
+# tap - without this a bounced confirm press on "mute" could toggle mute on
+# and then immediately back off again, which looks to the user like the
+# button "did nothing".
+
+
+def poll_action(stdscr, js_file, axis_state, action_debounce, timeout=0.1):
     fds = [sys.stdin]
     if js_file is not None:
         fds.append(js_file)
@@ -4388,6 +4436,8 @@ def poll_action(stdscr, js_file, axis_state, timeout=0.1):
         ready, _, _ = select.select(fds, [], [], timeout)
     except (OSError, ValueError):
         ready = []
+
+    action = None
 
     if js_file is not None and js_file in ready:
         data = js_file.read(EVENT_SIZE)
@@ -4398,9 +4448,9 @@ def poll_action(stdscr, js_file, axis_state, timeout=0.1):
             if not is_init:
                 if typ == JS_EVENT_BUTTON and value == 1:
                     if number == BTN_CONFIRM:
-                        return "confirm"
-                    if number == BTN_BACK:
-                        return "back"
+                        action = "confirm"
+                    elif number == BTN_BACK:
+                        action = "back"
                 elif typ == JS_EVENT_AXIS and number in (0, 1):
                     past = abs(value) > AXIS_THRESHOLD
                     was_past = axis_state.get(number, False)
@@ -4411,7 +4461,7 @@ def poll_action(stdscr, js_file, axis_state, timeout=0.1):
                         else:
                             return "down" if value > 0 else "up"
 
-    if sys.stdin in ready:
+    if action is None and sys.stdin in ready:
         ch = stdscr.getch()
         if ch == curses.KEY_UP:
             return "up"
@@ -4422,10 +4472,17 @@ def poll_action(stdscr, js_file, axis_state, timeout=0.1):
         if ch == curses.KEY_RIGHT:
             return "right"
         if ch in (10, 13, ord(" ")):
-            return "confirm"
-        if ch in (27, ord("q"), ord("Q")):
-            return "back"
-    return None
+            action = "confirm"
+        elif ch in (27, ord("q"), ord("Q")):
+            action = "back"
+
+    if action in ("confirm", "back"):
+        now = time.monotonic()
+        if now - action_debounce.get(action, 0.0) < CONFIRM_DEBOUNCE_S:
+            return None
+        action_debounce[action] = now
+
+    return action
 
 
 def draw(win, sinks, out_idx, vol, muted, sel, js_connected):
@@ -4481,6 +4538,7 @@ def run(stdscr):
 
     js_file = open_joystick()
     axis_state = {}
+    action_debounce = {}
 
     sinks = list_sinks()
     out_idx = 0
@@ -4494,7 +4552,7 @@ def run(stdscr):
     try:
         while True:
             draw(stdscr, sinks, out_idx, vol, muted, sel, js_file is not None)
-            action = poll_action(stdscr, js_file, axis_state)
+            action = poll_action(stdscr, js_file, axis_state, action_debounce)
             if action is None:
                 continue
 
@@ -4589,6 +4647,7 @@ import os
 import select
 import struct
 import sys
+import time
 
 JS_DEVICE = "/dev/input/js0"
 JS_EVENT_BUTTON = 0x01
@@ -4624,7 +4683,15 @@ def open_joystick():
         return None
 
 
-def poll_action(stdscr, js_file, axis_state, timeout=0.15):
+CONFIRM_DEBOUNCE_S = 0.25
+# Guards confirm/back specifically (not directional movement) against
+# switch/contact bounce on cheap arcade buttons and joystick encoders, which
+# can report two or more rapid press events for what is physically a single
+# tap - without this a bounced confirm press could immediately re-toggle the
+# Yes/No selection back, or fire the confirm/cancel branch twice.
+
+
+def poll_action(stdscr, js_file, axis_state, action_debounce, timeout=0.15):
     fds = [sys.stdin]
     if js_file is not None:
         fds.append(js_file)
@@ -4632,6 +4699,8 @@ def poll_action(stdscr, js_file, axis_state, timeout=0.15):
         ready, _, _ = select.select(fds, [], [], timeout)
     except (OSError, ValueError):
         ready = []
+
+    action = None
 
     if js_file is not None and js_file in ready:
         data = js_file.read(EVENT_SIZE)
@@ -4642,9 +4711,9 @@ def poll_action(stdscr, js_file, axis_state, timeout=0.15):
             if not is_init:
                 if typ == JS_EVENT_BUTTON and value == 1:
                     if number == BTN_CONFIRM:
-                        return "confirm"
-                    if number == BTN_BACK:
-                        return "back"
+                        action = "confirm"
+                    elif number == BTN_BACK:
+                        action = "back"
                 elif typ == JS_EVENT_AXIS and number == 0:
                     past = abs(value) > AXIS_THRESHOLD
                     was_past = axis_state.get(0, False)
@@ -4652,17 +4721,24 @@ def poll_action(stdscr, js_file, axis_state, timeout=0.15):
                     if past and not was_past:
                         return "right" if value > 0 else "left"
 
-    if sys.stdin in ready:
+    if action is None and sys.stdin in ready:
         ch = stdscr.getch()
         if ch == curses.KEY_LEFT:
             return "left"
         if ch == curses.KEY_RIGHT:
             return "right"
         if ch in (10, 13, ord(" ")):
-            return "confirm"
-        if ch in (27, ord("q"), ord("Q")):
-            return "back"
-    return None
+            action = "confirm"
+        elif ch in (27, ord("q"), ord("Q")):
+            action = "back"
+
+    if action in ("confirm", "back"):
+        now = time.monotonic()
+        if now - action_debounce.get(action, 0.0) < CONFIRM_DEBOUNCE_S:
+            return None
+        action_debounce[action] = now
+
+    return action
 
 
 def draw(win, yes_selected, js_connected):
@@ -4705,13 +4781,14 @@ def run(stdscr):
 
     js_file = open_joystick()
     axis_state = {}
+    action_debounce = {}
     yes_selected = True
 
     result = False
     try:
         while True:
             draw(stdscr, yes_selected, js_file is not None)
-            action = poll_action(stdscr, js_file, axis_state)
+            action = poll_action(stdscr, js_file, axis_state, action_debounce)
             if action is None:
                 continue
             if action == "back":
@@ -4792,6 +4869,7 @@ import select
 import struct
 import subprocess
 import sys
+import time
 
 JS_DEVICE = "/dev/input/js0"
 JS_EVENT_BUTTON = 0x01
@@ -4802,6 +4880,13 @@ BTN_CONFIRM = $BTN_X       # X / Cross / A - same role as the rest of the RetroP
 BTN_BACK = $BTN_CIRCLE     # Circle / B - same role as the rest of the RetroPie menu
 
 SERVICE = "proftpd"
+
+CONFIRM_DEBOUNCE_S = 0.25
+# Guards the toggle against switch/contact bounce on cheap arcade buttons and
+# joystick encoders, which can report two rapid press events for what is
+# physically a single tap - without this a bounced press toggles the service
+# on and then immediately back off again, which looks to the user like the
+# button "did nothing".
 
 COL_HEADER, COL_LABEL, COL_HINT, COL_GOOD, COL_BAD = 1, 2, 3, 4, 5
 
@@ -4858,7 +4943,7 @@ def open_joystick():
         return None
 
 
-def poll_action(stdscr, js_file, timeout=0.15):
+def poll_action(stdscr, js_file, action_debounce, timeout=0.15):
     fds = [sys.stdin]
     if js_file is not None:
         fds.append(js_file)
@@ -4866,6 +4951,8 @@ def poll_action(stdscr, js_file, timeout=0.15):
         ready, _, _ = select.select(fds, [], [], timeout)
     except (OSError, ValueError):
         ready = []
+
+    action = None
 
     if js_file is not None and js_file in ready:
         data = js_file.read(EVENT_SIZE)
@@ -4875,17 +4962,24 @@ def poll_action(stdscr, js_file, timeout=0.15):
             typ &= ~JS_EVENT_INIT
             if not is_init and typ == JS_EVENT_BUTTON and value == 1:
                 if number == BTN_CONFIRM:
-                    return "confirm"
-                if number == BTN_BACK:
-                    return "back"
+                    action = "confirm"
+                elif number == BTN_BACK:
+                    action = "back"
 
-    if sys.stdin in ready:
+    if action is None and sys.stdin in ready:
         ch = stdscr.getch()
         if ch in (10, 13, ord(" ")):
-            return "confirm"
-        if ch in (27, ord("q"), ord("Q")):
-            return "back"
-    return None
+            action = "confirm"
+        elif ch in (27, ord("q"), ord("Q")):
+            action = "back"
+
+    if action in ("confirm", "back"):
+        now = time.monotonic()
+        if now - action_debounce.get(action, 0.0) < CONFIRM_DEBOUNCE_S:
+            return None
+        action_debounce[action] = now
+
+    return action
 
 
 def draw(win, enabled, active, busy, js_connected):
@@ -4934,13 +5028,14 @@ def run(stdscr):
     stdscr.keypad(True)
 
     js_file = open_joystick()
+    action_debounce = {}
     enabled = is_enabled()
     active = is_active()
 
     try:
         while True:
             draw(stdscr, enabled, active, False, js_file is not None)
-            action = poll_action(stdscr, js_file)
+            action = poll_action(stdscr, js_file, action_debounce)
             if action is None:
                 continue
             if action == "back":
