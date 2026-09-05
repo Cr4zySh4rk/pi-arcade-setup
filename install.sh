@@ -1073,7 +1073,7 @@ LEDCFG
 	<game>
 		<path>./ftpsettings.rp</path>
 		<name>FTP settings</name>
-		<desc>Turn the FTP file transfer server on or off.</desc>
+		<desc>Turn FTP and/or SFTP file transfer on or off independently.</desc>
 		<image>$icon_dir/filemanager.png</image>
 	</game>
 </gameList>
@@ -3173,6 +3173,10 @@ RECONNECT_RETRY_S = 5.0
 # so a phone that doesn't proactively reopen A2DP on its own gets pulled
 # back in automatically rather than sitting paired-but-silent.
 _last_connect_attempt = {}
+_last_connected_path = None
+# Tracks whichever device path enforce_single_connection() last decided to
+# keep, so a newly-appearing second connection can be told apart from the
+# one that was already there (see enforce_single_connection below).
 
 
 def get_managed_objects(bus):
@@ -3223,7 +3227,19 @@ def reconnect_paired_devices(bus, objects):
     profile specifically - not a generic Device1.Connect(), which also
     tries the complementary a2dp-source profile and hard-fails the whole
     attempt with br-connection-profile-unavailable if that role isn't
-    registered. Throttled per-device rather than hammered every poll."""
+    registered. Throttled per-device rather than hammered every poll.
+
+    Skipped entirely if something is already connected: this only exists
+    to pull a previously-used phone back in if it doesn't proactively
+    reopen A2DP on its own, not to keep hunting for every other paired
+    device in the background. Without this guard, an old phone from an
+    earlier session could reconnect on its own timer right while a new
+    device (or a laptop, which doesn't need pairing at all beyond the
+    initial trust) was being connected, and would then race it for the
+    single A2DP link - which is what made a stale device "still show up"
+    instead of the one actually being connected right now."""
+    if any(bool(ifaces.get(DEVICE_IFACE, {}).get("Connected")) for ifaces in objects.values()):
+        return
     now = time.time()
     for path, ifaces in objects.items():
         dev = ifaces.get(DEVICE_IFACE)
@@ -3238,6 +3254,36 @@ def reconnect_paired_devices(bus, objects):
             print(f"[bt-nowplaying] reconnected {path}")
         except Exception as e:
             print(f"[bt-nowplaying] reconnect attempt for {path} failed: {e}")
+
+
+def enforce_single_connection(bus, objects):
+    """Only one phone/laptop should be treated as the active audio source
+    at a time. If more than one device ends up Connected simultaneously -
+    e.g. an old device's own reconnect timer fired right as a new device
+    was being paired/connected from its own side - keep only whichever
+    one is new (not the device we already knew about from the previous
+    poll) and disconnect the rest, so a stale device can't linger and
+    get shown or fought over instead of the one actually in use."""
+    global _last_connected_path
+    connected = [
+        path for path, ifaces in objects.items()
+        if bool(ifaces.get(DEVICE_IFACE, {}).get("Connected"))
+    ]
+    if len(connected) <= 1:
+        _last_connected_path = connected[0] if connected else None
+        return
+
+    keep = next((p for p in connected if p != _last_connected_path), connected[0])
+    for path in connected:
+        if path == keep:
+            continue
+        try:
+            device = dbus.Interface(bus.get_object(BLUEZ_SERVICE, path), DEVICE_IFACE)
+            device.Disconnect()
+            print(f"[bt-nowplaying] disconnected stale device {path} (new device took over)")
+        except Exception as e:
+            print(f"[bt-nowplaying] failed to disconnect stale device {path}: {e}")
+    _last_connected_path = keep
 
 
 def disconnect_all(bus, objects):
@@ -3350,6 +3396,7 @@ def main():
         if is_active:
             auto_trust(bus, objects)
             reconnect_paired_devices(bus, objects)
+            enforce_single_connection(bus, objects)
         elif was_active:
             # Bluetooth Player just closed - drop any connected phone so
             # the Pi goes back to being a plain host device immediately,
@@ -3382,6 +3429,26 @@ PYEOF
 [Service]
 ExecStart=
 ExecStart=/usr/bin/bluealsa -S --keep-alive=5 -p a2dp-sink
+EOF
+
+    # bluealsa-aplay opens a fresh connection to the ALSA PCM device for
+    # every new Bluetooth audio stream (its own documented behavior, not a
+    # bug) - which happens not just once at connection time but again at
+    # every track change on some sources (confirmed live: a MacBook's A2DP
+    # session does this), each time briefly re-negotiating/re-filling
+    # buffers. The default 500ms PCM buffer is too tight to absorb that
+    # without an audible chop; doubling it to 1s gives enough headroom to
+    # ride through a stream restart smoothly, at the cost of a bit more
+    # latency - an easy trade for background music playback, not a
+    # real-time game. --single-audio is redundant with (but a cheap second
+    # line of defense alongside) bt-nowplaying-daemon.py's own single-
+    # active-connection enforcement, for the brief window between an old
+    # device's stale reconnect and the daemon's next poll dropping it.
+    sudo mkdir -p /etc/systemd/system/bluealsa-aplay.service.d
+    sudo tee /etc/systemd/system/bluealsa-aplay.service.d/override.conf >/dev/null <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/bin/bluealsa-aplay -S --single-audio --pcm-buffer-time=1000000 --pcm-period-time=100000
 EOF
 
     sudo tee /etc/systemd/system/bt-agent.service >/dev/null <<EOF
@@ -4855,16 +4922,25 @@ phase_ftp_settings_tool() {
     tee "$PI_HOME/scripts/ftp-settings.py" >/dev/null <<PYEOF
 #!/usr/bin/env python3
 """
-FTP server on/off switch for pi-arcade-setup. Run from the RetroPie menu
+File transfer settings for pi-arcade-setup. Run from the RetroPie menu
 ("FTP settings") or directly:
     python3 ftp-settings.py
-Toggles the proftpd service pi-arcade-setup installs (enable+start /
-disable+stop), so file transfer only runs when you actually want it.
+Two independently switchable file-transfer methods:
+  - FTP: the proftpd service pi-arcade-setup installs (port 21).
+  - SFTP: file transfer over the SSH connection you already use to manage
+    the Pi (port 22). This does NOT touch the ssh service itself - sshd
+    stays up the whole time, since that's this project's only remote
+    shell/management path - it only enables or disables the "sftp"
+    subsystem sshd exposes, by commenting/restoring the Subsystem line in
+    /etc/ssh/sshd_config and reloading (not restarting) sshd, which
+    re-reads config without dropping any existing session.
 
-Works with the controller as well as the keyboard: X/Cross toggles,
-Circle/B exits - same button roles as the rest of the RetroPie menu.
+Fully navigable by controller as well as keyboard: left stick (or D-pad)
+up/down to choose FTP or SFTP, X/Cross to toggle it on/off, Circle/B to
+exit - same button roles as the rest of the RetroPie menu.
 """
 import curses
+import re
 import select
 import struct
 import subprocess
@@ -4873,22 +4949,30 @@ import time
 
 JS_DEVICE = "/dev/input/js0"
 JS_EVENT_BUTTON = 0x01
+JS_EVENT_AXIS = 0x02
 JS_EVENT_INIT = 0x80
 EVENT_FORMAT = "IhBB"
 EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+AXIS_THRESHOLD = 16000
 BTN_CONFIRM = $BTN_X       # X / Cross / A - same role as the rest of the RetroPie menu
 BTN_BACK = $BTN_CIRCLE     # Circle / B - same role as the rest of the RetroPie menu
 
-SERVICE = "proftpd"
+FTP_SERVICE = "proftpd"
+SSHD_CONFIG = "/etc/ssh/sshd_config"
+# Matches an (optionally already-commented) "Subsystem sftp ..." line,
+# tabs or spaces, so both the stock Debian config's tab-separated form and
+# a hand-edited space-separated one are recognized the same way.
+SFTP_LINE_RE = re.compile(r"^([ \t]*)#?[ \t]*(Subsystem[ \t]+sftp\b.*)$", re.MULTILINE)
+
+ROWS = ["ftp", "sftp"]
+ROW_LABELS = {"ftp": "FTP  (ProFTPD, port 21)", "sftp": "SFTP (over SSH, port 22)"}
+
+COL_HEADER, COL_LABEL, COL_HINT, COL_GOOD, COL_BAD, COL_SEL = 1, 2, 3, 4, 5, 6
 
 CONFIRM_DEBOUNCE_S = 0.25
-# Guards the toggle against switch/contact bounce on cheap arcade buttons and
-# joystick encoders, which can report two rapid press events for what is
-# physically a single tap - without this a bounced press toggles the service
-# on and then immediately back off again, which looks to the user like the
-# button "did nothing".
-
-COL_HEADER, COL_LABEL, COL_HINT, COL_GOOD, COL_BAD = 1, 2, 3, 4, 5
+# Secondary safety net for the keyboard path only (curses getch() in this
+# raw mode has no reliable key-up signal, so a held key can't be tracked
+# as a press/release edge the way a joystick button can below).
 
 
 def cx(win, text):
@@ -4905,27 +4989,90 @@ def safe_addstr(win, y, x, text, attr=0):
             pass
 
 
-def is_enabled():
+def ftp_is_enabled():
     try:
-        r = subprocess.run(["systemctl", "is-enabled", SERVICE], capture_output=True, text=True, timeout=3)
+        r = subprocess.run(["systemctl", "is-enabled", FTP_SERVICE], capture_output=True, text=True, timeout=3)
         return r.stdout.strip() == "enabled"
     except Exception:
         return False
 
 
-def is_active():
+def ftp_is_active():
     try:
-        r = subprocess.run(["systemctl", "is-active", SERVICE], capture_output=True, text=True, timeout=3)
+        r = subprocess.run(["systemctl", "is-active", FTP_SERVICE], capture_output=True, text=True, timeout=3)
         return r.stdout.strip() == "active"
     except Exception:
         return False
 
 
-def set_enabled(enable):
+def set_ftp_enabled(enable):
     if enable:
-        subprocess.run(["sudo", "systemctl", "enable", "--now", SERVICE], capture_output=True, timeout=10)
+        subprocess.run(["sudo", "systemctl", "enable", "--now", FTP_SERVICE], capture_output=True, timeout=10)
     else:
-        subprocess.run(["sudo", "systemctl", "disable", "--now", SERVICE], capture_output=True, timeout=10)
+        subprocess.run(["sudo", "systemctl", "disable", "--now", FTP_SERVICE], capture_output=True, timeout=10)
+
+
+def sftp_is_enabled():
+    try:
+        with open(SSHD_CONFIG) as f:
+            text = f.read()
+    except Exception:
+        return False
+    m = SFTP_LINE_RE.search(text)
+    if not m:
+        return False
+    # group(0) is the whole matched line; an active (uncommented) line is
+    # one where nothing but the leading whitespace in group(1) precedes
+    # "Subsystem" - i.e. the match doesn't start with a '#' after that.
+    line = m.group(0).strip()
+    return not line.startswith("#")
+
+
+def sftp_is_active():
+    # sshd itself is never toggled by this tool (SSH shell access must
+    # always stay available), so "active" tracks the same thing as
+    # "enabled" here, unlike proftpd's separate enabled/active split.
+    return sftp_is_enabled()
+
+
+def set_sftp_enabled(enable):
+    script = (
+        "import re\n"
+        "path = " + repr(SSHD_CONFIG) + "\n"
+        "with open(path) as f:\n"
+        "    text = f.read()\n"
+        "pattern = re.compile(r'^([ \\t]*)#?[ \\t]*(Subsystem[ \\t]+sftp\\b.*)$', re.MULTILINE)\n"
+        "if pattern.search(text):\n"
+        "    if " + repr(bool(enable)) + ":\n"
+        "        text = pattern.sub(lambda m: m.group(1) + m.group(2), text, count=1)\n"
+        "    else:\n"
+        "        text = pattern.sub(lambda m: m.group(1) + '# ' + m.group(2), text, count=1)\n"
+        "elif " + repr(bool(enable)) + ":\n"
+        "    sep = '' if text.endswith(chr(10)) else chr(10)\n"
+        "    text += sep + 'Subsystem sftp /usr/lib/openssh/sftp-server' + chr(10)\n"
+        "with open(path, 'w') as f:\n"
+        "    f.write(text)\n"
+    )
+    try:
+        subprocess.run(["sudo", "python3", "-c", script], capture_output=True, timeout=5)
+        subprocess.run(["sudo", "systemctl", "reload", "ssh"], capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
+def is_enabled(row):
+    return ftp_is_enabled() if row == "ftp" else sftp_is_enabled()
+
+
+def is_active(row):
+    return ftp_is_active() if row == "ftp" else sftp_is_active()
+
+
+def set_enabled(row, enable):
+    if row == "ftp":
+        set_ftp_enabled(enable)
+    else:
+        set_sftp_enabled(enable)
 
 
 def get_ip():
@@ -4943,17 +5090,13 @@ def open_joystick():
         return None
 
 
-def poll_action(stdscr, js_file, button_state, action_debounce, timeout=0.15):
+def poll_action(stdscr, js_file, axis_state, button_state, action_debounce, timeout=0.15):
     """button_state tracks whether BTN_CONFIRM/BTN_BACK are currently held,
-    so an action only fires on the press edge (0->1). This is the primary
-    defense against a double-fire: some controllers/drivers report a
-    repeat "still held" button-down event for what a person experiences as
-    a single tap (not just true switch bounce, which is normally sub-50ms)
-    - a fixed debounce window can't reliably tell that apart from a
-    genuine second press, but requiring an intervening release (value=0)
-    can, regardless of timing. action_debounce is kept as a secondary
-    safety net, mainly for the keyboard path below, where a raw terminal
-    read can't distinguish a held key from a fresh one the same way."""
+    so an action only fires on the press edge (0->1) - some controllers/
+    drivers report a repeat "still held" button-down event for what a
+    person experiences as a single tap, and requiring an intervening
+    release is correct regardless of timing, unlike a fixed debounce
+    window (still kept below as a secondary net for the keyboard path)."""
     fds = [sys.stdin]
     if js_file is not None:
         fds.append(js_file)
@@ -4970,17 +5113,28 @@ def poll_action(stdscr, js_file, button_state, action_debounce, timeout=0.15):
             _t, value, typ, number = struct.unpack(EVENT_FORMAT, data)
             is_init = bool(typ & JS_EVENT_INIT)
             typ &= ~JS_EVENT_INIT
-            if not is_init and typ == JS_EVENT_BUTTON and number in (BTN_CONFIRM, BTN_BACK):
-                was_held = button_state.get(number, False)
-                button_state[number] = bool(value)
-                if value == 1 and not was_held:
-                    if number == BTN_CONFIRM:
-                        action = "confirm"
-                    elif number == BTN_BACK:
-                        action = "back"
+            if not is_init:
+                if typ == JS_EVENT_BUTTON and number in (BTN_CONFIRM, BTN_BACK):
+                    was_held = button_state.get(number, False)
+                    button_state[number] = bool(value)
+                    if value == 1 and not was_held:
+                        if number == BTN_CONFIRM:
+                            action = "confirm"
+                        elif number == BTN_BACK:
+                            action = "back"
+                elif typ == JS_EVENT_AXIS and number == 1:
+                    past = abs(value) > AXIS_THRESHOLD
+                    was_past = axis_state.get(1, False)
+                    axis_state[1] = past
+                    if past and not was_past:
+                        return "down" if value > 0 else "up"
 
     if action is None and sys.stdin in ready:
         ch = stdscr.getch()
+        if ch == curses.KEY_UP:
+            return "up"
+        if ch == curses.KEY_DOWN:
+            return "down"
         if ch in (10, 13, ord(" ")):
             action = "confirm"
         elif ch in (27, ord("q"), ord("Q")):
@@ -4997,12 +5151,9 @@ def poll_action(stdscr, js_file, button_state, action_debounce, timeout=0.15):
 
 def settle_input(stdscr, js_file, duration=0.5):
     """Discards any keyboard/joystick input that arrives during the
-    settle window - called right after toggling the service. Time-based
-    debounce alone only catches a second press within CONFIRM_DEBOUNCE_S;
-    this additionally sweeps up anything still queued from the same
-    physical press (or arriving while the blocking systemctl call above
-    was running), so it can't be misread as a second, unintended toggle
-    once the loop resumes."""
+    settle window right after toggling a service, so a lingering
+    duplicate from the same physical press can't be misread as a second,
+    unintended toggle once the loop resumes."""
     deadline = time.monotonic() + duration
     fds = [sys.stdin] + ([js_file] if js_file is not None else [])
     while True:
@@ -5021,35 +5172,45 @@ def settle_input(stdscr, js_file, duration=0.5):
             stdscr.getch()
 
 
-def draw(win, enabled, active, busy, js_connected):
+def draw(win, states, sel, busy_row, js_connected):
     win.erase()
     h, w = win.getmaxyx()
-    title = " FTP SETTINGS "
-    safe_addstr(win, 2, cx(win, title), title, curses.color_pair(COL_HEADER) | curses.A_BOLD)
+    title = " FILE TRANSFER SETTINGS "
+    safe_addstr(win, 1, cx(win, title), title, curses.color_pair(COL_HEADER) | curses.A_BOLD)
 
-    status = "ON" if enabled else "OFF"
-    attr = curses.color_pair(COL_GOOD) if enabled else curses.color_pair(COL_BAD)
-    line = f"FTP server: {status}"
-    safe_addstr(win, h // 2 - 2, cx(win, line), line, attr | curses.A_BOLD)
+    top = h // 2 - 4
+    for i, row in enumerate(ROWS):
+        y = top + i * 3
+        enabled, active = states[row]
+        status = "ON" if enabled else "OFF"
+        status_attr = curses.color_pair(COL_GOOD) if enabled else curses.color_pair(COL_BAD)
+        sel_attr = curses.A_REVERSE if i == sel else 0
 
-    if busy:
-        sub = "Applying..."
-    elif enabled and active:
-        sub = "Running - connect with any FTP client using the Pi user login."
-    elif enabled and not active:
-        sub = "Enabled but not running yet."
-    else:
-        sub = "Disabled."
-    safe_addstr(win, h // 2 - 1, cx(win, sub), sub, curses.A_DIM)
+        label_line = f"{ROW_LABELS[row]}"
+        safe_addstr(win, y, cx(win, label_line), label_line, curses.color_pair(COL_LABEL) | sel_attr | curses.A_BOLD)
 
-    if enabled:
-        ip_line = f"ftp://{get_ip()}"
-        safe_addstr(win, h // 2 + 1, cx(win, ip_line), ip_line, curses.color_pair(COL_LABEL))
+        if busy_row == row:
+            status_line = "Applying..."
+            status_attr = curses.color_pair(COL_HINT)
+        elif row == "ftp" and enabled and not active:
+            status_line = f"{status} (enabled but not running yet)"
+        else:
+            status_line = status
+        safe_addstr(win, y + 1, cx(win, status_line), status_line, status_attr | curses.A_BOLD)
+
+    ip = get_ip()
+    hint_y = top + len(ROWS) * 3 + 1
+    if states["ftp"][0]:
+        safe_addstr(win, hint_y, cx(win, f"FTP:  ftp://{ip}"), f"FTP:  ftp://{ip}", curses.color_pair(COL_LABEL))
+        hint_y += 1
+    if states["sftp"][0]:
+        safe_addstr(win, hint_y, cx(win, f"SFTP: sftp://{ip}"), f"SFTP: sftp://{ip}", curses.color_pair(COL_LABEL))
+        hint_y += 1
 
     js_line = "Controller connected" if js_connected else "No controller detected - keyboard only"
     safe_addstr(win, h - 3, cx(win, js_line), js_line, curses.A_DIM)
 
-    footer = "Enter/A/X: toggle on/off   ESC/B/Circle: exit"
+    footer = "UP/DOWN: select   Enter/A/X: toggle on/off   ESC/B/Circle: exit"
     safe_addstr(win, h - 2, cx(win, footer), footer, curses.color_pair(COL_HINT))
     win.refresh()
 
@@ -5063,28 +5224,36 @@ def run(stdscr):
     curses.init_pair(COL_HINT, curses.COLOR_YELLOW, -1)
     curses.init_pair(COL_GOOD, curses.COLOR_GREEN, -1)
     curses.init_pair(COL_BAD, curses.COLOR_RED, -1)
+    curses.init_pair(COL_SEL, curses.COLOR_GREEN, -1)
     stdscr.nodelay(True)
     stdscr.keypad(True)
 
     js_file = open_joystick()
+    axis_state = {}
     button_state = {}
     action_debounce = {}
-    enabled = is_enabled()
-    active = is_active()
+    sel = 0
+    states = {row: (is_enabled(row), is_active(row)) for row in ROWS}
 
     try:
         while True:
-            draw(stdscr, enabled, active, False, js_file is not None)
-            action = poll_action(stdscr, js_file, button_state, action_debounce)
+            draw(stdscr, states, sel, None, js_file is not None)
+            action = poll_action(stdscr, js_file, axis_state, button_state, action_debounce)
             if action is None:
                 continue
+
             if action == "back":
                 break
-            if action == "confirm":
-                draw(stdscr, enabled, active, True, js_file is not None)
-                set_enabled(not enabled)
-                enabled = is_enabled()
-                active = is_active()
+            elif action == "up":
+                sel = (sel - 1) % len(ROWS)
+            elif action == "down":
+                sel = (sel + 1) % len(ROWS)
+            elif action == "confirm":
+                row = ROWS[sel]
+                draw(stdscr, states, sel, row, js_file is not None)
+                enabled, _ = states[row]
+                set_enabled(row, not enabled)
+                states[row] = (is_enabled(row), is_active(row))
                 settle_input(stdscr, js_file)
     finally:
         if js_file is not None:
