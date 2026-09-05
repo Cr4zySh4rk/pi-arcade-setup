@@ -1160,6 +1160,16 @@ phase_esde_retroarch_links() {
 # "Alternative Emulators" menu would otherwise write - this only sets the
 # system-wide default and does not touch per-game overrides or overwrite an
 # existing gamelist.xml.
+#
+# IMPORTANT: per ES-DE's own GamelistFileParser.cpp (confirmed against the
+# actual source this build compiles), <alternativeEmulator> is read via
+# doc.child("alternativeEmulator") - i.e. it must be a document-level
+# SIBLING of <gameList>, immediately before it - NOT nested inside
+# <gameList> as a child. Nesting it inside <gameList> parses without error
+# but is silently never read, so the system-wide override has no effect
+# and every ROM keeps launching with the (missing) default core - confirmed
+# live: this was the actual reason the first version of this fix didn't
+# work even after a reboot.
 phase_esde_nes_default_emulator() {
     local sys
     for sys in nes fds; do
@@ -1172,15 +1182,15 @@ phase_esde_nes_default_emulator() {
                 log "$sys gamelist.xml already has an alternativeEmulator override, leaving as-is"
                 continue
             fi
-            sed -i '0,/<gameList>/s//<gameList>\n\t<alternativeEmulator>\n\t\t<label>Nestopia UE<\/label>\n\t<\/alternativeEmulator>/' "$gl_file" \
+            sed -i '0,/<gameList>/s//<alternativeEmulator>\n\t<label>Nestopia UE<\/label>\n<\/alternativeEmulator>\n<gameList>/' "$gl_file" \
                 || log_warn "could not patch existing $sys gamelist.xml with alternativeEmulator override"
         else
             cat > "$gl_file" <<'EOF'
 <?xml version="1.0"?>
+<alternativeEmulator>
+	<label>Nestopia UE</label>
+</alternativeEmulator>
 <gameList>
-	<alternativeEmulator>
-		<label>Nestopia UE</label>
-	</alternativeEmulator>
 </gameList>
 EOF
         fi
