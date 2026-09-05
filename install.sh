@@ -1389,7 +1389,7 @@ PROFEOF
 phase_custom_retropie_system() {
     mkdir -p "$PI_HOME/ES-DE/custom_systems" "$PI_HOME/ES-DE/gamelists/retropie"
 
-    local keep=(showip.rp avsettings.rp wifigate.rp ftpsettings.rp)
+    local keep=(showip.rp avsettings.rp wifigate.rp ftpsettings.rp retroarch.rp)
     [ "$ENABLE_BT_SPEAKER" = "true" ] && keep+=(btpair.rp btaudio.rp)
     [ "$ENABLE_CONTROLLER_HOTKEYS" = "true" ] && keep+=(hotkeyconfig.rp)
     [ "$ENABLE_MUSIC_PLAYER" = "true" ] && keep+=(musicplayer.rp)
@@ -1453,6 +1453,12 @@ EOF
 		<name>Show IP</name>
 		<desc>Displays your current IP address and other network information.</desc>
 		<image>$icon_dir/showip.png</image>
+	</game>
+	<game>
+		<path>./retroarch.rp</path>
+		<name>RetroArch</name>
+		<desc>Opens RetroArch's own configuration menu (RGUI) directly - video, audio, input, and per-core settings, same as classic EmulationStation's RetroArch entry.</desc>
+		<image>$icon_dir/configedit.png</image>
 	</game>
 $( [ "$ENABLE_BT_SPEAKER" = "true" ] && cat <<BTPAIR
 	<game>
@@ -1519,6 +1525,52 @@ LEDCFG
 	</game>
 </gameList>
 EOF
+
+    # RetroPie-Setup's own retropiemenu.sh ships a "retroarch.rp" case
+    # (opens RetroArch's own RGUI settings menu directly, no ROM loaded -
+    # the same entry classic EmulationStation exposes) that this project's
+    # custom, deliberately-lean menu system doesn't wire up by default (see
+    # the "keep" list above and the step 15 README note on what's
+    # intentionally left out). Wire it back in - it's a genuinely useful
+    # escape hatch for anything not exposed by this project's own tools
+    # (video/audio/input settings, per-core options, etc.), and costs
+    # nothing to have available.
+    touch "$PI_HOME/RetroPie/retropiemenu/retroarch.rp"
+    local menu_script="$PI_HOME/RetroPie-Setup/scriptmodules/supplementary/retropiemenu.sh"
+    if [ -f "$menu_script" ] && ! grep -q "retroarch.rp)" "$menu_script"; then
+        sudo cp "$menu_script" "${menu_script}.bak.$(date +%s)"
+        sudo python3 - "$menu_script" <<'PYEOF'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+anchor = "filemanager.rp)"
+idx = text.find(anchor)
+if idx == -1:
+    print("[retroarch.rp] anchor 'filemanager.rp)' not found in retropiemenu.sh; skipping menu wiring")
+    sys.exit(0)
+case_end = text.find(";;", idx)
+if case_end == -1:
+    print("[retroarch.rp] could not find end of filemanager.rp) case; skipping menu wiring")
+    sys.exit(0)
+insert_point = text.find("\n", case_end) + 1
+line_start = text.rfind("\n", 0, idx) + 1
+indent = text[line_start:idx]
+body_indent = indent + "    "
+insert_block = (
+    f"{indent}retroarch.rp)\n"
+    f'{body_indent}joy2keyStop\n'
+    f'{body_indent}cp "$configdir/all/retroarch.cfg" "$configdir/all/retroarch.cfg.bak"\n'
+    f'{body_indent}chown "$__user":"$__group" "$configdir/all/retroarch.cfg.bak"\n'
+    f'{body_indent}su "$__user" -c "XDG_RUNTIME_DIR=/run/user/$SUDO_UID \\"$emudir/retroarch/bin/retroarch\\" --menu --config \\"$configdir/all/retroarch.cfg\\""\n'
+    f'{body_indent}iniConfig " = " \'"\' "$configdir/all/retroarch.cfg"\n'
+    f'{body_indent}iniSet "config_save_on_exit" "false"\n'
+    f"{indent}    ;;\n"
+)
+new_text = text[:insert_point] + insert_block + text[insert_point:]
+open(path, "w").write(new_text)
+print("[retroarch.rp] wired into retropiemenu.sh")
+PYEOF
+    fi
     return 0
 }
 
