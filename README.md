@@ -144,6 +144,7 @@ ENABLE_DSI_DISPLAY=false ENABLE_CONTROLLER_HOTKEYS=false \
 ## After install
 
 - **Copy ROMs** into `~/RetroPie/roms/<system>/` (e.g. `arcade`, `snes`, `psx`, `psp`) over the network via FTP (ProFTPD, port 21, jailed to your home directory) or SFTP (over SSH, port 22) — both switchable independently from the "FTP settings" tool — then rescan from the frontend or reboot.
+- **Add Dreamcast BIOS files**: Flycast (installed by step 4a) needs `dc_boot.bin` and `dc_flash.bin` — dumped from your own Dreamcast console — copied into `~/RetroPie/BIOS/dc/` (same FTP/SFTP path as ROMs above). Without both files present, Dreamcast content won't boot. These are copyrighted Sega firmware, so this project can't include or download them for you; for Naomi/Atomiswave arcade content via Flycast, also add `naomi.zip`/`awbios.zip` to the same folder.
 - **Switch frontends**: `~/switch-frontend.sh esde` or `~/switch-frontend.sh classic` (takes effect on next boot/restart).
 - **Relaunch ES-DE** without rebooting after a deliberate Quit: run `esde`.
 - **Remap controller hotkeys**: RetroPie Setup → *Hotkey Config* inside ES-DE, or `sudo python3 ~/scripts/hotkey-remap.py` over SSH.
