@@ -540,6 +540,43 @@ LOCEOF
     sudo apt-get install -y git dialog unzip xmlstarlet curl ca-certificates util-linux || die "base package install failed"
     df -h / | sudo tee -a "$LOG_FILE" >/dev/null
 
+    # The onboard Cypress/Infineon BCM4345/6 WiFi chip on this Pi has a
+    # long-standing, still-unresolved upstream firmware bug where association
+    # to a real, in-range, correctly-configured AP fails outright - not a
+    # scan/visibility/password problem. Confirmed live: wpa_supplicant logs
+    # `CTRL-EVENT-ASSOC-REJECT bssid=00:00:00:00:00:00 status_code=16`
+    # (the all-zero bssid means this is generated locally by the
+    # driver/firmware, not a real rejection frame from the AP) on every
+    # single association attempt, for two different real networks, both
+    # confirmed visible with a strong signal via a raw `iw scan`, both with
+    # the correct password already stored in the connection profile. This is
+    # a widely-reported bug on this exact chip (see
+    # https://github.com/RPi-Distro/firmware-nonfree/issues/38 and
+    # https://forums.raspberrypi.com/viewtopic.php?t=377009) with no official
+    # fix as of this writing. The most consistently-reported community
+    # workaround - disabling the driver's own roaming logic - resolved it
+    # immediately on the reference Pi (confirmed live: failed on every
+    # attempt before this, connected on the very first attempt after
+    # rebooting with it in place, with a real IP and working internet).
+    # Requires the reboot below to reload the brcmfmac module with this
+    # option; harmless if your hardware never hits this bug in the first
+    # place (roaming isn't used on a stationary kiosk device anyway).
+    echo 'options brcmfmac roamoff=1' | sudo tee /etc/modprobe.d/brcmfmac.conf >/dev/null
+    log "Disabled brcmfmac WiFi roaming (roamoff=1) to work around a known BCM4345/6 association-failure bug - see comment above"
+
+    # WiFi power-save mode is a separate, well-documented source of flaky
+    # associations/drops on this same Broadcom chip. It wasn't the cause of
+    # the specific bug above (confirmed: still failed identically with this
+    # already off), but it's a real, independent failure mode worth ruling
+    # out permanently on a device that's meant to just stay connected.
+    # NetworkManager doesn't ship this disabled by default.
+    sudo mkdir -p /etc/NetworkManager/conf.d
+    sudo tee /etc/NetworkManager/conf.d/wifi-powersave-off.conf >/dev/null <<'PSEOF'
+[connection]
+wifi.powersave = 2
+PSEOF
+    log "Disabled WiFi power-save via NetworkManager (wifi.powersave = 2)"
+
     # A kernel/bootloader update via full-upgrade is common on Pi OS and can
     # leave later steps (display driver, builds) on a stale running kernel -
     # always reboot once after this phase for a clean baseline.
