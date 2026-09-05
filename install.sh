@@ -75,6 +75,19 @@ SPLASH_TRANSFORM_TYPE="${SPLASH_TRANSFORM_TYPE:-90}"    # VLC --transform-type, 
 SPLASH_VIDEO_URL="${SPLASH_VIDEO_URL:-https://raw.githubusercontent.com/Cr4zySh4rk/pi-arcade-setup/main/splash/retro-splash.mp4}"
 DO_RPI_FIRMWARE_UPDATE="${DO_RPI_FIRMWARE_UPDATE:-false}" # runs `rpi-update`; opt-in, only if panel is blank on old firmware
 
+# --- CPU/GPU overclock (Raspberry Pi 4 only) --------------------------------
+# On by default to reproduce the reference build. Scoped under a [pi4]
+# section filter in config.txt (see phase_overclock) so it's a no-op on any
+# other board this script might run on. Both values are above stock
+# (arm_freq 1500MHz / gpu_freq 500MHz) and need the extra core voltage
+# (over_voltage) for stability, plus real cooling (heatsink+fan case) to
+# avoid thermal throttling under sustained load - set ENABLE_OVERCLOCK=false
+# for a stock-clocked, passively-cooled build.
+ENABLE_OVERCLOCK="${ENABLE_OVERCLOCK:-true}"
+OC_ARM_FREQ="${OC_ARM_FREQ:-2000}"     # CPU, MHz
+OC_GPU_FREQ="${OC_GPU_FREQ:-675}"      # VideoCore/GPU core clock, MHz
+OC_OVER_VOLTAGE="${OC_OVER_VOLTAGE:-6}" # +0.025V per step; 6 = +0.15V, needed for 2GHz arm_freq
+
 # --- Emulators --------------------------------------------------------------
 # MAME is always installed (the point of this script). Additional cores are
 # a comma-separated list of RetroPie-Setup package ids.
@@ -215,6 +228,10 @@ RETROARCH_VIDEO_ROTATION=$RETROARCH_VIDEO_ROTATION
 SPLASH_TRANSFORM_TYPE=$SPLASH_TRANSFORM_TYPE
 SPLASH_VIDEO_URL=$SPLASH_VIDEO_URL
 DO_RPI_FIRMWARE_UPDATE=$DO_RPI_FIRMWARE_UPDATE
+ENABLE_OVERCLOCK=$ENABLE_OVERCLOCK
+OC_ARM_FREQ=$OC_ARM_FREQ
+OC_GPU_FREQ=$OC_GPU_FREQ
+OC_OVER_VOLTAGE=$OC_OVER_VOLTAGE
 EMULATOR_CORES=$EMULATOR_CORES
 ESDE_BRANCH=$ESDE_BRANCH
 APPLY_ESDE_QUITMENU_PATCH=$APPLY_ESDE_QUITMENU_PATCH
@@ -349,6 +366,63 @@ phase_preflight() {
     sudo chmod 666 "$LOG_FILE" 2>/dev/null || true
     write_config_file
     return 0
+}
+
+phase_overclock() {
+    if [ "$ENABLE_OVERCLOCK" != "true" ]; then
+        log "ENABLE_OVERCLOCK=false, skipping"
+        return 0
+    fi
+
+    local cfg="/boot/firmware/config.txt"
+    [ -f "$cfg" ] || cfg="/boot/config.txt"
+    [ -f "$cfg" ] || { log_warn "config.txt not found at /boot/firmware/config.txt or /boot/config.txt; skipping overclock"; return 0; }
+
+    # Idempotent re-run: strip any block this phase previously added (by its
+    # marker comments) before reappending the current desired values, rather
+    # than leaving stale/duplicate arm_freq|gpu_freq|over_voltage lines
+    # behind if OC_* was changed and the installer re-run.
+    sudo python3 - "$cfg" <<'PYEOF'
+import re, sys
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+text = re.sub(
+    r"\n?# --- pi-arcade-setup overclock \(BEGIN\) ---.*?# --- pi-arcade-setup overclock \(END\) ---\n?",
+    "\n", text, flags=re.DOTALL,
+)
+with open(path, "w") as f:
+    f.write(text.rstrip("\n") + "\n")
+PYEOF
+
+    # Scoped under the [pi4] conditional filter (a real config.txt feature,
+    # not a comment) so this is a harmless no-op if the script's ever run on
+    # different Raspberry Pi hardware - arm_freq/over_voltage are exactly the
+    # kind of values that shouldn't silently carry over to a different SoC.
+    # Appended at the end of the file and closed with a trailing [all] so it
+    # can't accidentally swallow whatever section header the file happened
+    # to end on (e.g. this build's own DSI overlay under [all]) into [pi4].
+    sudo tee -a "$cfg" >/dev/null <<EOF
+
+# --- pi-arcade-setup overclock (BEGIN) ---
+# Raspberry Pi 4 only. Bumps the CPU to ${OC_ARM_FREQ}MHz (stock 1500MHz) and
+# the GPU/VideoCore core clock to ${OC_GPU_FREQ}MHz (stock 500MHz), with the
+# extra core voltage (over_voltage=${OC_OVER_VOLTAGE}, +${OC_OVER_VOLTAGE} *
+# 0.025V) these clocks need for stability. Requires real cooling (heatsink +
+# fan case, not passive) to avoid thermal throttling under sustained load.
+# Takes effect on next reboot - check "vcgencmd get_throttled" afterwards
+# (0x0 = never throttled) and "vcgencmd measure_clock arm"/"measure_clock
+# core" to confirm the new clocks actually applied.
+[pi4]
+over_voltage=$OC_OVER_VOLTAGE
+arm_freq=$OC_ARM_FREQ
+gpu_freq=$OC_GPU_FREQ
+[all]
+# --- pi-arcade-setup overclock (END) ---
+EOF
+
+    log "Overclock written to $cfg (arm_freq=$OC_ARM_FREQ gpu_freq=$OC_GPU_FREQ over_voltage=$OC_OVER_VOLTAGE) - reboot required to take effect"
+    request_reboot "applying CPU/GPU overclock"
 }
 
 phase_base_update() {
@@ -883,6 +957,26 @@ if [ "\$FRONTEND" = "esde" ]; then
             continue
         fi
 
+        # ES-DE's own Reboot/Power Off menu actions run "shutdown --reboot
+        # now"/"shutdown --poweroff now" internally via a plain system()
+        # call whose result is never checked or surfaced anywhere (not in
+        # the UI, not in the log) - if it doesn't fire for any reason, the
+        # only visible symptom is ES-DE quitting to this console with the
+        # Pi otherwise untouched. The two LOG(LogInfo) lines below it logs
+        # right beforehand are unconditional though, so treat them as the
+        # actual "user asked for this" signal and issue the real command
+        # ourselves too - harmless if ES-DE's own call already succeeded
+        # (a second shutdown/reboot request while one is in flight is a
+        # no-op), and it's what actually guarantees the Pi does what the
+        # menu said regardless of why ES-DE's own attempt may not have.
+        if echo "\$LOG_TAIL" | grep -q 'Powering off system'; then
+            echo "ES-DE requested power off - issuing shutdown --poweroff now"
+            /usr/sbin/shutdown --poweroff now 2>/dev/null || sudo -n /usr/sbin/shutdown --poweroff now 2>/dev/null || true
+        elif echo "\$LOG_TAIL" | grep -q 'Rebooting system'; then
+            echo "ES-DE requested reboot - issuing shutdown --reboot now"
+            /usr/sbin/shutdown --reboot now 2>/dev/null || sudo -n /usr/sbin/shutdown --reboot now 2>/dev/null || true
+        fi
+
         if echo "\$LOG_TAIL" | grep -q 'ES-DE cleanly shutting down'; then
             echo "ES-DE exited cleanly (quit/reboot/power off). Not relaunching."
             echo "Run 'esde' or reboot to return to the frontend."
@@ -1044,7 +1138,7 @@ $( [ "$ENABLE_BT_SPEAKER" = "true" ] && cat <<BTAUDIO
 	<game>
 		<path>./btaudio.rp</path>
 		<name>Bluetooth Player</name>
-		<desc>Pair a phone to "$BT_SPEAKER_NAME" and stream music to the arcade's speakers. Shows the connected device's now-playing track, car-stereo style, and lets the controller play/pause/skip.</desc>
+		<desc>Pair a device to "$BT_SPEAKER_NAME" and stream music to the arcade's speakers. Shows the connected device's now-playing track, car-stereo style, and lets the controller play/pause/skip.</desc>
 		<image>$icon_dir/bluetooth.png</image>
 	</game>
 BTAUDIO
@@ -1368,10 +1462,10 @@ EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
 ROLES = [
     ("l3", "L3", "Left stick click"),
     ("r3", "R3", "Right stick click"),
-    ("square", "SQUARE", "Brightness UP"),
-    ("x", "X / CROSS", "Brightness DOWN"),
-    ("triangle", "TRIANGLE", "Volume UP"),
-    ("circle", "CIRCLE", "Volume DOWN"),
+    ("square", "SQUARE (Xbox: X)", "Brightness UP"),
+    ("x", "CROSS / X (Xbox: A)", "Brightness DOWN"),
+    ("triangle", "TRIANGLE (Xbox: Y)", "Volume UP"),
+    ("circle", "CIRCLE (Xbox: B)", "Volume DOWN"),
 ]
 
 COL_HEADER, COL_LABEL, COL_HINT, COL_GOOD, COL_BAD = 1, 2, 3, 4, 5
@@ -1519,7 +1613,7 @@ def run(stdscr):
 
         lines = [("MAPPING COMPLETE", curses.color_pair(COL_GOOD) | curses.A_BOLD), ("", 0)]
         for key, name, desc in ROLES:
-            lines.append((f"{name:<12} ({desc}):  button {mapping[key]}", 0))
+            lines.append((f"{name:<20} ({desc}):  button {mapping[key]}", 0))
         lines.append(("", 0))
         lines.append(("Press any button or key to continue...", curses.A_DIM))
         show_message(stdscr, lines, js_fd=js_fd, js_file=js_file)
@@ -1539,7 +1633,7 @@ def main():
     print("=" * 50)
     print(" New hotkey mapping saved and applied:")
     for key, name, desc in ROLES:
-        print(f"   {name:<12} ({desc}):  button {mapping[key]}")
+        print(f"   {name:<20} ({desc}):  button {mapping[key]}")
     print("=" * 50)
 
 
@@ -3177,6 +3271,10 @@ _last_connected_path = None
 # Tracks whichever device path enforce_single_connection() last decided to
 # keep, so a newly-appearing second connection can be told apart from the
 # one that was already there (see enforce_single_connection below).
+_last_active_path = None
+# Tracks whichever device path was last actually seen Connected, updated in
+# main()'s poll loop. Used to scope reconnect_paired_devices() to only the
+# single device that was in use most recently - see that function for why.
 
 
 def get_managed_objects(bus):
@@ -3198,7 +3296,7 @@ def find_connected_device_and_player(objects):
             break
 
     if device_path is None:
-        return None, None, None
+        return None, None, None, None
 
     player_path, player_props = None, None
     for path, ifaces in objects.items():
@@ -3206,7 +3304,7 @@ def find_connected_device_and_player(objects):
             player_path, player_props = path, ifaces[PLAYER_IFACE]
             break
 
-    return device_props, player_path, player_props
+    return device_path, device_props, player_path, player_props
 
 
 def auto_trust(bus, objects):
@@ -3222,38 +3320,51 @@ def auto_trust(bus, objects):
 
 
 def reconnect_paired_devices(bus, objects):
-    """While the Bluetooth Player screen is open: for every paired/trusted
-    device that isn't currently connected, (re)request the Audio Sink
-    profile specifically - not a generic Device1.Connect(), which also
-    tries the complementary a2dp-source profile and hard-fails the whole
-    attempt with br-connection-profile-unavailable if that role isn't
-    registered. Throttled per-device rather than hammered every poll.
+    """While the Bluetooth Player screen is open: if the single device that
+    was most recently actually in use (_last_active_path) has dropped its
+    A2DP link without a new device taking over, (re)request the Audio Sink
+    profile specifically for THAT device only - not a generic
+    Device1.Connect(), which also tries the complementary a2dp-source
+    profile and hard-fails the whole attempt with
+    br-connection-profile-unavailable if that role isn't registered.
+    Throttled per-device rather than hammered every poll.
 
-    Skipped entirely if something is already connected: this only exists
-    to pull a previously-used phone back in if it doesn't proactively
-    reopen A2DP on its own, not to keep hunting for every other paired
-    device in the background. Without this guard, an old phone from an
-    earlier session could reconnect on its own timer right while a new
-    device (or a laptop, which doesn't need pairing at all beyond the
-    initial trust) was being connected, and would then race it for the
-    single A2DP link - which is what made a stale device "still show up"
-    instead of the one actually being connected right now."""
+    Deliberately scoped to one device, not "every paired device": this
+    only exists to pull the phone/laptop you were just listening from back
+    in if it drops out (walked out of range, brief link loss) without you
+    doing anything, not to keep hunting down every other device this Pi
+    has ever been paired with. Reconnecting indiscriminately meant an old,
+    already-disconnected device (e.g. a laptop the user just intentionally
+    disconnected from) could get raced back in by this same loop right
+    while a completely different device (a phone) was being connected from
+    its own side - competing for the single A2DP link the onboard radio
+    can actually hold, and either getting shown instead of the new device
+    or interfering with its connection outright. Also skipped entirely if
+    something is already connected, for the same reason.
+
+    If nothing has been active yet this run (_last_active_path is still
+    None - e.g. right after the daemon or the Pi itself starts), this is
+    deliberately a no-op: the very first connection of a session should
+    always come from the device's own side, not from this Pi guessing
+    which of its paired devices to chase."""
     if any(bool(ifaces.get(DEVICE_IFACE, {}).get("Connected")) for ifaces in objects.values()):
         return
+    if _last_active_path is None:
+        return
+    ifaces = objects.get(_last_active_path)
+    dev = ifaces.get(DEVICE_IFACE) if ifaces else None
+    if not dev or not bool(dev.get("Paired")) or bool(dev.get("Connected")):
+        return
     now = time.time()
-    for path, ifaces in objects.items():
-        dev = ifaces.get(DEVICE_IFACE)
-        if not dev or not bool(dev.get("Paired")) or bool(dev.get("Connected")):
-            continue
-        if now - _last_connect_attempt.get(path, 0.0) < RECONNECT_RETRY_S:
-            continue
-        _last_connect_attempt[path] = now
-        try:
-            device = dbus.Interface(bus.get_object(BLUEZ_SERVICE, path), DEVICE_IFACE)
-            device.ConnectProfile(AUDIO_SINK_UUID)
-            print(f"[bt-nowplaying] reconnected {path}")
-        except Exception as e:
-            print(f"[bt-nowplaying] reconnect attempt for {path} failed: {e}")
+    if now - _last_connect_attempt.get(_last_active_path, 0.0) < RECONNECT_RETRY_S:
+        return
+    _last_connect_attempt[_last_active_path] = now
+    try:
+        device = dbus.Interface(bus.get_object(BLUEZ_SERVICE, _last_active_path), DEVICE_IFACE)
+        device.ConnectProfile(AUDIO_SINK_UUID)
+        print(f"[bt-nowplaying] reconnected {_last_active_path}")
+    except Exception as e:
+        print(f"[bt-nowplaying] reconnect attempt for {_last_active_path} failed: {e}")
 
 
 def enforce_single_connection(bus, objects):
@@ -3386,6 +3497,7 @@ def run_command(bus, player_path, cmd):
 
 
 def main():
+    global _last_active_path
     bus = dbus.SystemBus()
     last_seq = None
     was_active = False
@@ -3403,9 +3515,12 @@ def main():
             # not whenever that phone eventually times out on its own.
             disconnect_all(bus, objects)
             objects = get_managed_objects(bus)
+            _last_active_path = None
         was_active = is_active
 
-        device_props, player_path, player_props = find_connected_device_and_player(objects)
+        device_path, device_props, player_path, player_props = find_connected_device_and_player(objects)
+        if device_path is not None:
+            _last_active_path = device_path
         write_status(device_props, player_path, player_props)
 
         cmd = read_command()
@@ -4162,7 +4277,7 @@ def draw(win, status, vol, muted, js_connected, t):
     if not connected:
         conn_line = "No device connected".center(inner_w)[:inner_w]
         safe_addstr(win, top + 2, card_x + 2, conn_line, curses.color_pair(COL_BAD) | curses.A_BOLD)
-        hint = f'Pair a phone to "{SPEAKER_NAME}" to stream music here'
+        hint = f'Pair a device to "{SPEAKER_NAME}" to stream music here'
         safe_addstr(win, top + 4, card_x + 2, hint.center(inner_w)[:inner_w], curses.A_DIM)
     else:
         dev_line = f"Connected: {status.get('device_name') or status.get('device_address', '?')}"
@@ -4177,7 +4292,7 @@ def draw(win, status, vol, muted, js_connected, t):
             total = status.get("duration_ms", -1)
         else:
             title_line = "No track metadata yet".center(inner_w)[:inner_w]
-            sub = "(play something on your phone)"
+            sub = "(play something on your device)"
             state = "■ Idle"
             elapsed, total = -1, -1
 
@@ -5330,6 +5445,7 @@ main() {
 
     PHASES=(
         preflight
+        overclock
         base_update
         display_setup
         verify_display
