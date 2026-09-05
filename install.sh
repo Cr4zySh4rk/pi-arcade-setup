@@ -111,22 +111,23 @@ DO_RPI_FIRMWARE_UPDATE="${DO_RPI_FIRMWARE_UPDATE:-false}" # runs `rpi-update`; o
 # MAME-specific mechanism.
 
 # --- CPU/GPU overclock (Raspberry Pi 4 only) --------------------------------
-# OFF by default. Confirmed via a byte-for-byte config diff against a
-# known-good reference SD card (identical retroarch.cfg/config.txt otherwise)
-# that enabling this GPU overclock (gpu_freq above stock 500MHz) breaks
-# RetroArch's content-rotation pipeline on this panel - RGUI menus and
-# in-game content (both MAME and non-MAME, e.g. SNES) came out rotated 90
-# degrees with it on, and displayed correctly with it off, with no other
-# change. Root cause not fully understood beyond "it's the GPU core clock
-# specifically" (likely an HVS/scaler timing interaction) - set
-# ENABLE_OVERCLOCK=true only if you don't need working rotation, or have
-# verified it's fine on your specific panel/kernel combination. Scoped under
-# a [pi4] section filter in config.txt (see phase_overclock) so it's a no-op
-# on any other board this script might run on regardless. Both values are
-# above stock (arm_freq 1500MHz / gpu_freq 500MHz) and need the extra core
-# voltage (over_voltage) for stability, plus real cooling (heatsink+fan case)
-# to avoid thermal throttling under sustained load, if you do enable it.
-ENABLE_OVERCLOCK="${ENABLE_OVERCLOCK:-false}"
+# ON by default (per explicit choice - see below for the trade-off). Earlier
+# testing found, via a byte-for-byte config diff against a known-good
+# reference SD card (identical retroarch.cfg/config.txt otherwise), that
+# enabling this GPU overclock (gpu_freq above stock 500MHz) broke RetroArch's
+# content-rotation pipeline on this panel - RGUI menus and in-game content
+# (both MAME and non-MAME, e.g. SNES) came out rotated 90 degrees with it on,
+# and displayed correctly with it off, with no other change. Root cause not
+# fully understood beyond "it's the GPU core clock specifically" (likely an
+# HVS/scaler timing interaction). If rotation breaks again after enabling
+# this, set ENABLE_OVERCLOCK=false and re-verify before assuming some other
+# regression. Scoped under a [pi4] section filter in config.txt (see
+# phase_overclock) so it's a no-op on any other board this script might run
+# on regardless. Both values are above stock (arm_freq 1500MHz / gpu_freq
+# 500MHz) and need the extra core voltage (over_voltage) for stability, plus
+# real cooling (heatsink+fan case) to avoid thermal throttling under
+# sustained load.
+ENABLE_OVERCLOCK="${ENABLE_OVERCLOCK:-true}"
 OC_ARM_FREQ="${OC_ARM_FREQ:-2000}"     # CPU, MHz
 OC_GPU_FREQ="${OC_GPU_FREQ:-675}"      # VideoCore/GPU core clock, MHz
 OC_OVER_VOLTAGE="${OC_OVER_VOLTAGE:-6}" # +0.025V per step; 6 = +0.15V, needed for 2GHz arm_freq
@@ -135,6 +136,27 @@ OC_OVER_VOLTAGE="${OC_OVER_VOLTAGE:-6}" # +0.025V per step; 6 = +0.15V, needed f
 # MAME is always installed (the point of this script). Additional cores are
 # a comma-separated list of RetroPie-Setup package ids.
 EMULATOR_CORES="${EMULATOR_CORES:-lr-snes9x,lr-pcsx-rearmed,ppsspp,lr-fceumm,lr-gambatte,lr-genesis-plus-gx,lr-nestopia,lr-picodrive,mupen64plus}"
+
+# --- RetroArch source patch (menu rotation) ---------------------------------
+# RetroArch's own menu/quick-menu render pass (RGUI) hardcodes an unrotated
+# projection matrix in gl2_draw_texture() (gfx/drivers/gl2.c) - a deliberate
+# upstream choice to keep the menu upright even when *content* is rotated,
+# which backfires when "rotation" is actually compensating for a physically
+# rotated panel like this one. No config setting can fix this (confirmed via
+# `strings` on the stock binary - no rotation option exists for the menu at
+# all) - it needs a source patch and a rebuild. See
+# _apply_retroarch_menu_rotation_patch/phase_retroarch_menu_rotation_patch.
+# Also fixes a second, MAME-specific bug found afterward: some cores (MAME,
+# for ROT90 arcade games like Pac-Man) call the libretro
+# RETRO_ENVIRONMENT_SET_ROTATION callback, which overwrites RetroArch's
+# internal rotation value with just the core's own raw request instead of
+# combining it with this script's panel-rotation config - harmless for game
+# content (MAME separately pre-rotates its own frame buffer to compensate)
+# but left the *menu* rotated wrong specifically during MAME sessions once
+# the first patch made it share that same value. The patch below builds a
+# separate rotation matrix for the menu from the config's video_rotation
+# alone, so it's unaffected by whatever any given core requests.
+APPLY_RETROARCH_MENU_ROTATION_PATCH="${APPLY_RETROARCH_MENU_ROTATION_PATCH:-true}"
 
 # --- ES-DE --------------------------------------------------------------
 ESDE_BRANCH="${ESDE_BRANCH:-stable-3.4}"
@@ -278,6 +300,7 @@ OC_ARM_FREQ=$OC_ARM_FREQ
 OC_GPU_FREQ=$OC_GPU_FREQ
 OC_OVER_VOLTAGE=$OC_OVER_VOLTAGE
 EMULATOR_CORES=$EMULATOR_CORES
+APPLY_RETROARCH_MENU_ROTATION_PATCH=$APPLY_RETROARCH_MENU_ROTATION_PATCH
 ESDE_BRANCH=$ESDE_BRANCH
 APPLY_ESDE_QUITMENU_PATCH=$APPLY_ESDE_QUITMENU_PATCH
 INSTALL_THEMES=$INSTALL_THEMES
@@ -609,6 +632,120 @@ phase_emulators_install() {
     return 0
 }
 
+# Patches RetroArch's gl2 GL2 video driver so the RGUI menu/quick-menu is
+# rotated to match the panel instead of always drawing unrotated (see the
+# APPLY_RETROARCH_MENU_ROTATION_PATCH comment above for the full story).
+# Modeled on _apply_quitmenu_patch's fail-soft pattern: matches exact,
+# current-upstream anchor text and skips (with a warning, not a hard
+# failure) if RetroArch's source has changed underneath it, rather than
+# risking a corrupt/half-applied source tree.
+_apply_retroarch_menu_rotation_patch() {
+    local ra_src_dir="$1"
+    python3 - "$ra_src_dir" <<'PYEOF'
+import sys, pathlib
+
+root = pathlib.Path(sys.argv[1])
+path = root / "gfx/drivers/gl2.c"
+text = path.read_text()
+
+old = """static INLINE void gl2_draw_texture(gl2_t *gl)
+{
+   GLfloat color[16];
+   unsigned width         = gl->video_width;
+   unsigned height        = gl->video_height;
+"""
+
+new = """static INLINE void gl2_draw_texture(gl2_t *gl)
+{
+   GLfloat color[16];
+   /* The menu must always be oriented purely by the user's configured
+    * video_rotation (physical panel-mounting compensation), never by
+    * gl->rotation/gl->mvp - those reflect retroarch_get_rotation(), i.e.
+    * config rotation PLUS whatever the active core has separately
+    * requested via RETRO_ENVIRONMENT_SET_ROTATION (see runloop.c). Some
+    * cores (confirmed: MAME, for ROT90 arcade games like Pac-Man) call
+    * this, which overwrites gl->rotation with just their own raw request
+    * (video_driver_set_rotation() passes it straight through, it does not
+    * re-add the config value) - fine for game content, since MAME also
+    * pre-rotates its own framebuffer pixels to compensate, but it leaves
+    * the shared gl->mvp wrong for the menu texture specifically, which has
+    * no such per-core compensation. Building a separate, config-only
+    * rotation matrix here keeps the menu's orientation tied only to the
+    * physical panel, regardless of what any given core requests. */
+   math_matrix_4x4 menu_mvp;
+   unsigned menu_rotation = config_get_ptr()->uints.video_rotation % 4;
+   unsigned width         = gl->video_width;
+   unsigned height        = gl->video_height;
+
+   if (menu_rotation)
+   {
+      static math_matrix_4x4 menu_rot = {
+         { 0.0f,     0.0f,    0.0f,    0.0f ,
+           0.0f,     0.0f,    0.0f,    0.0f ,
+           0.0f,     0.0f,    0.0f,    0.0f ,
+           0.0f,     0.0f,    0.0f,    1.0f }
+      };
+      float radians = M_PI * (90.0f * menu_rotation) / 180.0f;
+      float cosine   = cosf(radians);
+      float sine     = sinf(radians);
+      MAT_ELEM_4X4(menu_rot, 0, 0) = cosine;
+      MAT_ELEM_4X4(menu_rot, 0, 1) = -sine;
+      MAT_ELEM_4X4(menu_rot, 1, 0) = sine;
+      MAT_ELEM_4X4(menu_rot, 1, 1) = cosine;
+      matrix_4x4_multiply(menu_mvp, menu_rot, gl->mvp_no_rot);
+   }
+   else
+      menu_mvp = gl->mvp_no_rot;
+"""
+
+old2 = "   gl->shader->set_mvp(gl->shader_data, &gl->mvp_no_rot);\n\n   glEnable(GL_BLEND);"
+new2 = "   gl->shader->set_mvp(gl->shader_data, &menu_mvp);\n\n   glEnable(GL_BLEND);"
+
+if new in text:
+    print("[patch] gl2.c gl2_draw_texture: already applied")
+    sys.exit(0)
+
+if text.count(old) != 1 or text.count(old2) != 1:
+    print("[patch] gl2.c gl2_draw_texture: anchor text not found/not unique, skipping (RetroArch source may have changed) - menu will render unrotated, matching stock upstream behavior")
+    sys.exit(3)
+
+text = text.replace(old, new, 1)
+text = text.replace(old2, new2, 1)
+path.write_text(text)
+print("[patch] gl2.c gl2_draw_texture: applied")
+PYEOF
+}
+
+# RetroPie-Setup's own basic_install builds RetroArch from source but leaves
+# it unpatched. This re-patches the same source tree it already fetched
+# (under RetroPie-Setup/tmp/build/retroarch) and re-runs just the
+# build+install steps (RetroPie-Setup's own build_retroarch/install_retroarch
+# functions - ./configure && make clean && make, then make install) rather
+# than a full re-clone. Fails soft: if the source tree isn't where expected
+# (e.g. a future RetroPie-Setup version changes its build layout) or the
+# patch's anchor text doesn't match, this logs a warning and leaves the
+# stock (unpatched, unrotated-menu) RetroArch in place instead of aborting
+# the whole install.
+phase_retroarch_menu_rotation_patch() {
+    if [ "$APPLY_RETROARCH_MENU_ROTATION_PATCH" != "true" ]; then
+        log "APPLY_RETROARCH_MENU_ROTATION_PATCH=false, skipping RetroArch menu rotation patch"
+        return 0
+    fi
+    local ra_src_dir="$PI_HOME/RetroPie-Setup/tmp/build/retroarch"
+    if [ ! -d "$ra_src_dir/gfx/drivers" ]; then
+        log_warn "RetroArch source tree not found at $ra_src_dir (RetroPie-Setup layout may have changed) - skipping menu rotation patch, RGUI/quick-menu will render unrotated"
+        return 0
+    fi
+    if ! _apply_retroarch_menu_rotation_patch "$ra_src_dir"; then
+        log_warn "RetroArch menu rotation patch did not fully apply; RGUI/quick-menu will render unrotated (matching stock upstream behavior)"
+        return 0
+    fi
+    log "Rebuilding RetroArch with the menu rotation patch (re-running RetroPie-Setup's own build+install steps)"
+    cd "$PI_HOME/RetroPie-Setup" || die "RetroPie-Setup missing"
+    sudo ./retropie_packages.sh retroarch build install || die "RetroArch rebuild after menu rotation patch failed"
+    return 0
+}
+
 # RetroArch ships a large library of controller autoconfig profiles under
 # .../retroarch/autoconfig-presets/udev/ (hundreds of pads, matched by
 # vendor/product id), but only copies a profile into the *active*
@@ -713,6 +850,24 @@ phase_video_rotation_setup() {
     else
         log_warn "arcade/retroarch.cfg not found yet - set video_allow_rotate/video_rotation in all/retroarch.cfg only; the arcade system will still inherit it via #include"
     fi
+
+    # RGUI's own aspect-lock setting is separate from the content viewport
+    # fix above, and defaults to INTEGER (whole-pixel-multiple scaling only),
+    # which left the standalone Main Menu looking too narrow once its
+    # rotation was also fixed (see _apply_retroarch_menu_rotation_patch) -
+    # NONE lets it fill the screen like everything else here.
+    _set_retroarch_key "$all_cfg" "rgui_aspect_ratio_lock" "0"
+
+    # Xbox-style pads (and others following the same physical-position
+    # convention) map their bottom face button to retro-B and right face
+    # button to retro-A - RetroArch's menu then reads as "B confirms, A
+    # backs out", which is backwards from what most people expect. This
+    # swaps it to the more intuitive "A confirms, B backs out" without
+    # touching any actual button mapping (confirmed via source - a real,
+    # driver-agnostic input setting, not an ozone/xmb cosmetic option, and
+    # needs no recompile).
+    _set_retroarch_key "$all_cfg" "menu_swap_ok_cancel_buttons" "true"
+    log "Set rgui_aspect_ratio_lock=0 (None), menu_swap_ok_cancel_buttons=true in all/retroarch.cfg"
     return 0
 }
 
@@ -5584,6 +5739,7 @@ main() {
         verify_display
         retropie_install
         emulators_install
+        retroarch_menu_rotation_patch
         retroarch_autoconfig
         video_rotation_setup
         ftp_install
