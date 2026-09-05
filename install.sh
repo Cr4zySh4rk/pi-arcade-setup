@@ -166,6 +166,27 @@ APPLY_RETROARCH_MENU_ROTATION_PATCH="${APPLY_RETROARCH_MENU_ROTATION_PATCH:-true
 # --- ES-DE --------------------------------------------------------------
 ESDE_BRANCH="${ESDE_BRANCH:-stable-3.4}"
 APPLY_ESDE_QUITMENU_PATCH="${APPLY_ESDE_QUITMENU_PATCH:-true}"
+# Fixes a genuine upstream ES-DE 3.4.1 crash: opening Main Menu > Scraper
+# (GuiScraperMenu's constructor, es-app/src/guis/GuiScraperMenu.cpp) builds
+# the "SCRAPE THESE SYSTEMS" list by looping over SystemData::sSystemVector
+# with index i, but calls mSystems->add(...) only for systems that don't
+# have PlatformIds::PLATFORM_IGNORE - then immediately calls
+# mSystems->selectEntry(i)/unselectEntry(i) using that SAME outer index i,
+# not the position actually reached inside mSystems. Any ignored system
+# before the end of sSystemVector (this project's own "RetroPie Setup"
+# custom system, step 15, is deliberately tagged <platform>ignore</platform>
+# so it isn't scraped, and sorts before every real system alphabetically)
+# makes every subsequent selectEntry/unselectEntry call run one or more
+# indices past the end of mSystems's actual entry list - an out-of-bounds
+# access that throws unconditionally, is never caught, and terminates the
+# whole process (std::terminate -> SIGABRT) with no ES-DE log line and no
+# kernel-visible fault, since the crash happens before any scraper-specific
+# code path would log anything. Confirmed live via a debug-logged capture
+# of the crash (nothing at all between the Start button press that opens
+# the Main Menu and the process exiting) and by reading the actual
+# GuiScraperMenu.cpp source this build compiles. Fixed by tracking a
+# separate counter for the index actually reached inside mSystems.
+APPLY_ESDE_SCRAPER_MENU_PATCH="${APPLY_ESDE_SCRAPER_MENU_PATCH:-true}"
 INSTALL_THEMES="${INSTALL_THEMES:-true}"
 ESDE_THEME_NAME="${ESDE_THEME_NAME:-artflix-revisited}"
 INITIAL_FRONTEND="${INITIAL_FRONTEND:-esde}"            # esde | classic
@@ -308,6 +329,7 @@ EMULATOR_CORES=$EMULATOR_CORES
 APPLY_RETROARCH_MENU_ROTATION_PATCH=$APPLY_RETROARCH_MENU_ROTATION_PATCH
 ESDE_BRANCH=$ESDE_BRANCH
 APPLY_ESDE_QUITMENU_PATCH=$APPLY_ESDE_QUITMENU_PATCH
+APPLY_ESDE_SCRAPER_MENU_PATCH=$APPLY_ESDE_SCRAPER_MENU_PATCH
 INSTALL_THEMES=$INSTALL_THEMES
 ESDE_THEME_NAME=$ESDE_THEME_NAME
 INITIAL_FRONTEND=$INITIAL_FRONTEND
@@ -1057,6 +1079,54 @@ sys.exit(0 if ok else 3)
 PYEOF
 }
 
+# Fixes a genuine upstream ES-DE crash when opening Main Menu > Scraper -
+# see the APPLY_ESDE_SCRAPER_MENU_PATCH comment above for the full story.
+# Same fail-soft exact-match pattern as _apply_quitmenu_patch.
+_apply_scraper_menu_crash_patch() {
+    local esde_dir="$1"
+    python3 - "$esde_dir" <<'PYEOF'
+import sys, pathlib
+
+root = pathlib.Path(sys.argv[1])
+path = root / "es-app/src/guis/GuiScraperMenu.cpp"
+text = path.read_text()
+
+old = """    mSystems = std::make_shared<OptionListComponent<SystemData*>>(_("SCRAPE THESE SYSTEMS"), true);
+    for (unsigned int i {0}; i < SystemData::sSystemVector.size(); ++i) {
+        if (!SystemData::sSystemVector[i]->hasPlatformId(PlatformIds::PLATFORM_IGNORE)) {
+            mSystems->add(Utils::String::toUpper(SystemData::sSystemVector[i]->getFullName()),
+                          SystemData::sSystemVector[i],
+                          !SystemData::sSystemVector[i]->getPlatformIds().empty());
+            SystemData::sSystemVector[i]->getScrapeFlag() ? mSystems->selectEntry(i) :
+                                                            mSystems->unselectEntry(i);
+        }
+    }"""
+
+new = """    mSystems = std::make_shared<OptionListComponent<SystemData*>>(_("SCRAPE THESE SYSTEMS"), true);
+    unsigned int mSystemsIndex {0};
+    for (unsigned int i {0}; i < SystemData::sSystemVector.size(); ++i) {
+        if (!SystemData::sSystemVector[i]->hasPlatformId(PlatformIds::PLATFORM_IGNORE)) {
+            mSystems->add(Utils::String::toUpper(SystemData::sSystemVector[i]->getFullName()),
+                          SystemData::sSystemVector[i],
+                          !SystemData::sSystemVector[i]->getPlatformIds().empty());
+            SystemData::sSystemVector[i]->getScrapeFlag() ? mSystems->selectEntry(mSystemsIndex) :
+                                                            mSystems->unselectEntry(mSystemsIndex);
+            ++mSystemsIndex;
+        }
+    }"""
+
+if new in text:
+    print("[patch] GuiScraperMenu.cpp scraper crash fix: already applied")
+    sys.exit(0)
+if old not in text:
+    print("[patch] GuiScraperMenu.cpp scraper crash fix: anchor text not found, skipping (ES-DE source may have changed)")
+    sys.exit(3)
+path.write_text(text.replace(old, new, 1))
+print("[patch] GuiScraperMenu.cpp scraper crash fix: applied")
+sys.exit(0)
+PYEOF
+}
+
 phase_esde_build() {
     if [ ! -d "$PI_HOME/emulationstation-de" ]; then
         git clone https://gitlab.com/es-de/emulationstation-de.git "$PI_HOME/emulationstation-de" || die "ES-DE clone failed"
@@ -1067,6 +1137,10 @@ phase_esde_build() {
 
     if [ "$APPLY_ESDE_QUITMENU_PATCH" = "true" ]; then
         _apply_quitmenu_patch "$PI_HOME/emulationstation-de" || log_warn "Quit-menu patch did not fully apply; ES-DE will build without the Restart EmulationStation option."
+    fi
+
+    if [ "$APPLY_ESDE_SCRAPER_MENU_PATCH" = "true" ]; then
+        _apply_scraper_menu_crash_patch "$PI_HOME/emulationstation-de" || log_warn "Scraper menu crash patch did not fully apply; opening Main Menu > Scraper may crash ES-DE if any system is tagged platform=ignore (e.g. the custom RetroPie Setup system)."
     fi
 
     mkdir -p build && cd build || die "cannot cd into emulationstation-de/build"
@@ -3952,10 +4026,25 @@ ExecStart=
 ExecStart=/usr/bin/bluealsa-aplay -S --single-audio --pcm-buffer-time=1000000 --pcm-period-time=100000
 EOF
 
+    # bt-agent/bt-nowplaying-daemon After/Wants bt-power-on.service (not
+    # just bluetooth.service) so bt-power-on always starts first - but this
+    # alone isn't enough to stop bt-power-on's own "org.bluez.Error.Busy"
+    # failures (confirmed live via journalctl), because bluetoothd is also
+    # concurrently fielding endpoint-registration D-Bus calls from other
+    # independent startup paths at the exact same moment - bluealsa.service
+    # (registers the Audio Sink profile) and the pi user's own PipeWire/
+    # WirePlumber session (started via loginctl linger, entirely unordered
+    # relative to any root-level systemd unit) both do this, and neither is
+    # something bt-power-on can simply be ordered after without adding a
+    # much more fragile web of cross-user-session dependencies. The
+    # ExecStart below retries each bluetoothctl call instead of running it
+    # once, which resolves the transient "Busy" without needing to track
+    # down every possible concurrent initializer up front.
     sudo tee /etc/systemd/system/bt-agent.service >/dev/null <<EOF
 [Unit]
 Description=Headless Bluetooth pairing agent (auto-accept, DisplayYesNo)
-After=bluetooth.service dbus.service
+After=bluetooth.service dbus.service bt-power-on.service
+Wants=bt-power-on.service
 Requires=bluetooth.service
 
 [Service]
@@ -3997,7 +4086,7 @@ Requires=bluetooth.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/bash -c 'bluetoothctl power on; bluetoothctl discoverable off; bluetoothctl pairable off'
+ExecStart=/usr/bin/bash -c 'for c in "power on" "discoverable off" "pairable off"; do for i in 1 2 3 4 5; do bluetoothctl \$c && break; sleep 1; done; done'
 RemainAfterExit=yes
 
 [Install]
@@ -4007,7 +4096,8 @@ EOF
     sudo tee /etc/systemd/system/bt-nowplaying-daemon.service >/dev/null <<EOF
 [Unit]
 Description=Bluetooth AVRCP now-playing status/control daemon
-After=bluetooth.service dbus.service
+After=bluetooth.service dbus.service bt-power-on.service
+Wants=bt-power-on.service
 Requires=bluetooth.service
 
 [Service]
