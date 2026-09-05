@@ -75,6 +75,44 @@ SPLASH_TRANSFORM_TYPE="${SPLASH_TRANSFORM_TYPE:-90}"    # VLC --transform-type, 
 SPLASH_VIDEO_URL="${SPLASH_VIDEO_URL:-https://raw.githubusercontent.com/Cr4zySh4rk/pi-arcade-setup/main/splash/retro-splash.mp4}"
 DO_RPI_FIRMWARE_UPDATE="${DO_RPI_FIRMWARE_UPDATE:-false}" # runs `rpi-update`; opt-in, only if panel is blank on old firmware
 
+# --- MAME per-game rotation (vertical-cabinet games, e.g. Pac-Man) ----------
+# MAME reports its own screen orientation per game and pre-rotates natively
+# vertical/TATE games to landscape before RetroArch ever sees the frame -
+# but that's calculated for a plain landscape display, not for the extra
+# fixed video_rotation this panel's physical portrait mount needs (see
+# RETROARCH_VIDEO_ROTATION above). RetroArch does not add video_rotation on
+# top of a game that already reports its own rotation (confirmed live: it
+# has zero effect on Pac-Man while fully controlling horizontal games like
+# Mortal Kombat) - so vertical-cabinet games always come out one rotation
+# step off, and no single global setting fixes both at once. The real fix
+# (phase_mame_rotation_autofix) applies MAME's own mame_rotation_mode core
+# option per-ROM, only to games that are natively vertical, using MAME's own
+# machine database (data/vertical-mame-roms.txt, generated from a real
+# `mame -listxml` dump - not guesswork) so it covers ROMs added later too.
+# mame_rotation_mode only has 3 valid values ("libretro" = default per-game
+# auto, "tate-ror"/"tate-rol" = rotated 90 one way or the other) - tate-ror
+# is the value confirmed needed for this build's panel orientation.
+MAME_VERTICAL_ROTATION_MODE="${MAME_VERTICAL_ROTATION_MODE:-tate-ror}"
+VERTICAL_MAME_ROMS_URL="${VERTICAL_MAME_ROMS_URL:-https://raw.githubusercontent.com/Cr4zySh4rk/pi-arcade-setup/main/data/vertical-mame-roms.txt}"
+# NOTE: MAME ROMs aren't only under roms/arcade - RetroPie also ships a
+# separate "mame-libretro" system (confirmed live: its own emulators.cfg
+# also points at mamearcade_libretro.so) with its own roms/mame-libretro
+# folder, and in principle any other system could be pointed at the same
+# core too. So this is *not* a single hardcoded folder - the sync script
+# discovers every system whose emulators.cfg references
+# mamearcade_libretro.so at run time (see mame-rotation-sync.py) and scans
+# all of their ROM folders under here, every time it runs - covering
+# systems/ROMs added after this installer runs, not just what's here now.
+ROMS_BASE_DIR="${ROMS_BASE_DIR:-$PI_HOME/RetroPie/roms}"
+# Live in-game hotkey (phase_mame_rotation_hotkey): hold L3+R3 and press
+# Dpad-Right/Left to rotate the CURRENTLY RUNNING game 90 degrees CW/CCW,
+# saved as that specific ROM's own override only. Needs RetroArch's network
+# command interface (loopback only) to ask a running instance to quit before
+# relaunching the same ROM, since core options are only read at content load.
+ENABLE_MAME_ROTATION_HOTKEY="${ENABLE_MAME_ROTATION_HOTKEY:-true}"
+RETROARCH_NETWORK_CMD_PORT="${RETROARCH_NETWORK_CMD_PORT:-55355}"
+DPAD_X_AXIS="${DPAD_X_AXIS:-6}" # joydev axis index for the D-pad's left/right hat (confirmed for a standard xpad-driver Xbox controller; re-check via /proc/bus/input/devices ABS bitmap for other pads)
+
 # --- CPU/GPU overclock (Raspberry Pi 4 only) --------------------------------
 # On by default to reproduce the reference build. Scoped under a [pi4]
 # section filter in config.txt (see phase_overclock) so it's a no-op on any
@@ -228,6 +266,12 @@ RETROARCH_VIDEO_ROTATION=$RETROARCH_VIDEO_ROTATION
 SPLASH_TRANSFORM_TYPE=$SPLASH_TRANSFORM_TYPE
 SPLASH_VIDEO_URL=$SPLASH_VIDEO_URL
 DO_RPI_FIRMWARE_UPDATE=$DO_RPI_FIRMWARE_UPDATE
+MAME_VERTICAL_ROTATION_MODE=$MAME_VERTICAL_ROTATION_MODE
+VERTICAL_MAME_ROMS_URL=$VERTICAL_MAME_ROMS_URL
+ROMS_BASE_DIR=$ROMS_BASE_DIR
+ENABLE_MAME_ROTATION_HOTKEY=$ENABLE_MAME_ROTATION_HOTKEY
+RETROARCH_NETWORK_CMD_PORT=$RETROARCH_NETWORK_CMD_PORT
+DPAD_X_AXIS=$DPAD_X_AXIS
 ENABLE_OVERCLOCK=$ENABLE_OVERCLOCK
 OC_ARM_FREQ=$OC_ARM_FREQ
 OC_GPU_FREQ=$OC_GPU_FREQ
@@ -613,8 +657,8 @@ phase_video_rotation_setup() {
     # cabinet game) was tried live on the reference Pi and reverted - it
     # fixed nothing for a vertical game (Pac-Man) and broke horizontal ones
     # (Mortal Kombat came out rotated). true is the correct/default setting;
-    # getting vertical-cabinet games to display correctly on this panel
-    # needs a different, not-yet-solved fix (see README Known limitations).
+    # vertical-cabinet games (Pac-Man etc.) are handled separately, per-ROM,
+    # by phase_mame_rotation_autofix below - see that function's comment.
     _set_retroarch_key "$all_cfg" "video_allow_rotate" "true"
     _set_retroarch_key "$all_cfg" "video_rotation" "$RETROARCH_VIDEO_ROTATION"
     # RetroPad combo to quit straight back to the frontend (4 = Start +
@@ -643,6 +687,194 @@ phase_video_rotation_setup() {
     else
         log_warn "arcade/retroarch.cfg not found yet - set video_allow_rotate/video_rotation in all/retroarch.cfg only; the arcade system will still inherit it via #include"
     fi
+    return 0
+}
+
+phase_mame_rotation_autofix() {
+    # See the MAME per-game rotation comment near MAME_VERTICAL_ROTATION_MODE
+    # above for the full explanation. In short: MAME pre-rotates natively
+    # vertical/TATE-cabinet games (Pac-Man etc.) for a plain landscape
+    # display, which comes out one rotation step off on this panel's
+    # physically-portrait mount, and RetroArch ignores the fixed
+    # video_rotation for any game reporting its own rotation - so vertical
+    # games need a per-ROM fix, applied automatically here via MAME's own
+    # mame_rotation_mode core option and RetroArch's per-game "Game Specific
+    # Core Options" (a $corename/$romname.opt override file - confirmed
+    # empirically on the reference Pi to live under
+    # configs/all/retroarch/config/<corename>/, and the mamearcade_libretro
+    # core's own .info file gives its corename as "MAME (Git)").
+    #
+    # Which ROMs are vertical comes from MAME's own machine database
+    # (`mame -listxml`, <display rotate="90|270">), not guesswork - see
+    # data/vertical-mame-roms.txt in this repo, generated once from a real
+    # `mame -listxml` dump covering the full ~48000-machine MAME driver set
+    # (so it also covers ROMs the user adds after this installer runs, not
+    # just what happens to be installed right now).
+    local list_dest="/opt/retropie/configs/all/vertical-mame-roms.txt"
+    sudo mkdir -p /opt/retropie/configs/all
+    if ! sudo curl -fsSL "$VERTICAL_MAME_ROMS_URL" -o "$list_dest"; then
+        log_warn "Could not download $VERTICAL_MAME_ROMS_URL; automatic vertical-cabinet rotation fix will be skipped until this file exists at $list_dest (re-run the installer once you have network access to fetch it)"
+        return 0
+    fi
+    sudo chmod 644 "$list_dest"
+
+    mkdir -p "$PI_HOME/scripts"
+    tee "$PI_HOME/scripts/mame-rotation-sync.py" >/dev/null <<PYEOF
+#!/usr/bin/env python3
+"""
+Auto-fixes screen orientation for natively-vertical MAME/arcade ROMs (e.g.
+Pac-Man) so they display correctly on this panel with zero manual per-game
+editing. Generated by pi-arcade-setup
+(https://github.com/Cr4zySh4rk/pi-arcade-setup) - see phase_mame_rotation_autofix
+in install.sh for the full explanation.
+
+Run once at install time (for ROMs already present) and again automatically
+whenever a MAME-using system's ROM folder changes (via the systemd path
+units this phase installs, one per system discovered at install time), so
+ROMs added later are picked up without any manual step.
+
+Which ROM folders to scan is *not* hardcoded to roms/arcade - RetroPie can
+have more than one system pointed at MAME's libretro core (confirmed live:
+this build also has a separate "mame-libretro" system, with its own
+roms/mame-libretro folder, whose emulators.cfg also points at
+mamearcade_libretro.so). So every run discovers this fresh by scanning
+every configs/<system>/emulators.cfg for that core string and scanning
+roms/<system> for each match - covering a system added after this installer
+runs too, not just whatever happens to use the MAME core right now.
+
+Never overwrites a .opt file that already exists, so it won't clobber a
+rotation the user has manually adjusted with the in-game L3+R3+Dpad hotkey
+(see mame-rotation-hotkey.py) - that hotkey's own choice always wins.
+"""
+import glob
+import os
+
+RETROPIE_CONFIGS_DIR = "/opt/retropie/configs"
+ROMS_BASE_DIR = "$ROMS_BASE_DIR"
+VERTICAL_LIST = "/opt/retropie/configs/all/vertical-mame-roms.txt"
+OVERRIDE_DIR = "/opt/retropie/configs/all/retroarch/config/MAME (Git)"
+DEFAULT_MODE = "$MAME_VERTICAL_ROTATION_MODE"
+ROM_EXTS = (".zip", ".7z")
+MAME_CORE_MARKER = "mamearcade_libretro.so"
+
+
+def load_vertical_set():
+    try:
+        with open(VERTICAL_LIST) as f:
+            return {line.strip() for line in f if line.strip()}
+    except FileNotFoundError:
+        return set()
+
+
+def discover_mame_roms_dirs():
+    """Every roms/<system> folder whose emulators.cfg points at MAME's
+    libretro core - not just "arcade" - discovered fresh each run."""
+    dirs = []
+    for cfg_path in sorted(glob.glob(os.path.join(RETROPIE_CONFIGS_DIR, "*", "emulators.cfg"))):
+        try:
+            with open(cfg_path, errors="replace") as f:
+                content = f.read()
+        except OSError:
+            continue
+        if MAME_CORE_MARKER not in content:
+            continue
+        system = os.path.basename(os.path.dirname(cfg_path))
+        roms_dir = os.path.join(ROMS_BASE_DIR, system)
+        if os.path.isdir(roms_dir):
+            dirs.append(roms_dir)
+    return dirs
+
+
+def main():
+    vertical = load_vertical_set()
+    if not vertical:
+        print("[mame-rotation-sync] no vertical-games list found, nothing to do")
+        return
+    roms_dirs = discover_mame_roms_dirs()
+    if not roms_dirs:
+        print(f"[mame-rotation-sync] no MAME-using system ROM folders found under {ROMS_BASE_DIR} yet, nothing to do")
+        return
+
+    os.makedirs(OVERRIDE_DIR, exist_ok=True)
+    fixed = 0
+    for roms_dir in roms_dirs:
+        for fname in os.listdir(roms_dir):
+            base, ext = os.path.splitext(fname)
+            if ext.lower() not in ROM_EXTS:
+                continue
+            if base not in vertical:
+                continue
+            opt_path = os.path.join(OVERRIDE_DIR, base + ".opt")
+            if os.path.exists(opt_path):
+                continue  # never overwrite - respects a user's own hotkey adjustment
+            with open(opt_path, "w") as f:
+                f.write(f'mame_rotation_mode = "{DEFAULT_MODE}"\n')
+            fixed += 1
+            print(f"[mame-rotation-sync] {base} ({roms_dir}): applied {DEFAULT_MODE} (vertical-cabinet game)")
+    print(f"[mame-rotation-sync] done - {fixed} new override(s) written across {len(roms_dirs)} MAME-using system folder(s)")
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+    chmod +x "$PI_HOME/scripts/mame-rotation-sync.py"
+    sudo mkdir -p "/opt/retropie/configs/all/retroarch/config/MAME (Git)"
+    sudo chown -R "$PI_USER":"$PI_USER" /opt/retropie/configs/all/retroarch/config
+
+    # Run once now for ROMs already present.
+    python3 "$PI_HOME/scripts/mame-rotation-sync.py" 2>&1 | sudo tee -a "$LOG_FILE" >/dev/null
+
+    # Install a path unit so it re-runs automatically whenever ROMs are
+    # added/removed/renamed later - no manual step, ever. One PathChanged=
+    # line per MAME-using system folder discovered right now (a systemd
+    # .path unit needs static paths - a genuinely new system added after
+    # install won't get a live watcher of its own until the installer is
+    # re-run, but the script's own discovery above still means no *code*
+    # change is ever needed, and every folder that already uses MAME today
+    # - including mame-libretro, not just arcade - is covered immediately).
+    local mame_system_dirs=()
+    local cfg_path system roms_dir
+    for cfg_path in /opt/retropie/configs/*/emulators.cfg; do
+        [ -f "$cfg_path" ] || continue
+        grep -q "mamearcade_libretro.so" "$cfg_path" || continue
+        system="$(basename "$(dirname "$cfg_path")")"
+        roms_dir="$ROMS_BASE_DIR/$system"
+        sudo mkdir -p "$roms_dir"
+        sudo chown "$PI_USER":"$PI_USER" "$roms_dir"
+        mame_system_dirs+=("$roms_dir")
+    done
+    if [ "${#mame_system_dirs[@]}" -eq 0 ]; then
+        log_warn "No system's emulators.cfg references mamearcade_libretro.so yet - skipping the live ROM-folder watcher (re-run the installer once lr-mame is installed to pick this up)"
+        return 0
+    fi
+
+    sudo tee /etc/systemd/system/mame-rotation-sync.service >/dev/null <<EOF
+[Unit]
+Description=Auto-fix vertical-cabinet MAME ROM screen orientation
+
+[Service]
+Type=oneshot
+User=$PI_USER
+ExecStart=/usr/bin/python3 $PI_HOME/scripts/mame-rotation-sync.py
+StandardOutput=append:/var/log/mame-rotation-sync.log
+StandardError=append:/var/log/mame-rotation-sync.log
+EOF
+    {
+        echo "[Unit]"
+        echo "Description=Watch MAME-using system ROM folders for mame-rotation-sync"
+        echo ""
+        echo "[Path]"
+        for roms_dir in "${mame_system_dirs[@]}"; do
+            echo "PathChanged=$roms_dir"
+        done
+        echo "Unit=mame-rotation-sync.service"
+        echo ""
+        echo "[Install]"
+        echo "WantedBy=multi-user.target"
+    } | sudo tee /etc/systemd/system/mame-rotation-sync.path >/dev/null
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now mame-rotation-sync.path
+    log "Vertical-cabinet MAME ROM rotation auto-fix installed ($MAME_VERTICAL_ROTATION_MODE applied per-ROM to games listed in data/vertical-mame-roms.txt); watching ${mame_system_dirs[*]} for ROMs added later"
     return 0
 }
 
@@ -1682,6 +1914,235 @@ open(path, "w").write(new_text)
 print("[hotkeyconfig] wired into retropiemenu.sh")
 PYEOF
     fi
+    return 0
+}
+
+phase_mame_rotation_hotkey() {
+    if [ "$ENABLE_MAME_ROTATION_HOTKEY" != "true" ]; then
+        log "ENABLE_MAME_ROTATION_HOTKEY=false, skipping"
+        return 0
+    fi
+
+    # This daemon needs to ask a running RetroArch instance to quit before
+    # relaunching the same ROM (MAME's mame_rotation_mode core option is only
+    # read at content load - there's no live-reload path for it), which
+    # requires RetroArch's network command interface. Left at its default of
+    # listening on all interfaces, same as upstream - this is a closed home
+    # cabinet setup, not a multi-user/internet-facing box.
+    local all_cfg="/opt/retropie/configs/all/retroarch.cfg"
+    _set_retroarch_key "$all_cfg" "network_cmd_enable" "true"
+    _set_retroarch_key "$all_cfg" "network_cmd_port" "$RETROARCH_NETWORK_CMD_PORT"
+
+    mkdir -p "$PI_HOME/scripts"
+    tee "$PI_HOME/scripts/mame-rotation-hotkey.py" >/dev/null <<PYEOF
+#!/usr/bin/env python3
+"""
+Live in-game rotation hotkey for the currently running MAME/arcade game.
+Generated by pi-arcade-setup (https://github.com/Cr4zySh4rk/pi-arcade-setup).
+
+Hold L3 + R3 and press Dpad-Right to rotate the CURRENTLY RUNNING game 90
+degrees clockwise; Dpad-Left rotates 90 degrees counter-clockwise. The
+change is saved as that specific ROM's own setting (a RetroArch per-game
+core-options override, the same mechanism phase_mame_rotation_autofix uses)
+- it never affects any other game - and is applied immediately by asking
+RetroArch to quit and relaunching the exact same ROM, since MAME's
+mame_rotation_mode core option is only read at content load; there is no
+live-reload path for a running core.
+
+MAME's own mame_rotation_mode core option only has 3 valid values
+("libretro" = default per-game auto rotation, "tate-ror"/"tate-rol" =
+rotated 90 degrees one way or the other) - not a full 4-way 0/90/180/270
+set - so this cycles through those 3 states in the pressed direction
+rather than applying a literal +/-90 degrees on top of whatever MAME and
+RetroArch are already doing. Pressing the same direction 3 times returns
+to the default.
+
+Button numbers are loaded from $PI_HOME/.controller-hotkeys-buttons.json if
+present (the same file the brightness/volume hotkey and its "Hotkey
+Config" remap tool use), so L3/R3 stay consistent across both features.
+"""
+import glob
+import json
+import os
+import socket
+import struct
+import subprocess
+import time
+
+JS_DEVICE = "/dev/input/js0"
+BUTTON_CONFIG_FILE = "$PI_HOME/.controller-hotkeys-buttons.json"
+OVERRIDE_DIR = "/opt/retropie/configs/all/retroarch/config/MAME (Git)"
+NETWORK_CMD_PORT = $RETROARCH_NETWORK_CMD_PORT
+
+DEFAULT_BUTTONS = {"l3": $BTN_L3, "r3": $BTN_R3}
+DPAD_X_AXIS = $DPAD_X_AXIS
+
+JS_EVENT_BUTTON = 0x01
+JS_EVENT_AXIS = 0x02
+JS_EVENT_INIT = 0x80
+EVENT_FORMAT = "IhBB"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+
+# Clockwise cycle: default -> +90 -> -90 (back to default from there, since
+# only 3 discrete states exist). Counter-clockwise just walks it backwards.
+CYCLE = ["libretro", "tate-ror", "tate-rol"]
+
+
+def load_button_mapping():
+    mapping = dict(DEFAULT_BUTTONS)
+    if os.path.exists(BUTTON_CONFIG_FILE):
+        try:
+            with open(BUTTON_CONFIG_FILE) as f:
+                data = json.load(f)
+                for key in DEFAULT_BUTTONS:
+                    if key in data:
+                        mapping[key] = data[key]
+        except Exception:
+            pass
+    return mapping
+
+
+def find_running_mame():
+    """(rom_shortname, argv_list) for the running lr-mame RetroArch process,
+    or (None, None) if no MAME game is currently running."""
+    for pid_dir in glob.glob("/proc/[0-9]*"):
+        try:
+            with open(f"{pid_dir}/cmdline", "rb") as f:
+                raw = f.read()
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+        if not raw or b"mamearcade_libretro.so" not in raw:
+            continue
+        argv = [a.decode(errors="replace") for a in raw.split(b"\\x00") if a]
+        rom_arg = next((a for a in reversed(argv) if a.lower().endswith((".zip", ".7z"))), None)
+        if not rom_arg:
+            continue
+        shortname = os.path.splitext(os.path.basename(rom_arg))[0]
+        return shortname, argv
+    return None, None
+
+
+def current_mode(shortname):
+    opt_path = os.path.join(OVERRIDE_DIR, shortname + ".opt")
+    try:
+        with open(opt_path) as f:
+            for line in f:
+                if line.strip().startswith("mame_rotation_mode"):
+                    return line.split("=", 1)[1].strip().strip('"')
+    except FileNotFoundError:
+        pass
+    return "libretro"
+
+
+def set_mode(shortname, mode):
+    os.makedirs(OVERRIDE_DIR, exist_ok=True)
+    opt_path = os.path.join(OVERRIDE_DIR, shortname + ".opt")
+    with open(opt_path, "w") as f:
+        f.write(f'mame_rotation_mode = "{mode}"\\n')
+
+
+def quit_retroarch():
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.sendto(b"QUIT\\n", ("127.0.0.1", NETWORK_CMD_PORT))
+        sock.close()
+    except Exception as e:
+        print(f"[rotation-hotkey] failed to send QUIT: {e}")
+
+
+def relaunch(argv):
+    try:
+        subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception as e:
+        print(f"[rotation-hotkey] failed to relaunch: {e}")
+
+
+def rotate(direction):
+    shortname, argv = find_running_mame()
+    if not shortname:
+        print("[rotation-hotkey] no MAME game currently running, ignoring")
+        return
+    mode = current_mode(shortname)
+    idx = CYCLE.index(mode) if mode in CYCLE else 0
+    idx = (idx + (1 if direction == "cw" else -1)) % len(CYCLE)
+    new_mode = CYCLE[idx]
+    set_mode(shortname, new_mode)
+    print(f"[rotation-hotkey] {shortname}: {mode} -> {new_mode}, reloading")
+    quit_retroarch()
+    for _ in range(50):  # wait up to ~5s for the process to actually exit
+        if find_running_mame()[0] is None:
+            break
+        time.sleep(0.1)
+    time.sleep(0.3)
+    relaunch(argv)
+
+
+def main():
+    buttons = load_button_mapping()
+    print(f"[rotation-hotkey] starting, L3={buttons['l3']} R3={buttons['r3']} dpad_axis={DPAD_X_AXIS}")
+    held = {}
+    dpad_x = 0
+
+    while True:
+        try:
+            with open(JS_DEVICE, "rb") as js:
+                print("[rotation-hotkey] connected to", JS_DEVICE)
+                while True:
+                    data = js.read(EVENT_SIZE)
+                    if not data or len(data) < EVENT_SIZE:
+                        break
+                    _t, value, typ, number = struct.unpack(EVENT_FORMAT, data)
+                    typ &= ~JS_EVENT_INIT
+
+                    if typ == JS_EVENT_BUTTON:
+                        held[number] = bool(value)
+                        continue
+
+                    if typ == JS_EVENT_AXIS and number == DPAD_X_AXIS:
+                        prev = dpad_x
+                        dpad_x = value
+                        if not (held.get(buttons["l3"]) and held.get(buttons["r3"])):
+                            continue
+                        if prev == 0 and dpad_x > 0:
+                            rotate("cw")
+                        elif prev == 0 and dpad_x < 0:
+                            rotate("ccw")
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            print(f"[rotation-hotkey] joystick read error: {e}")
+
+        held.clear()
+        dpad_x = 0
+        time.sleep(2)
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+    chmod +x "$PI_HOME/scripts/mame-rotation-hotkey.py"
+
+    sudo tee /etc/systemd/system/mame-rotation-hotkey.service >/dev/null <<EOF
+[Unit]
+Description=Live per-game MAME rotation hotkey (hold L3+R3, press Dpad-Right/Left)
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+User=$PI_USER
+ExecStart=/usr/bin/python3 -u $PI_HOME/scripts/mame-rotation-hotkey.py
+Restart=always
+RestartSec=2
+StandardOutput=append:/var/log/mame-rotation-hotkey.log
+StandardError=append:/var/log/mame-rotation-hotkey.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now mame-rotation-hotkey.service
+    log "Live rotation hotkey installed: hold L3+R3, press Dpad-Right/Left to rotate the current game 90deg CW/CCW (saved for that ROM only, network_cmd_enable=true/port=$RETROARCH_NETWORK_CMD_PORT set in all/retroarch.cfg to support it)"
     return 0
 }
 
@@ -5464,6 +5925,7 @@ main() {
         emulators_install
         retroarch_autoconfig
         video_rotation_setup
+        mame_rotation_autofix
         ftp_install
         disk_cleanup
         esde_build_deps
@@ -5478,6 +5940,7 @@ main() {
         polkit_fix
         controller_hotkeys
         hotkey_remap_tool
+        mame_rotation_hotkey
         led_strip_setup
         led_config_tool
         audio_output_setup
