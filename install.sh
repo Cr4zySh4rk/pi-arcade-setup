@@ -1146,6 +1146,50 @@ phase_esde_retroarch_links() {
     return 0
 }
 
+# ES-DE's built-in es_systems.xml lists "Mesen" as the first (i.e. default)
+# command for the nes/fds systems, which requires lr-mesen. As of this
+# writing, RetroPie's binary package repo has no lr-mesen (or lr-fceumm)
+# binary for aarch64 on this Debian release, so _binary_ installs of both
+# silently produce no .so (retropie_packages.sh exits 0 with just an
+# "Errors: Could not find a binary for ..." line) - confirmed live. Since
+# ES-DE still tries to launch the missing "Mesen" command by default, every
+# NES ROM fails with "Couldn't find emulator core 'MESEN_LIBRETRO.SO'" even
+# though lr-nestopia (already in EMULATOR_CORES) is installed and works
+# fine. Point ES-DE's default at Nestopia UE instead by pre-seeding each
+# system's gamelist.xml with the <alternativeEmulator> tag ES-DE's own
+# "Alternative Emulators" menu would otherwise write - this only sets the
+# system-wide default and does not touch per-game overrides or overwrite an
+# existing gamelist.xml.
+phase_esde_nes_default_emulator() {
+    local sys
+    for sys in nes fds; do
+        local gl_dir="$PI_HOME/ES-DE/gamelists/$sys"
+        local gl_file="$gl_dir/gamelist.xml"
+        mkdir -p "$gl_dir"
+        chown "$PI_USER:$PI_USER" "$gl_dir" 2>/dev/null || true
+        if [ -f "$gl_file" ]; then
+            if grep -q '<alternativeEmulator>' "$gl_file"; then
+                log "$sys gamelist.xml already has an alternativeEmulator override, leaving as-is"
+                continue
+            fi
+            sed -i '0,/<gameList>/s//<gameList>\n\t<alternativeEmulator>\n\t\t<label>Nestopia UE<\/label>\n\t<\/alternativeEmulator>/' "$gl_file" \
+                || log_warn "could not patch existing $sys gamelist.xml with alternativeEmulator override"
+        else
+            cat > "$gl_file" <<'EOF'
+<?xml version="1.0"?>
+<gameList>
+	<alternativeEmulator>
+		<label>Nestopia UE</label>
+	</alternativeEmulator>
+</gameList>
+EOF
+        fi
+        chown "$PI_USER:$PI_USER" "$gl_file" 2>/dev/null || true
+        log "Set Nestopia UE as the default emulator for $sys (Mesen has no aarch64 binary yet)"
+    done
+    return 0
+}
+
 phase_themes_install() {
     if [ "$INSTALL_THEMES" != "true" ]; then
         log "INSTALL_THEMES=false, skipping"
@@ -5792,6 +5836,7 @@ main() {
         esde_build
         esde_config
         esde_retroarch_links
+        esde_nes_default_emulator
         themes_install
         theme_system_art
         autostart_setup
