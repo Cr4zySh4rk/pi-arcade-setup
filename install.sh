@@ -97,36 +97,41 @@ DO_RPI_FIRMWARE_UPDATE="${DO_RPI_FIRMWARE_UPDATE:-false}" # runs `rpi-update`; o
 # mechanism (auto-detecting vertical-cabinet ROMs via a `mame -listxml` dump
 # and forcibly setting MAME's own mame_rotation_mode core option per-ROM),
 # plus a live L3+R3+Dpad in-game hotkey to re-cycle it. Both were removed
-# after diffing a known-good reference SD card against this build: the
-# *actual* root cause of "Pac-Man/Mortal Kombat rotated 90 degrees" was the
-# CPU/GPU overclock below breaking RetroArch's content rotation pipeline on
-# this panel (see ENABLE_OVERCLOCK), not anything MAME-specific - MAME's own
-# default mame_rotation_mode="libretro" (auto, per-game) already handles
+# after diffing a known-good reference SD card against this build and fixing
+# the real underlying issues instead - MAME's own default
+# mame_rotation_mode="libretro" (auto, per-game) already handles
 # vertical-cabinet games correctly with no per-ROM overrides needed at all.
 # Forcing mame_rotation_mode="tate-ror" on top of that was actively wrong -
-# it double-rotated/stretched vertical games once the real (overclock) fix
-# was in place. If this regresses again on different hardware, look at
-# ENABLE_OVERCLOCK and the aspect/viewport settings in
-# phase_video_rotation_setup first, before reintroducing any per-ROM
-# MAME-specific mechanism.
+# it double-rotated/stretched vertical games once those real fixes were in
+# place. The actual rotation bugs turned out to be the aspect/viewport
+# coordinate-space issue and the RGUI/menu source bug fixed in
+# phase_video_rotation_setup / phase_retroarch_menu_rotation_patch - an
+# earlier pass through this project also blamed the CPU/GPU overclock below,
+# but re-enabling it after those real fixes were in place did NOT reproduce
+# any rotation problem (confirmed live), so that appears to have been a
+# correlation from testing multiple changed settings at once, not an actual
+# cause. If rotation regresses again on different hardware, look at the
+# aspect/viewport settings and the menu rotation patch first, before
+# suspecting the overclock or reintroducing any per-ROM MAME-specific
+# mechanism.
 
 # --- CPU/GPU overclock (Raspberry Pi 4 only) --------------------------------
-# ON by default (per explicit choice - see below for the trade-off). Earlier
-# testing found, via a byte-for-byte config diff against a known-good
-# reference SD card (identical retroarch.cfg/config.txt otherwise), that
-# enabling this GPU overclock (gpu_freq above stock 500MHz) broke RetroArch's
-# content-rotation pipeline on this panel - RGUI menus and in-game content
-# (both MAME and non-MAME, e.g. SNES) came out rotated 90 degrees with it on,
-# and displayed correctly with it off, with no other change. Root cause not
-# fully understood beyond "it's the GPU core clock specifically" (likely an
-# HVS/scaler timing interaction). If rotation breaks again after enabling
-# this, set ENABLE_OVERCLOCK=false and re-verify before assuming some other
-# regression. Scoped under a [pi4] section filter in config.txt (see
-# phase_overclock) so it's a no-op on any other board this script might run
-# on regardless. Both values are above stock (arm_freq 1500MHz / gpu_freq
-# 500MHz) and need the extra core voltage (over_voltage) for stability, plus
-# real cooling (heatsink+fan case) to avoid thermal throttling under
-# sustained load.
+# ON by default. An earlier pass through this project's rotation debugging
+# blamed this GPU overclock (gpu_freq above stock 500MHz) for breaking
+# RetroArch's rotation, based on a config diff against a known-good reference
+# SD card where several settings differed at once. That specific claim did
+# NOT hold up under a controlled re-test: with the overclock re-enabled
+# alongside the actual fixes (see phase_video_rotation_setup and
+# phase_retroarch_menu_rotation_patch), rotation, aspect, and the RGUI/menu
+# all displayed correctly, confirmed live. It's kept on by default for the
+# performance headroom; if you ever do see a rotation problem, it's worth
+# ruling out with ENABLE_OVERCLOCK=false, but treat that as a hypothesis to
+# test, not an assumed cause. Scoped under a [pi4] section filter in
+# config.txt (see phase_overclock) so it's a no-op on any other board this
+# script might run on regardless. Both values are above stock (arm_freq
+# 1500MHz / gpu_freq 500MHz) and need the extra core voltage (over_voltage)
+# for stability, plus real cooling (heatsink+fan case) to avoid thermal
+# throttling under sustained load.
 ENABLE_OVERCLOCK="${ENABLE_OVERCLOCK:-true}"
 OC_ARM_FREQ="${OC_ARM_FREQ:-2000}"     # CPU, MHz
 OC_GPU_FREQ="${OC_GPU_FREQ:-675}"      # VideoCore/GPU core clock, MHz
@@ -797,8 +802,10 @@ phase_video_rotation_setup() {
     # (Mortal Kombat came out rotated). true is the correct/default setting -
     # MAME's own default mame_rotation_mode="libretro" (auto, per-ROM) already
     # handles vertical-cabinet games correctly with video_allow_rotate=true;
-    # no per-ROM override is needed (see the comment near ENABLE_OVERCLOCK
-    # for what the actual rotation bug turned out to be).
+    # no per-ROM override is needed (see the comment near
+    # phase_retroarch_menu_rotation_patch and the aspect/viewport code below
+    # for what the actual rotation bugs turned out to be - not the CPU/GPU
+    # overclock, despite an earlier pass through this project blaming it).
     _set_retroarch_key "$all_cfg" "video_allow_rotate" "true"
     _set_retroarch_key "$all_cfg" "video_rotation" "$RETROARCH_VIDEO_ROTATION"
     # RetroPad combo to quit straight back to the frontend (4 = Start +
