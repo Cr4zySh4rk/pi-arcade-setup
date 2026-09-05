@@ -608,17 +608,14 @@ _set_retroarch_key() {
 
 phase_video_rotation_setup() {
     local all_cfg="/opt/retropie/configs/all/retroarch.cfg"
-    # video_allow_rotate=false is deliberate, not a typo: RetroArch ADDS a
-    # core's own reported screen-orientation rotation (e.g. MAME reports
-    # ROT90 for a vertical cabinet game like Pac-Man) on top of
-    # video_rotation when video_allow_rotate is true - correct for someone
-    # manually rotating a monitor per-game, but wrong here, where the panel
-    # is fixed in one physical orientation. With it left true, a vertical
-    # game's core-reported rotation and this fixed video_rotation combined
-    # to an incorrect net angle (confirmed live: Pac-Man displayed rotated
-    # 90 degrees off). Setting it false makes every system use *only*
-    # video_rotation, uniformly, matching how ES-DE itself is rotated.
-    _set_retroarch_key "$all_cfg" "video_allow_rotate" "false"
+    # NOTE: video_allow_rotate=false (letting only the fixed video_rotation
+    # apply, ignoring what a libretro core like MAME reports for a vertical
+    # cabinet game) was tried live on the reference Pi and reverted - it
+    # fixed nothing for a vertical game (Pac-Man) and broke horizontal ones
+    # (Mortal Kombat came out rotated). true is the correct/default setting;
+    # getting vertical-cabinet games to display correctly on this panel
+    # needs a different, not-yet-solved fix (see README Known limitations).
+    _set_retroarch_key "$all_cfg" "video_allow_rotate" "true"
     _set_retroarch_key "$all_cfg" "video_rotation" "$RETROARCH_VIDEO_ROTATION"
     # RetroPad combo to quit straight back to the frontend (4 = Start +
     # Select) - unset by default upstream, which is why Start+Select alone
@@ -633,16 +630,16 @@ phase_video_rotation_setup() {
     local arcade_cfg="/opt/retropie/configs/arcade/retroarch.cfg"
     if [ -f "$arcade_cfg" ]; then
         if grep -q "^video_allow_rotate" "$arcade_cfg"; then
-            sudo sed -i "s|^video_allow_rotate.*|video_allow_rotate = false|" "$arcade_cfg"
+            sudo sed -i "s|^video_allow_rotate.*|video_allow_rotate = true|" "$arcade_cfg"
         else
-            sudo sed -i "/^#include/i video_allow_rotate = false" "$arcade_cfg"
+            sudo sed -i "/^#include/i video_allow_rotate = true" "$arcade_cfg"
         fi
         if grep -q "^video_rotation" "$arcade_cfg"; then
             sudo sed -i "s|^video_rotation.*|video_rotation = $RETROARCH_VIDEO_ROTATION|" "$arcade_cfg"
         else
             sudo sed -i "/^#include/i video_rotation = $RETROARCH_VIDEO_ROTATION" "$arcade_cfg"
         fi
-        log "Set video_allow_rotate=false, video_rotation=$RETROARCH_VIDEO_ROTATION in all/retroarch.cfg and arcade/retroarch.cfg; input_quit_gamepad_combo=4 (Start+Select) in all/retroarch.cfg"
+        log "Set video_allow_rotate=true, video_rotation=$RETROARCH_VIDEO_ROTATION in all/retroarch.cfg and arcade/retroarch.cfg; input_quit_gamepad_combo=4 (Start+Select) in all/retroarch.cfg"
     else
         log_warn "arcade/retroarch.cfg not found yet - set video_allow_rotate/video_rotation in all/retroarch.cfg only; the arcade system will still inherit it via #include"
     fi
