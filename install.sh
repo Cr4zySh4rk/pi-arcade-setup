@@ -142,6 +142,44 @@ OC_OVER_VOLTAGE="${OC_OVER_VOLTAGE:-6}" # +0.025V per step; 6 = +0.15V, needed f
 # a comma-separated list of RetroPie-Setup package ids.
 EMULATOR_CORES="${EMULATOR_CORES:-lr-snes9x,lr-pcsx-rearmed,ppsspp,lr-fceumm,lr-gambatte,lr-genesis-plus-gx,lr-nestopia,lr-picodrive,mupen64plus}"
 
+# --- Dreamcast (Flycast) -----------------------------------------------------
+# Redream (the other well-known Dreamcast emulator) has no real aarch64 Linux
+# build - its public source only targets x86_64, the Raspberry Pi/"premium"
+# binaries are compiled from a separate closed-source repo, and the official
+# binary is known to fail to even start on 64-bit Raspberry Pi OS with the
+# modern Mesa v3d KMS driver stack this image uses. Flycast is fully
+# open-source, has a real ARM64 JIT backend, and is the standard way
+# Dreamcast/Naomi/Atomiswave emulation works on Pi 4 - but RetroPie's binary
+# repo has no lr-flycast package for aarch64 on this Debian release either
+# (confirmed live: "Could not find a binary for lr-flycast"), so this always
+# builds it from source, which needs two fixes of its own - see
+# APPLY_GCC14_CFLAGS_PATCH below and _apply_flycast_libzip_patch/
+# phase_dreamcast_flycast_install for the details.
+ENABLE_DREAMCAST="${ENABLE_DREAMCAST:-true}"
+
+# This OS's default compiler is GCC 14, which made an implicit function
+# declaration (calling a function with no visible prototype - almost always
+# a missing #include) a hard error by default in C code, where every GCC
+# before it only warned. That's correct-by-default behavior upstream, but it
+# breaks building a lot of older, otherwise-fine C code unchanged for years,
+# including the bundled libzip dependency in Flycast's source tree
+# (core/deps/libzip/zip_close.c calls close() but only pulled in
+# <unistd.h> on __APPLE__/__SWITCH__, relying on it being available
+# transitively elsewhere on Linux - which silently stopped being true here)
+# - confirmed live: this specific line is what broke the very first Flycast
+# build attempt on this box. Rather than patching every individual instance
+# of this class of error that a from-source build might hit (there is
+# usually more than one in a codebase this old and this large - a second,
+# different instance turned up in libretro-common/glsm/glsm.c on the very
+# next build attempt), this patches RetroPie-Setup's own compiler-flags
+# setup (scriptmodules/system.sh's single "export CFLAGS=..." line) to add
+# -Wno-error=implicit-function-declaration project-wide, downgrading it back
+# to a warning - which is what actually let the build finish, since a
+# codebase this size may have more of these than any one person building it
+# once will discover. This benefits any other module this script (or you,
+# later) ever builds from source on this box, not just Flycast.
+APPLY_GCC14_CFLAGS_PATCH="${APPLY_GCC14_CFLAGS_PATCH:-true}"
+
 # --- RetroArch source patch (menu rotation) ---------------------------------
 # RetroArch's own menu/quick-menu render pass (RGUI) hardcodes an unrotated
 # projection matrix in gl2_draw_texture() (gfx/drivers/gl2.c) - a deliberate
@@ -326,6 +364,8 @@ OC_ARM_FREQ=$OC_ARM_FREQ
 OC_GPU_FREQ=$OC_GPU_FREQ
 OC_OVER_VOLTAGE=$OC_OVER_VOLTAGE
 EMULATOR_CORES=$EMULATOR_CORES
+ENABLE_DREAMCAST=$ENABLE_DREAMCAST
+APPLY_GCC14_CFLAGS_PATCH=$APPLY_GCC14_CFLAGS_PATCH
 APPLY_RETROARCH_MENU_ROTATION_PATCH=$APPLY_RETROARCH_MENU_ROTATION_PATCH
 ESDE_BRANCH=$ESDE_BRANCH
 APPLY_ESDE_QUITMENU_PATCH=$APPLY_ESDE_QUITMENU_PATCH
@@ -670,6 +710,45 @@ phase_retropie_install() {
     return 0
 }
 
+# See the APPLY_GCC14_CFLAGS_PATCH comment above for the full story. A tiny,
+# single-line patch to RetroPie-Setup's own compiler-flags setup - applied
+# once, right after cloning it, so every module built from source afterward
+# (not just Flycast) picks it up. Fail-soft like the other source patches:
+# skips with a warning rather than failing the whole install if a future
+# RetroPie-Setup version changes this line.
+_apply_gcc14_cflags_patch() {
+    local rp_setup_dir="$1"
+    python3 - "$rp_setup_dir" <<'PYEOF'
+import sys, pathlib
+
+root = pathlib.Path(sys.argv[1])
+path = root / "scriptmodules/system.sh"
+text = path.read_text()
+
+old = 'export CFLAGS="$__cflags"'
+new = 'export CFLAGS="$__cflags -Wno-error=implicit-function-declaration"'
+
+if new in text:
+    print("[patch] system.sh GCC14 CFLAGS fix: already applied")
+    sys.exit(0)
+if old not in text:
+    print("[patch] system.sh GCC14 CFLAGS fix: anchor text not found, skipping (RetroPie-Setup source may have changed)")
+    sys.exit(3)
+path.write_text(text.replace(old, new, 1))
+print("[patch] system.sh GCC14 CFLAGS fix: applied")
+sys.exit(0)
+PYEOF
+}
+
+phase_gcc14_cflags_patch() {
+    if [ "$APPLY_GCC14_CFLAGS_PATCH" != "true" ]; then
+        log "APPLY_GCC14_CFLAGS_PATCH=false, skipping"
+        return 0
+    fi
+    _apply_gcc14_cflags_patch "$PI_HOME/RetroPie-Setup" || log_warn "GCC14 CFLAGS patch did not apply; building any module from source (e.g. Flycast) may fail on this OS's GCC 14 with an implicit-function-declaration error."
+    return 0
+}
+
 phase_emulators_install() {
     cd "$PI_HOME/RetroPie-Setup" || die "RetroPie-Setup missing"
     log "Installing MAME (lr-mame)"
@@ -690,9 +769,84 @@ phase_emulators_install() {
         fi
     done
 
-    for sys in snes psx psp arcade nes gb gbc megadrive n64; do
+    for sys in snes psx psp arcade nes gb gbc megadrive n64 dreamcast; do
         mkdir -p "$PI_HOME/RetroPie/roms/$sys"
     done
+    return 0
+}
+
+# Fixes the specific implicit-function-declaration error confirmed live in
+# Flycast's bundled libzip dependency (core/deps/libzip/zip_close.c calls
+# close() but only #includes <unistd.h> on __APPLE__/__SWITCH__) - see the
+# ENABLE_DREAMCAST comment above. This one is patched directly (rather than
+# just relying on the project-wide GCC14 CFLAGS downgrade above) since it's
+# a genuine missing-include bug worth actually fixing at the source, not
+# just silencing - the GCC14 patch is what catches whatever *other* such
+# bugs remain elsewhere in a codebase this size (confirmed live: there was
+# at least one more, in libretro-common/glsm/glsm.c).
+_apply_flycast_libzip_patch() {
+    local flycast_src_dir="$1"
+    python3 - "$flycast_src_dir" <<'PYEOF'
+import sys, pathlib
+
+root = pathlib.Path(sys.argv[1])
+path = root / "core/deps/libzip/zip_close.c"
+if not path.exists():
+    print("[patch] zip_close.c GCC14 include fix: file not found, skipping (Flycast source may have changed)")
+    sys.exit(3)
+text = path.read_text()
+
+old = """#if defined(__APPLE__) || defined(__SWITCH__)
+#include <unistd.h>
+#endif"""
+new = "#include <unistd.h>"
+
+if new in text and old not in text:
+    print("[patch] zip_close.c GCC14 include fix: already applied")
+    sys.exit(0)
+if old not in text:
+    print("[patch] zip_close.c GCC14 include fix: anchor text not found, skipping (Flycast source may have changed)")
+    sys.exit(3)
+path.write_text(text.replace(old, new, 1))
+print("[patch] zip_close.c GCC14 include fix: applied")
+sys.exit(0)
+PYEOF
+}
+
+# Installs Flycast (lr-flycast) for Dreamcast/Naomi/Atomiswave emulation -
+# see the ENABLE_DREAMCAST comment above for why this isn't Redream, and why
+# this always builds from source. Modeled on how the RetroArch/ES-DE source
+# patches in this script work, but split into separate retropie_packages.sh
+# calls (sources, then build+install+configure+clean via the "_source_"
+# meta-mode) rather than one chained call - confirmed live that
+# retropie_packages.sh only ever acts on the *first* mode argument given to
+# it; a plain module name with no mode (or the literal "_source_") is the
+# one exception that internally chains depends/sources/build/install/
+# configure/clean, which is what this relies on for the second call.
+phase_dreamcast_flycast_install() {
+    if [ "$ENABLE_DREAMCAST" != "true" ]; then
+        log "ENABLE_DREAMCAST=false, skipping"
+        return 0
+    fi
+    cd "$PI_HOME/RetroPie-Setup" || die "RetroPie-Setup missing"
+    log "Fetching Flycast source"
+    sudo ./retropie_packages.sh lr-flycast sources || die "lr-flycast sources step failed"
+
+    _apply_flycast_libzip_patch "$PI_HOME/RetroPie-Setup/tmp/build/lr-flycast" \
+        || log_warn "Flycast libzip patch did not fully apply; build may fail on GCC 14 if the source has changed - the project-wide GCC14 CFLAGS patch may still cover it."
+
+    log "Building Flycast (Dreamcast/Naomi/Atomiswave) - this can take 10-15 min on a Pi 4"
+    sudo ./retropie_packages.sh lr-flycast _source_ || die "lr-flycast build/install failed"
+
+    if [ ! -f /opt/retropie/libretrocores/lr-flycast/flycast_libretro.so ]; then
+        log_warn "flycast_libretro.so not found after install; Dreamcast emulation will not be available"
+        return 0
+    fi
+
+    mkdir -p "$PI_HOME/.config/retroarch/cores"
+    ln -sf /opt/retropie/libretrocores/lr-flycast/flycast_libretro.so "$PI_HOME/.config/retroarch/cores/flycast_libretro.so"
+
+    log "Flycast installed - copy dc_boot.bin and dc_flash.bin (dumped from your own Dreamcast) to $PI_HOME/RetroPie/BIOS/dc, and Dreamcast ROMs to $PI_HOME/RetroPie/roms/dreamcast"
     return 0
 }
 
@@ -5926,7 +6080,9 @@ main() {
         display_setup
         verify_display
         retropie_install
+        gcc14_cflags_patch
         emulators_install
+        dreamcast_flycast_install
         retroarch_menu_rotation_patch
         retroarch_autoconfig
         video_rotation_setup
