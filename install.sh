@@ -282,6 +282,25 @@ LED_PWM_CHANNEL="${LED_PWM_CHANNEL:-0}"   # rpi_ws281x channel index: 0 for GPIO
 ENABLE_MUSIC_PLAYER="${ENABLE_MUSIC_PLAYER:-true}"
 MUSIC_DIR="${MUSIC_DIR:-$PI_HOME/RetroPie/Music}"
 
+# --- Bezel Project (RetroArch overlay bezels) ---------------------------------
+# Installs thebezelproject/BezelProject's own bezelproject.sh - an
+# interactive, dialog-based tool (RetroPie menu -> "Bezel Project") for
+# downloading per-system RetroArch overlay bezels (a PNG frame drawn around
+# the game, matching original arcade cabinet/console artwork; needs ROMs
+# named to the No-Intro convention to match up). This only installs the
+# tool itself, exactly as thebezelproject's own install instructions do
+# (a single script dropped into the RetroPie menu folder) - which systems'
+# bezel packs to actually download and enable is left up to you to choose
+# interactively from the tool's own menu, since each pack is a sizeable
+# per-system git clone and there's no sensible unattended default for
+# "which systems do you play". IMPORTANT: read this project's own README
+# Known limitations entry on this before enabling the "MAME" bezel pack -
+# confirmed by reading the tool's own source, it strips this project's
+# aspect_ratio/custom_viewport lines from /opt/retropie/configs/arcade/
+# retroarch.cfg when applied, which undoes the vertical-cabinet rotation/
+# aspect fix documented in step 6 above.
+ENABLE_BEZEL_PROJECT="${ENABLE_BEZEL_PROJECT:-true}"
+
 # --- Bluetooth speaker ---------------------------------------------------------
 # Turns the Pi into an A2DP sink advertised as BT_SPEAKER_NAME, via BlueALSA
 # (bluealsa + bluealsa-aplay - see phase_bt_speaker_setup for why PipeWire/
@@ -392,6 +411,7 @@ LED_DMA_CHANNEL=$LED_DMA_CHANNEL
 LED_PWM_CHANNEL=$LED_PWM_CHANNEL
 ENABLE_MUSIC_PLAYER=$ENABLE_MUSIC_PLAYER
 MUSIC_DIR=$MUSIC_DIR
+ENABLE_BEZEL_PROJECT=$ENABLE_BEZEL_PROJECT
 ENABLE_BT_SPEAKER=$ENABLE_BT_SPEAKER
 BT_SPEAKER_NAME=$BT_SPEAKER_NAME
 AUTO_REBOOT_AT_END=$AUTO_REBOOT_AT_END
@@ -1973,6 +1993,15 @@ LEDCFG
 		<desc>Turn FTP and/or SFTP file transfer on or off independently.</desc>
 		<image>$icon_dir/filemanager.png</image>
 	</game>
+$( [ "$ENABLE_BEZEL_PROJECT" = "true" ] && cat <<BEZELPROJECT
+	<game>
+		<path>./bezelproject.sh</path>
+		<name>Bezel Project</name>
+		<desc>Browse and download per-system RetroArch overlay bezels (thebezelproject/BezelProject). Read the README's Known limitations note on the arcade/MAME pack before enabling it - it can undo this project's own rotation fix for that system.</desc>
+		<image>$icon_dir/configedit.png</image>
+	</game>
+BEZELPROJECT
+)
 </gameList>
 EOF
 
@@ -6279,6 +6308,34 @@ PYEOF
     return 0
 }
 
+# Installs thebezelproject/BezelProject's bezelproject.sh exactly the way
+# its own README says to (a single script dropped into the RetroPie menu
+# folder) - no separate case-statement wiring into retropiemenu.sh is
+# needed here, unlike this project's other custom tools, since the
+# "retropie" custom system's <extension> already includes .sh directly
+# (RetroPie's own retropiemenu dispatch runs a .sh file placed there as-is;
+# the .rp "stub + case in retropiemenu.sh" mechanism used elsewhere in this
+# script is only needed for tools that aren't already a standalone script).
+# The gamelist entry for this is added unconditionally inside
+# phase_custom_retropie_system (gated on ENABLE_BEZEL_PROJECT there too);
+# this phase only needs to actually place the file.
+phase_bezel_project_install() {
+    if [ "$ENABLE_BEZEL_PROJECT" != "true" ]; then
+        log "ENABLE_BEZEL_PROJECT=false, skipping"
+        return 0
+    fi
+    mkdir -p "$PI_HOME/RetroPie/retropiemenu"
+    if curl -fsSL "https://raw.githubusercontent.com/thebezelproject/BezelProject/master/bezelproject.sh" \
+        -o "$PI_HOME/RetroPie/retropiemenu/bezelproject.sh"; then
+        chmod +x "$PI_HOME/RetroPie/retropiemenu/bezelproject.sh"
+        chown "$PI_USER:$PI_USER" "$PI_HOME/RetroPie/retropiemenu/bezelproject.sh"
+        log "Bezel Project installed - run it from the RetroPie Setup menu to browse and download per-system overlay bezel packs (read the README's Known limitations note before enabling the arcade/MAME pack)"
+    else
+        log_warn "Bezel Project download failed; 'Bezel Project' menu entry will fail to launch until you re-run this phase or fetch bezelproject.sh manually"
+    fi
+    return 0
+}
+
 phase_finalize() {
     log ""
     log "========================================================"
@@ -6346,6 +6403,7 @@ main() {
         audio_settings_tool
         wifi_settings_tool
         ftp_settings_tool
+        bezel_project_install
         finalize
     )
 
