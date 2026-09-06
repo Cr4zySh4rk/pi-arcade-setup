@@ -199,6 +199,16 @@ APPLY_GCC14_CFLAGS_PATCH="${APPLY_GCC14_CFLAGS_PATCH:-true}"
 # the first patch made it share that same value. The patch below builds a
 # separate rotation matrix for the menu from the config's video_rotation
 # alone, so it's unaffected by whatever any given core requests.
+# Also fixes a third bug found later, once Bezel Project overlay bezels
+# were added to this project: gl2_render_overlay() (the function that
+# draws a RetroArch input_overlay, e.g. a Bezel Project cabinet/console
+# bezel) hardcodes that same unrotated gl->mvp_no_rot matrix regardless of
+# video_rotation, same as the menu did - confirmed live: an otherwise
+# correctly-installed NES bezel pack rendered rotated 90 degrees relative
+# to the (correctly rotated) game beneath it. Unlike the menu, an overlay
+# is tied to actual game content, so it's patched to use gl->mvp (the same
+# already-rotated matrix content itself draws with) rather than a
+# separate config-only matrix like the menu needs.
 APPLY_RETROARCH_MENU_ROTATION_PATCH="${APPLY_RETROARCH_MENU_ROTATION_PATCH:-true}"
 
 # --- ES-DE --------------------------------------------------------------
@@ -1174,18 +1184,38 @@ new = """static INLINE void gl2_draw_texture(gl2_t *gl)
 old2 = "   gl->shader->set_mvp(gl->shader_data, &gl->mvp_no_rot);\n\n   glEnable(GL_BLEND);"
 new2 = "   gl->shader->set_mvp(gl->shader_data, &menu_mvp);\n\n   glEnable(GL_BLEND);"
 
+# gl2_render_overlay() - draws a RetroArch input_overlay (e.g. a Bezel
+# Project bezel). Unlike the menu, an overlay frames actual game content,
+# so it should rotate together with it - use gl->mvp (the same matrix
+# content itself is drawn with, already reflecting video_rotation) instead
+# of the hardcoded gl->mvp_no_rot upstream uses regardless of rotation.
+old3 = "   gl->shader->set_coords(gl->shader_data, &gl->coords);\n   gl->shader->set_mvp(gl->shader_data, &gl->mvp_no_rot);\n\n   for (i = 0; i < gl->overlays; i++)"
+new3 = "   gl->shader->set_coords(gl->shader_data, &gl->coords);\n   gl->shader->set_mvp(gl->shader_data, &gl->mvp);\n\n   for (i = 0; i < gl->overlays; i++)"
+
+menu_ok = True
 if new in text:
     print("[patch] gl2.c gl2_draw_texture: already applied")
-    sys.exit(0)
-
-if text.count(old) != 1 or text.count(old2) != 1:
+elif text.count(old) != 1 or text.count(old2) != 1:
     print("[patch] gl2.c gl2_draw_texture: anchor text not found/not unique, skipping (RetroArch source may have changed) - menu will render unrotated, matching stock upstream behavior")
-    sys.exit(3)
+    menu_ok = False
+else:
+    text = text.replace(old, new, 1)
+    text = text.replace(old2, new2, 1)
+    print("[patch] gl2.c gl2_draw_texture: applied")
 
-text = text.replace(old, new, 1)
-text = text.replace(old2, new2, 1)
+overlay_ok = True
+if new3 in text:
+    print("[patch] gl2.c gl2_render_overlay: already applied")
+elif text.count(old3) != 1:
+    print("[patch] gl2.c gl2_render_overlay: anchor text not found/not unique, skipping (RetroArch source may have changed) - overlay bezels will render unrotated, matching stock upstream behavior")
+    overlay_ok = False
+else:
+    text = text.replace(old3, new3, 1)
+    print("[patch] gl2.c gl2_render_overlay: applied")
+
 path.write_text(text)
-print("[patch] gl2.c gl2_draw_texture: applied")
+if not (menu_ok and overlay_ok):
+    sys.exit(3)
 PYEOF
 }
 
@@ -1215,7 +1245,17 @@ phase_retroarch_menu_rotation_patch() {
     fi
     log "Rebuilding RetroArch with the menu rotation patch (re-running RetroPie-Setup's own build+install steps)"
     cd "$PI_HOME/RetroPie-Setup" || die "RetroPie-Setup missing"
-    sudo ./retropie_packages.sh retroarch build install || die "RetroArch rebuild after menu rotation patch failed"
+    # Separate calls, not "retroarch build install" as one - confirmed live
+    # (same root cause as the Flycast single-mode-dispatch finding
+    # elsewhere in this file): rp_callModule() only ever acts on the
+    # *first* mode argument given to it, so a combined call silently ran
+    # "build" alone and never actually copied the freshly-built binary
+    # into /opt/retropie/emulators/retroarch/bin/retroarch at all - every
+    # prior run of this phase left the freshly-patched RetroArch sitting
+    # uninstalled in the build tree while the *old* binary kept running,
+    # with no error to indicate it.
+    sudo ./retropie_packages.sh retroarch build || die "RetroArch rebuild after menu rotation patch failed"
+    sudo ./retropie_packages.sh retroarch install || die "RetroArch install after menu rotation patch rebuild failed"
     return 0
 }
 
