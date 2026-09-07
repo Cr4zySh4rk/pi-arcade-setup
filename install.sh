@@ -2035,7 +2035,7 @@ LEDCFG
 	</game>
 	<game>
 		<path>./mamemixerhotkey.rp</path>
-		<name>MAME Mixer Hotkey</name>
+		<name>MAME Audio Mixer Hotkey</name>
 		<desc>Toggle the in-game MAME menu hotkey (Select+X stock, or L3+R3 - avoids clashing with this project's Start+Select quit shortcut), and set a per-game audio boost (dB) and stereo/mono toggle for any arcade ROM you've launched at least once - useful for low-volume games like Mortal Kombat. Saved into that game's own MAME config, same as MAME's own in-game Audio Mixer.</desc>
 		<image>$icon_dir/audiosettings.png</image>
 	</game>
@@ -6387,9 +6387,9 @@ phase_mame_mixer_hotkey_tool() {
     tee "$PI_HOME/scripts/mame-mixer-hotkey.py" >/dev/null <<PYEOF
 #!/usr/bin/env python3
 """
-MAME Mixer Hotkey - per-game audio boost / stereo-mono tool, and the
+MAME Audio Mixer Hotkey - per-game audio boost / stereo-mono tool, and the
 in-game MAME menu hotkey toggle, for pi-arcade-setup. Run from the
-RetroPie menu ("MAME Mixer Hotkey") or directly:
+RetroPie menu ("MAME Audio Mixer Hotkey") or directly:
     python3 mame-mixer-hotkey.py
 
 Top row: toggles the combo used to open/close MAME's own internal menu
@@ -6760,7 +6760,7 @@ def build_row_list():
 def draw_list(win, rows, sel, scroll):
     win.erase()
     h, w = win.getmaxyx()
-    title = " MAME MIXER HOTKEY "
+    title = " MAME AUDIO MIXER HOTKEY "
     safe_addstr(win, 1, cx(win, title), title, curses.color_pair(COL_HEADER) | curses.A_BOLD)
 
     visible_rows = h - 6
@@ -6943,7 +6943,7 @@ open(path, "w").write(new_text)
 print("[mamemixerhotkey] wired into retropiemenu.sh")
 PYEOF
     fi
-    log "MAME Mixer Hotkey installed - MAME's internal-menu combo defaults to L3+R3 (avoids the Select+Start clash with this project's quit-to-frontend shortcut); run it from the RetroPie menu ('MAME Mixer Hotkey') to switch that back to stock, or to set a per-game audio boost (dB) and stereo/mono toggle for any arcade ROM that's been launched at least once"
+    log "MAME Audio Mixer Hotkey installed - MAME's internal-menu combo defaults to L3+R3 (avoids the Select+Start clash with this project's quit-to-frontend shortcut); run it from the RetroPie menu ('MAME Audio Mixer Hotkey') to switch that back to stock, or to set a per-game audio boost (dB) and stereo/mono toggle for any arcade ROM that's been launched at least once"
     return 0
 }
 
