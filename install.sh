@@ -1899,7 +1899,7 @@ PROFEOF
 phase_custom_retropie_system() {
     mkdir -p "$PI_HOME/ES-DE/custom_systems" "$PI_HOME/ES-DE/gamelists/retropie"
 
-    local keep=(showip.rp avsettings.rp wifigate.rp ftpsettings.rp retroarch.rp)
+    local keep=(showip.rp avsettings.rp wifigate.rp ftpsettings.rp retroarch.rp mamemixerhotkey.rp)
     [ "$ENABLE_BT_SPEAKER" = "true" ] && keep+=(btpair.rp btaudio.rp)
     [ "$ENABLE_CONTROLLER_HOTKEYS" = "true" ] && keep+=(hotkeyconfig.rp)
     [ "$ENABLE_MUSIC_PLAYER" = "true" ] && keep+=(musicplayer.rp)
@@ -2032,6 +2032,12 @@ LEDCFG
 		<name>FTP settings</name>
 		<desc>Turn FTP and/or SFTP file transfer on or off independently.</desc>
 		<image>$icon_dir/filemanager.png</image>
+	</game>
+	<game>
+		<path>./mamemixerhotkey.rp</path>
+		<name>MAME Mixer Hotkey</name>
+		<desc>Set a per-game audio boost (dB) and stereo/mono toggle for any arcade ROM you've launched at least once - useful for low-volume games like Mortal Kombat. Saved into that game's own MAME config, same as MAME's own in-game Audio Mixer.</desc>
+		<image>$icon_dir/audiosettings.png</image>
 	</game>
 $( [ "$ENABLE_BEZEL_PROJECT" = "true" ] && cat <<BEZELPROJECT
 	<game>
@@ -6348,6 +6354,431 @@ PYEOF
     return 0
 }
 
+# Per-game audio boost / stereo-mono tool for pi-arcade-setup's MAME
+# (lr-mame, mamearcade_libretro.so) games. Some boards are quiet even at
+# max in-game volume - this is the original arcade hardware's own
+# characteristic, accurately emulated, not a bug (MAME Testers #06521,
+# "Low sound volume in all Mortal Kombat games", resolution: no change
+# required). Rather than a live in-game overlay, this is a RetroPie menu
+# tool: pick a game from the list, set a dB boost and stereo/mono
+# toggle, and it's written straight into that ROM's own MAME cfg file
+# (roms/arcade/mame/cfg/<romname>.cfg) using the exact same
+# <mixer><sound_map>/<node_mapping>/<channel_mapping> schema MAME's own
+# live Audio Mixer menu (Select+X while playing -> Audio Mixer) writes
+# to - confirmed against the real save/load code in mamedev/mame's
+# src/emu/sound.cpp (sound_manager::config_save/config_load): a plain
+# node_mapping is a "full route" (all of a device's channels auto-mapped
+# to one host output, gain in "db"); a channel_mapping is an explicit
+# guest_channel -> node_channel route with its own "db" - used here to
+# force a stereo device's left+right channels to both host channels
+# equally (an explicit mono downmix), replacing the plain full route.
+# Only games that have already been launched at least once are editable
+# - MAME auto-writes cfg/<romname>.cfg (with the correct sound device
+# tag(s) for that specific driver, e.g. ":speaker" or ":mono" - verified
+# these vary per game live on this Pi) the first time a game runs, and
+# guessing a tag for a game that's never run risks silently doing
+# nothing. The stereo/mono toggle is a no-op (harmless) on games whose
+# board only ever had one audio channel to begin with (this covers the
+# actual Mortal Kombat titles - their cfg files already show a single
+# ":speaker" tag, i.e. already-mono hardware, so the toggle has nothing
+# to do there; it's only meaningful on genuinely stereo boards).
+phase_mame_mixer_hotkey_tool() {
+    mkdir -p "$PI_HOME/scripts"
+    tee "$PI_HOME/scripts/mame-mixer-hotkey.py" >/dev/null <<PYEOF
+#!/usr/bin/env python3
+"""
+MAME Mixer Hotkey - per-game audio boost / stereo-mono tool for
+pi-arcade-setup. Run from the RetroPie menu ("MAME Mixer Hotkey") or
+directly:
+    python3 mame-mixer-hotkey.py
+
+Pick a game, set a dB boost (-96 to +12, MAME's own Audio Mixer range)
+and a stereo/mono toggle, and it's written into that ROM's own MAME cfg
+file (roms/arcade/mame/cfg/<romname>.cfg) - the exact same file and XML
+schema MAME's own live Audio Mixer menu (Select+X while playing ->
+Audio Mixer) uses, confirmed against sound_manager::config_save/
+config_load in mamedev/mame's src/emu/sound.cpp. Effects are scoped to
+that one game only - MAME's own per-driver cfg file mechanism, nothing
+this tool has to enforce itself.
+
+Only games with an existing cfg file (i.e. launched at least once) are
+editable - that's the only way to know the correct sound device tag(s)
+for that specific driver without guessing (confirmed live: it varies,
+e.g. ":speaker" vs ":mono" across different games on this exact Pi).
+"""
+import curses
+import glob
+import os
+import select
+import shutil
+import struct
+import sys
+import xml.etree.ElementTree as ET
+
+ROMS_DIR = "$PI_HOME/RetroPie/roms/arcade"
+CFG_DIR = os.path.join(ROMS_DIR, "mame", "cfg")
+DB_MIN, DB_MAX, DB_STEP = -96.0, 12.0, 1.0
+MONO_COMPENSATION_DB = 6.0  # summing two full-level channels into one needs ~-6dB to avoid clipping
+
+JS_DEVICE = "/dev/input/js0"
+JS_EVENT_INIT = 0x80
+JS_EVENT_BUTTON = 0x01
+JS_EVENT_AXIS = 0x02
+EVENT_FORMAT = "IhBB"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+AXIS_THRESHOLD = 16000
+BTN_CONFIRM = $BTN_X       # X / Cross / A - same role as the rest of the RetroPie menu
+BTN_BACK = $BTN_CIRCLE     # Circle / B - same role as the rest of the RetroPie menu
+
+COL_HEADER, COL_LABEL, COL_HINT, COL_GOOD, COL_DIM, COL_SEL = 1, 2, 3, 4, 5, 6
+
+
+def list_roms():
+    names = set()
+    if os.path.isdir(ROMS_DIR):
+        for ext in ("*.zip", "*.7z", "*.chd"):
+            for p in glob.glob(os.path.join(ROMS_DIR, ext)):
+                names.add(os.path.splitext(os.path.basename(p))[0])
+    return sorted(names)
+
+
+def cfg_path(shortname):
+    return os.path.join(CFG_DIR, shortname + ".cfg")
+
+
+def load_cfg(shortname):
+    """Returns (tree, sound_map_elems) or None if there's no usable cfg
+    yet (game never launched, or cfg has no sound_map to key off)."""
+    path = cfg_path(shortname)
+    if not os.path.isfile(path):
+        return None
+    try:
+        tree = ET.parse(path)
+    except ET.ParseError:
+        return None
+    system = tree.getroot().find("system")
+    if system is None:
+        return None
+    mixer = system.find("mixer")
+    if mixer is None:
+        return None
+    sound_maps = mixer.findall("sound_map")
+    if not sound_maps:
+        return None
+    return tree, sound_maps
+
+
+def get_state(shortname):
+    """Returns (boost_db, mono, editable)."""
+    loaded = load_cfg(shortname)
+    if loaded is None:
+        return 0.0, False, False
+    _tree, sound_maps = loaded
+    boost, mono = 0.0, False
+    for sm in sound_maps:
+        cmaps = sm.findall("channel_mapping")
+        nmaps = sm.findall("node_mapping")
+        if cmaps:
+            mono = True
+            try:
+                boost = round(float(cmaps[0].get("db", "0")) + MONO_COMPENSATION_DB, 1)
+            except ValueError:
+                boost = 0.0
+        elif nmaps:
+            try:
+                boost = round(float(nmaps[0].get("db", "0")), 1)
+            except ValueError:
+                boost = 0.0
+    return boost, mono, True
+
+
+def save_state(shortname, boost_db, mono):
+    loaded = load_cfg(shortname)
+    if loaded is None:
+        return False
+    tree, sound_maps = loaded
+    for sm in sound_maps:
+        for child in list(sm):
+            sm.remove(child)
+        if mono:
+            comp_db = round(boost_db - MONO_COMPENSATION_DB, 6)
+            for guest in (0, 1):
+                for node_channel in (0, 1):
+                    cmap = ET.SubElement(sm, "channel_mapping")
+                    cmap.set("guest_channel", str(guest))
+                    cmap.set("node", "")
+                    cmap.set("node_channel", str(node_channel))
+                    cmap.set("db", f"{comp_db:.6f}")
+        else:
+            nmap = ET.SubElement(sm, "node_mapping")
+            nmap.set("node", "")
+            nmap.set("db", f"{boost_db:.6f}")
+    try:
+        ET.indent(tree, space="    ")
+    except Exception:
+        pass
+    path = cfg_path(shortname)
+    try:
+        if os.path.exists(path):
+            shutil.copy2(path, path + ".bak")
+    except OSError:
+        pass
+    body = ET.tostring(tree.getroot(), encoding="unicode")
+    content = (
+        "﻿<?xml version=\\"1.0\\"?>\n"
+        "<!-- This file is autogenerated; comments and unknown tags will be stripped -->\n"
+        + body + "\n"
+    )
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.replace(tmp, path)
+    return True
+
+
+def open_joystick():
+    try:
+        return open(JS_DEVICE, "rb")
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def cx(win, text):
+    _, w = win.getmaxyx()
+    return max(0, (w - len(text)) // 2)
+
+
+def safe_addstr(win, y, x, text, attr=0):
+    h, w = win.getmaxyx()
+    if 0 <= y < h:
+        try:
+            win.addstr(y, max(0, x), text[: max(0, w - x - 1)], attr)
+        except curses.error:
+            pass
+
+
+class InputPoller:
+    """Shared controller+keyboard polling: up/down/left/right/confirm/back,
+    press-edge only (no repeat-while-held spam) - same approach as the
+    rest of this project's controller-navigable RetroPie menu tools."""
+
+    def __init__(self):
+        self.js_file = open_joystick()
+        self.axis_state = {}
+        self.button_state = {}
+
+    def close(self):
+        if self.js_file is not None:
+            self.js_file.close()
+
+    def poll(self, stdscr, timeout=0.15):
+        fds = [sys.stdin] + ([self.js_file] if self.js_file is not None else [])
+        try:
+            ready, _, _ = select.select(fds, [], [], timeout)
+        except (OSError, ValueError):
+            ready = []
+
+        if self.js_file is not None and self.js_file in ready:
+            data = self.js_file.read(EVENT_SIZE)
+            if data and len(data) == EVENT_SIZE:
+                _t, value, typ, number = struct.unpack(EVENT_FORMAT, data)
+                is_init = bool(typ & JS_EVENT_INIT)
+                typ &= ~JS_EVENT_INIT
+                if not is_init:
+                    if typ == JS_EVENT_BUTTON and number in (BTN_CONFIRM, BTN_BACK):
+                        was_held = self.button_state.get(number, False)
+                        self.button_state[number] = bool(value)
+                        if value == 1 and not was_held:
+                            return "confirm" if number == BTN_CONFIRM else "back"
+                    elif typ == JS_EVENT_AXIS and number in (0, 1):
+                        past = abs(value) > AXIS_THRESHOLD
+                        was_past = self.axis_state.get(number, False)
+                        self.axis_state[number] = past
+                        if past and not was_past:
+                            if number == 1:
+                                return "down" if value > 0 else "up"
+                            return "right" if value > 0 else "left"
+
+        if sys.stdin in ready:
+            ch = stdscr.getch()
+            if ch == curses.KEY_UP:
+                return "up"
+            if ch == curses.KEY_DOWN:
+                return "down"
+            if ch == curses.KEY_LEFT:
+                return "left"
+            if ch == curses.KEY_RIGHT:
+                return "right"
+            if ch in (10, 13, ord(" ")):
+                return "confirm"
+            if ch in (27, ord("q"), ord("Q")):
+                return "back"
+        return None
+
+
+def draw_list(win, roms, sel, scroll):
+    win.erase()
+    h, w = win.getmaxyx()
+    title = " MAME MIXER HOTKEY - select a game "
+    safe_addstr(win, 1, cx(win, title), title, curses.color_pair(COL_HEADER) | curses.A_BOLD)
+    if not roms:
+        msg = "No ROMs found in " + ROMS_DIR
+        safe_addstr(win, h // 2, cx(win, msg), msg, curses.color_pair(COL_DIM))
+    else:
+        rows = h - 6
+        if sel < scroll:
+            scroll = sel
+        elif sel >= scroll + rows:
+            scroll = sel - rows + 1
+        for i in range(scroll, min(len(roms), scroll + rows)):
+            name, editable = roms[i]
+            y = 3 + (i - scroll)
+            sel_attr = curses.A_REVERSE if i == sel else 0
+            label = name if editable else f"{name}  (launch once first)"
+            attr = (curses.color_pair(COL_LABEL) if editable else curses.color_pair(COL_DIM)) | sel_attr
+            safe_addstr(win, y, 4, label, attr)
+    footer = "UP/DOWN: select   X: edit   Circle/B: exit"
+    safe_addstr(win, h - 2, cx(win, footer), footer, curses.color_pair(COL_HINT))
+    win.refresh()
+    return scroll
+
+
+def draw_editor(win, name, boost_db, mono, field, dirty):
+    win.erase()
+    h, w = win.getmaxyx()
+    title = f" {name} "
+    safe_addstr(win, 1, cx(win, title), title, curses.color_pair(COL_HEADER) | curses.A_BOLD)
+
+    top = h // 2 - 5
+    rows = [
+        ("Audio Boost", f"{boost_db:+.1f} dB"),
+        ("Stereo", "ON" if not mono else "OFF (forced mono)"),
+        ("Save", ""),
+        ("Cancel", ""),
+    ]
+    for i, (label, value) in enumerate(rows):
+        y = top + i * 2
+        sel_attr = curses.A_REVERSE if i == field else 0
+        safe_addstr(win, y, cx(win, f"{label:<12}{value}"), f"{label:<12}{value}",
+                    curses.color_pair(COL_LABEL) | sel_attr | curses.A_BOLD)
+
+    if dirty:
+        msg = "unsaved changes"
+        safe_addstr(win, top + len(rows) * 2 + 1, cx(win, msg), msg, curses.color_pair(COL_HINT))
+
+    footer = "UP/DOWN: field   LEFT/RIGHT: adjust   X: activate   Circle/B: back"
+    safe_addstr(win, h - 2, cx(win, footer), footer, curses.color_pair(COL_HINT))
+    win.refresh()
+
+
+def edit_game(stdscr, poller, name):
+    boost_db, mono, _editable = get_state(name)
+    orig = (boost_db, mono)
+    field = 0
+    while True:
+        dirty = (boost_db, mono) != orig
+        draw_editor(stdscr, name, boost_db, mono, field, dirty)
+        action = poller.poll(stdscr)
+        if action is None:
+            continue
+        if action == "back":
+            return
+        if action == "up":
+            field = (field - 1) % 4
+        elif action == "down":
+            field = (field + 1) % 4
+        elif action == "left" and field == 0:
+            boost_db = max(DB_MIN, round(boost_db - DB_STEP, 1))
+        elif action == "right" and field == 0:
+            boost_db = min(DB_MAX, round(boost_db + DB_STEP, 1))
+        elif (action in ("left", "right")) and field == 1:
+            mono = not mono
+        elif action == "confirm":
+            if field == 1:
+                mono = not mono
+            elif field == 2:
+                save_state(name, boost_db, mono)
+                return
+            elif field == 3:
+                return
+
+
+def run(stdscr):
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(COL_HEADER, curses.COLOR_YELLOW, -1)
+    curses.init_pair(COL_LABEL, curses.COLOR_CYAN, -1)
+    curses.init_pair(COL_HINT, curses.COLOR_YELLOW, -1)
+    curses.init_pair(COL_GOOD, curses.COLOR_GREEN, -1)
+    curses.init_pair(COL_DIM, curses.COLOR_WHITE, -1)
+    curses.init_pair(COL_SEL, curses.COLOR_GREEN, -1)
+    stdscr.nodelay(True)
+    stdscr.keypad(True)
+
+    poller = InputPoller()
+    try:
+        sel, scroll = 0, 0
+        while True:
+            roms = [(n, get_state(n)[2]) for n in list_roms()]
+            if sel >= len(roms):
+                sel = max(0, len(roms) - 1)
+            scroll = draw_list(stdscr, roms, sel, scroll)
+            action = poller.poll(stdscr)
+            if action is None:
+                continue
+            if action == "back":
+                break
+            elif action == "up" and roms:
+                sel = (sel - 1) % len(roms)
+            elif action == "down" and roms:
+                sel = (sel + 1) % len(roms)
+            elif action == "confirm" and roms and roms[sel][1]:
+                edit_game(stdscr, poller, roms[sel][0])
+    finally:
+        poller.close()
+
+
+def main():
+    curses.wrapper(run)
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+    chmod +x "$PI_HOME/scripts/mame-mixer-hotkey.py"
+
+    touch "$PI_HOME/RetroPie/retropiemenu/mamemixerhotkey.rp"
+
+    local menu_script="$PI_HOME/RetroPie-Setup/scriptmodules/supplementary/retropiemenu.sh"
+    if [ -f "$menu_script" ] && ! grep -q "mamemixerhotkey.rp)" "$menu_script"; then
+        sudo cp "$menu_script" "${menu_script}.bak.$(date +%s)"
+        sudo python3 - "$menu_script" "$PI_HOME" <<'PYEOF'
+import sys
+path, pi_home = sys.argv[1], sys.argv[2]
+text = open(path).read()
+anchor = "filemanager.rp)"
+idx = text.find(anchor)
+if idx == -1:
+    print("[mamemixerhotkey] anchor 'filemanager.rp)' not found in retropiemenu.sh; skipping menu wiring")
+    sys.exit(0)
+case_end = text.find(";;", idx)
+if case_end == -1:
+    print("[mamemixerhotkey] could not find end of filemanager.rp) case; skipping menu wiring")
+    sys.exit(0)
+insert_point = text.find("\n", case_end) + 1
+line_start = text.rfind("\n", 0, idx) + 1
+indent = text[line_start:idx]
+insert_block = f"{indent}mamemixerhotkey.rp)\n{indent}    python3 {pi_home}/scripts/mame-mixer-hotkey.py\n{indent}    ;;\n"
+new_text = text[:insert_point] + insert_block + text[insert_point:]
+open(path, "w").write(new_text)
+print("[mamemixerhotkey] wired into retropiemenu.sh")
+PYEOF
+    fi
+    log "MAME Mixer Hotkey installed - run it from the RetroPie menu ('MAME Mixer Hotkey') to set a per-game audio boost (dB) and stereo/mono toggle for any arcade ROM that's been launched at least once"
+    return 0
+}
+
 # Installs thebezelproject/BezelProject's bezelproject.sh exactly the way
 # its own README says to (a single script dropped into the RetroPie menu
 # folder) - no separate case-statement wiring into retropiemenu.sh is
@@ -6443,6 +6874,7 @@ main() {
         audio_settings_tool
         wifi_settings_tool
         ftp_settings_tool
+        mame_mixer_hotkey_tool
         bezel_project_install
         finalize
     )
