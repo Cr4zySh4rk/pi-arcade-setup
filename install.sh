@@ -2036,7 +2036,7 @@ LEDCFG
 	<game>
 		<path>./mamemixerhotkey.rp</path>
 		<name>MAME Mixer Hotkey</name>
-		<desc>Set a per-game audio boost (dB) and stereo/mono toggle for any arcade ROM you've launched at least once - useful for low-volume games like Mortal Kombat. Saved into that game's own MAME config, same as MAME's own in-game Audio Mixer.</desc>
+		<desc>Toggle the in-game MAME menu hotkey (Select+X stock, or L3+R3 - avoids clashing with this project's Start+Select quit shortcut), and set a per-game audio boost (dB) and stereo/mono toggle for any arcade ROM you've launched at least once - useful for low-volume games like Mortal Kombat. Saved into that game's own MAME config, same as MAME's own in-game Audio Mixer.</desc>
 		<image>$icon_dir/audiosettings.png</image>
 	</game>
 $( [ "$ENABLE_BEZEL_PROJECT" = "true" ] && cat <<BEZELPROJECT
@@ -6387,24 +6387,43 @@ phase_mame_mixer_hotkey_tool() {
     tee "$PI_HOME/scripts/mame-mixer-hotkey.py" >/dev/null <<PYEOF
 #!/usr/bin/env python3
 """
-MAME Mixer Hotkey - per-game audio boost / stereo-mono tool for
-pi-arcade-setup. Run from the RetroPie menu ("MAME Mixer Hotkey") or
-directly:
+MAME Mixer Hotkey - per-game audio boost / stereo-mono tool, and the
+in-game MAME menu hotkey toggle, for pi-arcade-setup. Run from the
+RetroPie menu ("MAME Mixer Hotkey") or directly:
     python3 mame-mixer-hotkey.py
 
-Pick a game, set a dB boost (-96 to +12, MAME's own Audio Mixer range)
-and a stereo/mono toggle, and it's written into that ROM's own MAME cfg
-file (roms/arcade/mame/cfg/<romname>.cfg) - the exact same file and XML
-schema MAME's own live Audio Mixer menu (Select+X while playing ->
-Audio Mixer) uses, confirmed against sound_manager::config_save/
-config_load in mamedev/mame's src/emu/sound.cpp. Effects are scoped to
-that one game only - MAME's own per-driver cfg file mechanism, nothing
-this tool has to enforce itself.
+Top row: toggles the combo used to open/close MAME's own internal menu
+while a game is running (its "Slider Controls"/Audio Mixer submenu is
+what MAME's own live per-game volume/mixer adjustment actually lives
+in). MAME's stock combo for this is Select+X to open, Select+Start to
+cancel - but Select+Start is also this project's own project-wide
+RetroArch quit-to-frontend shortcut, so this installer sets it to L3+R3
+by default instead (a single button held together toggles the menu
+open and closed, the same way MAME's own "Show/Hide Menu" input is
+designed to work) - this row lets you switch back to the stock combo,
+or back to L3+R3, at any time. Written into roms/arcade/mame/cfg/
+default.cfg - confirmed against MAME's own source
+(ioport_manager::save_default_inputs/load_config in src/emu/ioport.cpp,
+and the JOYCODE token format in input_manager::code_to_token/
+seq_from_tokens in src/emu/input.cpp) and live: writing this combo and
+launching a game produces a clean run with no "Dropping invalid input
+token" warning, and MAME re-saves the identical binding back out on
+exit. L3+R3 specifically (not L1+R1) because it's the only physical
+combo that means the same thing on every game regardless of that
+driver's own button profile - confirmed via input_retro.cpp.
 
-Only games with an existing cfg file (i.e. launched at least once) are
-editable - that's the only way to know the correct sound device tag(s)
-for that specific driver without guessing (confirmed live: it varies,
-e.g. ":speaker" vs ":mono" across different games on this exact Pi).
+Everything else in the list: pick a game, set a dB boost (-96 to +12,
+MAME's own Audio Mixer range) and a stereo/mono toggle, written into
+that ROM's own MAME cfg file (roms/arcade/mame/cfg/<romname>.cfg) - the
+exact same file and XML schema MAME's own live Audio Mixer menu uses,
+confirmed against sound_manager::config_save/config_load in
+mamedev/mame's src/emu/sound.cpp. Effects are scoped to that one game
+only - MAME's own per-driver cfg file mechanism, nothing this tool has
+to enforce itself. Only games with an existing cfg file (i.e. launched
+at least once) are editable - that's the only way to know the correct
+sound device tag(s) for that specific driver without guessing
+(confirmed live: it varies, e.g. ":speaker" vs ":mono" across different
+games on this exact Pi).
 """
 import curses
 import glob
@@ -6417,8 +6436,35 @@ import xml.etree.ElementTree as ET
 
 ROMS_DIR = "$PI_HOME/RetroPie/roms/arcade"
 CFG_DIR = os.path.join(ROMS_DIR, "mame", "cfg")
+DEFAULT_CFG_PATH = os.path.join(CFG_DIR, "default.cfg")
 DB_MIN, DB_MAX, DB_STEP = -96.0, 12.0, 1.0
 MONO_COMPENSATION_DB = 6.0  # summing two full-level channels into one needs ~-6dB to avoid clipping
+
+# The combo used to open/close MAME's own internal menu (Show/Hide Menu,
+# IPT_UI_MENU) and to back all the way out of it (IPT_UI_CANCEL). L3+R3
+# is the only choice that's consistent across every game regardless of
+# its own button layout - confirmed by reading input_retro.cpp: L3/R3
+# are unconditionally bound to ITEM_ID_BUTTON7/BUTTON8 (JOYCODE_1_BUTTON7/8)
+# no matter what per-game button *profile* is active, whereas L1/R1 (which
+# would otherwise be the obvious alternative) share physical slots with
+# ordinary numbered gameplay buttons (BUTTON5/6) that shift meaning
+# per-game depending on that driver's own profile - not safe to reuse
+# here. MAME's own stock default for both of these is Select+X (open)
+# and Select+Start (cancel) - the same Select+Start this project already
+# uses, project-wide, as the RetroArch quit-to-frontend shortcut
+# (input_quit_gamepad_combo=4), so leaving the stock combo in place risks
+# Select+Start doing the wrong thing depending on which one sees the
+# press first. Verified against MAME's own source
+# (sound_manager::config_save/config_load equivalent for input -
+# ioport_manager::save_default_inputs/load_config in src/emu/ioport.cpp,
+# and the JOYCODE token format in input_manager::code_to_token/
+# seq_from_tokens in src/emu/input.cpp) and confirmed live: writing this
+# into default.cfg and launching a game produces a clean run with no
+# "Dropping invalid input token" warning (MAME's own diagnostic for a
+# bad cfg token), and MAME re-saves the exact same binding back out on
+# exit - proof it round-tripped through MAME's real load/save path, not
+# just tolerated by the XML parser.
+MENU_HOTKEY_TOKEN = "JOYCODE_1_BUTTON7 JOYCODE_1_BUTTON8"  # L3+R3
 
 JS_DEVICE = "/dev/input/js0"
 JS_EVENT_INIT = 0x80
@@ -6431,6 +6477,92 @@ BTN_CONFIRM = $BTN_X       # X / Cross / A - same role as the rest of the RetroP
 BTN_BACK = $BTN_CIRCLE     # Circle / B - same role as the rest of the RetroPie menu
 
 COL_HEADER, COL_LABEL, COL_HINT, COL_GOOD, COL_DIM, COL_SEL = 1, 2, 3, 4, 5, 6
+
+MENU_HOTKEY_ROW = "__menu_hotkey__"
+
+
+def load_default_cfg():
+    """Returns (tree, system_elem), creating a fresh skeleton if
+    default.cfg doesn't exist yet (a truly fresh install, before any
+    game or this tool has ever run) or is unreadable."""
+    if os.path.isfile(DEFAULT_CFG_PATH):
+        try:
+            tree = ET.parse(DEFAULT_CFG_PATH)
+            system = tree.getroot().find("system")
+            if system is None:
+                system = ET.SubElement(tree.getroot(), "system")
+                system.set("name", "default")
+            return tree, system
+        except ET.ParseError:
+            pass
+    root = ET.Element("mameconfig")
+    root.set("version", "10")
+    system = ET.SubElement(root, "system")
+    system.set("name", "default")
+    return ET.ElementTree(root), system
+
+
+def write_default_cfg(tree):
+    try:
+        ET.indent(tree, space="    ")
+    except Exception:
+        pass
+    os.makedirs(CFG_DIR, exist_ok=True)
+    try:
+        if os.path.exists(DEFAULT_CFG_PATH):
+            shutil.copy2(DEFAULT_CFG_PATH, DEFAULT_CFG_PATH + ".bak")
+    except OSError:
+        pass
+    body = ET.tostring(tree.getroot(), encoding="unicode")
+    content = (
+        "﻿<?xml version=\\"1.0\\"?>\n"
+        "<!-- This file is autogenerated; comments and unknown tags will be stripped -->\n"
+        + body + "\n"
+    )
+    tmp = DEFAULT_CFG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.replace(tmp, DEFAULT_CFG_PATH)
+
+
+def get_menu_hotkey_mode():
+    """Returns "l3r3" if this tool's override is active, else "stock"."""
+    if not os.path.isfile(DEFAULT_CFG_PATH):
+        return "stock"
+    try:
+        tree = ET.parse(DEFAULT_CFG_PATH)
+    except ET.ParseError:
+        return "stock"
+    system = tree.getroot().find("system")
+    if system is None:
+        return "stock"
+    inp = system.find("input")
+    if inp is None:
+        return "stock"
+    for port in inp.findall("port"):
+        if port.get("type") == "UI_MENU":
+            return "l3r3"
+    return "stock"
+
+
+def set_menu_hotkey_mode(mode):
+    tree, system = load_default_cfg()
+    inp = system.find("input")
+    if mode == "l3r3":
+        if inp is None:
+            inp = ET.SubElement(system, "input")
+        else:
+            for child in list(inp):
+                inp.remove(child)
+        for ptype in ("UI_MENU", "UI_CANCEL"):
+            port = ET.SubElement(inp, "port")
+            port.set("type", ptype)
+            seq = ET.SubElement(port, "newseq")
+            seq.set("type", "standard")
+            seq.text = MENU_HOTKEY_TOKEN
+    elif inp is not None:
+        system.remove(inp)
+    write_default_cfg(tree)
 
 
 def list_roms():
@@ -6616,28 +6748,42 @@ class InputPoller:
         return None
 
 
-def draw_list(win, roms, sel, scroll):
+def build_row_list():
+    """Row 0 is always the menu-hotkey toggle; the rest are ROMs."""
+    hotkey_label = "Menu Hotkey: L3+R3" if get_menu_hotkey_mode() == "l3r3" else "Menu Hotkey: Stock (Select+X / Select+Start)"
+    rows = [(MENU_HOTKEY_ROW, hotkey_label, True)]
+    for name in list_roms():
+        rows.append((name, name, get_state(name)[2]))
+    return rows
+
+
+def draw_list(win, rows, sel, scroll):
     win.erase()
     h, w = win.getmaxyx()
-    title = " MAME MIXER HOTKEY - select a game "
+    title = " MAME MIXER HOTKEY "
     safe_addstr(win, 1, cx(win, title), title, curses.color_pair(COL_HEADER) | curses.A_BOLD)
-    if not roms:
-        msg = "No ROMs found in " + ROMS_DIR
-        safe_addstr(win, h // 2, cx(win, msg), msg, curses.color_pair(COL_DIM))
-    else:
-        rows = h - 6
-        if sel < scroll:
-            scroll = sel
-        elif sel >= scroll + rows:
-            scroll = sel - rows + 1
-        for i in range(scroll, min(len(roms), scroll + rows)):
-            name, editable = roms[i]
-            y = 3 + (i - scroll)
-            sel_attr = curses.A_REVERSE if i == sel else 0
-            label = name if editable else f"{name}  (launch once first)"
-            attr = (curses.color_pair(COL_LABEL) if editable else curses.color_pair(COL_DIM)) | sel_attr
-            safe_addstr(win, y, 4, label, attr)
-    footer = "UP/DOWN: select   X: edit   Circle/B: exit"
+
+    visible_rows = h - 6
+    if sel < scroll:
+        scroll = sel
+    elif sel >= scroll + visible_rows:
+        scroll = sel - visible_rows + 1
+    for i in range(scroll, min(len(rows), scroll + visible_rows)):
+        key, label, editable = rows[i]
+        y = 3 + (i - scroll)
+        sel_attr = curses.A_REVERSE if i == sel else 0
+        if key == MENU_HOTKEY_ROW:
+            attr = curses.color_pair(COL_GOOD) | curses.A_BOLD | sel_attr
+        elif editable:
+            attr = curses.color_pair(COL_LABEL) | sel_attr
+        else:
+            label = f"{label}  (launch once first)"
+            attr = curses.color_pair(COL_DIM) | sel_attr
+        safe_addstr(win, y, 4, label, attr)
+        if key == MENU_HOTKEY_ROW:
+            safe_addstr(win, y + 1, 4, "-" * min(w - 8, 60), curses.color_pair(COL_DIM))
+
+    footer = "UP/DOWN: select   X: edit/toggle   Circle/B: exit"
     safe_addstr(win, h - 2, cx(win, footer), footer, curses.color_pair(COL_HINT))
     win.refresh()
     return scroll
@@ -6720,21 +6866,26 @@ def run(stdscr):
     try:
         sel, scroll = 0, 0
         while True:
-            roms = [(n, get_state(n)[2]) for n in list_roms()]
-            if sel >= len(roms):
-                sel = max(0, len(roms) - 1)
-            scroll = draw_list(stdscr, roms, sel, scroll)
+            rows = build_row_list()
+            if sel >= len(rows):
+                sel = max(0, len(rows) - 1)
+            scroll = draw_list(stdscr, rows, sel, scroll)
             action = poller.poll(stdscr)
             if action is None:
                 continue
             if action == "back":
                 break
-            elif action == "up" and roms:
-                sel = (sel - 1) % len(roms)
-            elif action == "down" and roms:
-                sel = (sel + 1) % len(roms)
-            elif action == "confirm" and roms and roms[sel][1]:
-                edit_game(stdscr, poller, roms[sel][0])
+            elif action == "up" and rows:
+                sel = (sel - 1) % len(rows)
+            elif action == "down" and rows:
+                sel = (sel + 1) % len(rows)
+            elif action == "confirm" and rows:
+                key, _label, editable = rows[sel]
+                if key == MENU_HOTKEY_ROW:
+                    new_mode = "stock" if get_menu_hotkey_mode() == "l3r3" else "l3r3"
+                    set_menu_hotkey_mode(new_mode)
+                elif editable:
+                    edit_game(stdscr, poller, key)
     finally:
         poller.close()
 
@@ -6747,6 +6898,23 @@ if __name__ == "__main__":
     main()
 PYEOF
     chmod +x "$PI_HOME/scripts/mame-mixer-hotkey.py"
+
+    # Default the MAME internal-menu combo to L3+R3 (see the script's own
+    # docstring above for why) unless it's already been set one way or
+    # the other - so a fresh install gets the collision-free combo out
+    # of the box, but re-running this phase never overwrites a choice
+    # already made from the RetroPie-menu tool itself.
+    python3 - <<MENUHOTKEYEOF
+import importlib.util
+spec = importlib.util.spec_from_file_location("mame_mixer_hotkey", "$PI_HOME/scripts/mame-mixer-hotkey.py")
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+if m.get_menu_hotkey_mode() == "l3r3":
+    print("[mamemixerhotkey] MAME internal-menu combo already set to L3+R3, leaving as-is")
+else:
+    m.set_menu_hotkey_mode("l3r3")
+    print("[mamemixerhotkey] set MAME internal-menu combo to L3+R3 (avoids the Select+Start clash with this project's quit-to-frontend shortcut)")
+MENUHOTKEYEOF
 
     touch "$PI_HOME/RetroPie/retropiemenu/mamemixerhotkey.rp"
 
@@ -6775,7 +6943,7 @@ open(path, "w").write(new_text)
 print("[mamemixerhotkey] wired into retropiemenu.sh")
 PYEOF
     fi
-    log "MAME Mixer Hotkey installed - run it from the RetroPie menu ('MAME Mixer Hotkey') to set a per-game audio boost (dB) and stereo/mono toggle for any arcade ROM that's been launched at least once"
+    log "MAME Mixer Hotkey installed - MAME's internal-menu combo defaults to L3+R3 (avoids the Select+Start clash with this project's quit-to-frontend shortcut); run it from the RetroPie menu ('MAME Mixer Hotkey') to switch that back to stock, or to set a per-game audio boost (dB) and stereo/mono toggle for any arcade ROM that's been launched at least once"
     return 0
 }
 
