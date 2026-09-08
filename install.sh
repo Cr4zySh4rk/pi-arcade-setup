@@ -140,7 +140,27 @@ OC_OVER_VOLTAGE="${OC_OVER_VOLTAGE:-6}" # +0.025V per step; 6 = +0.15V, needed f
 # --- Emulators --------------------------------------------------------------
 # MAME is always installed (the point of this script). Additional cores are
 # a comma-separated list of RetroPie-Setup package ids.
-EMULATOR_CORES="${EMULATOR_CORES:-lr-snes9x,lr-pcsx-rearmed,ppsspp,lr-fceumm,lr-gambatte,lr-genesis-plus-gx,lr-nestopia,lr-picodrive,mupen64plus}"
+#
+# lr-ppsspp (not "ppsspp"): confirmed live neither the standalone "ppsspp"
+# package nor the "lr-ppsspp" libretro core have an aarch64 binary on this
+# Debian release (both retropie_packages.sh ... _binary_ calls exit 0 with
+# just "Could not find a binary for ..." - the same silent-failure class of
+# bug as lr-mesen/lr-fceumm). Unlike those two, there's no other installed
+# core for the same system to fall back to for PSP, so phase_emulators_
+# install below automatically retries lr-ppsspp with a source build
+# (_source_) when its binary install produces nothing - the same pattern
+# already used for Flycast and the MAME custom overlay elsewhere in this
+# script. lr-ppsspp specifically (not standalone ppsspp) because its output
+# (ppsspp_libretro.so) is exactly what ES-DE's own default PSP command
+# already expects, so no alternativeEmulator override is needed either -
+# see phase_esde_default_emulators.
+EMULATOR_CORES="${EMULATOR_CORES:-lr-snes9x,lr-pcsx-rearmed,lr-ppsspp,lr-fceumm,lr-gambatte,lr-genesis-plus-gx,lr-nestopia,lr-picodrive,mupen64plus}"
+
+# Package ids in EMULATOR_CORES that should be retried with a source build
+# (_source_) if their binary install doesn't actually produce anything -
+# see the lr-ppsspp comment above. Comma-separated; extend this if another
+# core in EMULATOR_CORES ever turns out to have the same no-binary problem.
+EMULATOR_CORES_SOURCE_FALLBACK="${EMULATOR_CORES_SOURCE_FALLBACK:-lr-ppsspp}"
 
 # --- MAME custom in-game audio overlay ---------------------------------------
 # When true (default), this builds lr-mame from full source with a custom
@@ -185,6 +205,14 @@ ENABLE_MAME_CUSTOM_OVERLAY="${ENABLE_MAME_CUSTOM_OVERLAY:-true}"
 # APPLY_GCC14_CFLAGS_PATCH below and _apply_flycast_libzip_patch/
 # phase_dreamcast_flycast_install for the details.
 ENABLE_DREAMCAST="${ENABLE_DREAMCAST:-true}"
+
+# GameCube/Wii via Dolphin (lr-dolphin). On by default per explicit user
+# request, but read phase_gamecube_install's own comment before relying on
+# it for anything beyond light/2D-heavy titles - Dolphin's performance on a
+# Pi 4 is well documented as poor for most 3D-heavy GameCube games even
+# with this project's own CPU/GPU overclock applied. See the README's
+# Known limitations entry for the specifics. Set to false to skip it.
+ENABLE_GAMECUBE="${ENABLE_GAMECUBE:-true}"
 
 # This OS's default compiler is GCC 14, which made an implicit function
 # declaration (calling a function with no visible prototype - almost always
@@ -422,8 +450,10 @@ OC_ARM_FREQ=$OC_ARM_FREQ
 OC_GPU_FREQ=$OC_GPU_FREQ
 OC_OVER_VOLTAGE=$OC_OVER_VOLTAGE
 EMULATOR_CORES=$EMULATOR_CORES
+EMULATOR_CORES_SOURCE_FALLBACK=$EMULATOR_CORES_SOURCE_FALLBACK
 ENABLE_MAME_CUSTOM_OVERLAY=$ENABLE_MAME_CUSTOM_OVERLAY
 ENABLE_DREAMCAST=$ENABLE_DREAMCAST
+ENABLE_GAMECUBE=$ENABLE_GAMECUBE
 APPLY_GCC14_CFLAGS_PATCH=$APPLY_GCC14_CFLAGS_PATCH
 APPLY_RETROARCH_MENU_ROTATION_PATCH=$APPLY_RETROARCH_MENU_ROTATION_PATCH
 ESDE_BRANCH=$ESDE_BRANCH
@@ -818,7 +848,8 @@ phase_emulators_install() {
         sudo ./retropie_packages.sh lr-mame _binary_ || die "lr-mame install failed"
     fi
 
-    local core sys
+    local core sys fallback_cores
+    IFS=',' read -ra fallback_cores <<< "$EMULATOR_CORES_SOURCE_FALLBACK"
     IFS=',' read -ra cores <<< "$EMULATOR_CORES"
     for core in "${cores[@]}"; do
         [ -z "$core" ] && continue
@@ -828,8 +859,32 @@ phase_emulators_install() {
         # step (e.g. gamelist/scriptmodule bookkeeping) even though the
         # package itself installed fine - so don't trust the exit code
         # alone. Only actually warn if nothing landed on disk for it.
-        if [ ! -d "/opt/retropie/libretrocores/$core" ] && [ ! -d "/opt/retropie/emulators/$core" ]; then
-            log_warn "$core does not appear to be installed (this is a known flaky step for some cores, e.g. mupen64plus/N64 upstream) - continuing without it"
+        local core_dir="/opt/retropie/libretrocores/$core"
+        [ -d "$core_dir" ] || core_dir="/opt/retropie/emulators/$core"
+        local has_so=false
+        if [ -d "$core_dir" ] && compgen -G "$core_dir"/*_libretro.so >/dev/null 2>&1; then
+            has_so=true
+        elif [ -d "$core_dir" ] && [ -n "$(find "$core_dir" -maxdepth 1 -type f -executable 2>/dev/null)" ]; then
+            has_so=true  # standalone (non-libretro) emulator package
+        fi
+        if [ "$has_so" = false ]; then
+            local is_fallback=false
+            local fc
+            for fc in "${fallback_cores[@]}"; do
+                [ "$fc" = "$core" ] && is_fallback=true && break
+            done
+            if [ "$is_fallback" = true ]; then
+                log_warn "$core has no aarch64 binary (confirmed: retropie_packages.sh reports \"Could not find a binary\") - falling back to a source build. This can take a while (PPSSPP: roughly 30-60 min on a Pi 4)."
+                sudo ./retropie_packages.sh "$core" _source_ \
+                    || log_warn "$core source build failed - continuing without it, see the RetroPie-Setup build output above for the actual compiler error"
+                if compgen -G "/opt/retropie/libretrocores/$core"/*_libretro.so >/dev/null 2>&1; then
+                    log "$core: source build succeeded"
+                else
+                    log_warn "$core: source build did not produce a .so either - this system will stay unavailable until that's fixed upstream or by hand"
+                fi
+            else
+                log_warn "$core does not appear to be installed (this is a known flaky step for some cores, e.g. mupen64plus/N64 upstream) - continuing without it"
+            fi
         fi
     done
 
@@ -1960,6 +2015,49 @@ if not (menu_ok and overlay_ok):
 PYEOF
 }
 
+# GameCube/Wii via Dolphin (lr-dolphin, the libretro port - exactly what
+# ES-DE's own default gc/wii command expects, dolphin_libretro.so, so no
+# alternativeEmulator override is needed once it's installed and symlinked
+# by phase_esde_retroarch_links). ON BY DEFAULT SINCE THE USER ASKED FOR IT
+# EXPLICITLY, but read this before relying on it: Dolphin on a Raspberry Pi
+# 4 is well documented as poor for most titles even with heavy tuning -
+# published benchmarks and community reports consistently show most
+# GameCube games running somewhere in the 15-30fps range, with some 3D-
+# heavy titles as low as 5-10fps, well below the original hardware's 60fps
+# baseline; 2D-heavy or otherwise lightweight titles fare considerably
+# better. The CPU/GPU overclock this project already applies by default
+# (ENABLE_OVERCLOCK) is close to a requirement rather than a nice-to-have
+# for even that level of performance, and getting the best result out of a
+# given game typically needs real per-game tuning (OpenGL ES over Vulkan,
+# resolution/scaling, DSP HLE vs LLE, etc.) beyond what this phase sets up.
+# Set ENABLE_GAMECUBE=false to skip this entirely and keep the systems this
+# hardware handles comfortably.
+phase_gamecube_install() {
+    if [ "$ENABLE_GAMECUBE" != "true" ]; then
+        log "ENABLE_GAMECUBE=false, skipping"
+        return 0
+    fi
+    cd "$PI_HOME/RetroPie-Setup" || die "RetroPie-Setup missing"
+    log "Installing Dolphin (GameCube/Wii) - trying a binary first, falling back to source if none exists for this platform"
+    sudo ./retropie_packages.sh lr-dolphin _binary_
+    if [ ! -f /opt/retropie/libretrocores/lr-dolphin/dolphin_libretro.so ]; then
+        log_warn "lr-dolphin has no binary for this platform - falling back to a source build. Dolphin is a large codebase; this can take a long time on a Pi 4."
+        sudo ./retropie_packages.sh lr-dolphin _source_ \
+            || log_warn "lr-dolphin build failed - continuing without GameCube/Wii support, see the RetroPie-Setup build output above for the actual compiler error"
+    fi
+
+    if [ ! -f /opt/retropie/libretrocores/lr-dolphin/dolphin_libretro.so ]; then
+        log_warn "dolphin_libretro.so not found after install; GameCube/Wii emulation will not be available"
+        return 0
+    fi
+
+    mkdir -p "$PI_HOME/.config/retroarch/cores"
+    ln -sf /opt/retropie/libretrocores/lr-dolphin/dolphin_libretro.so "$PI_HOME/.config/retroarch/cores/dolphin_libretro.so"
+    mkdir -p "$PI_HOME/RetroPie/roms/gc" "$PI_HOME/RetroPie/roms/wii"
+    log "Dolphin (GameCube/Wii) installed - see the README's Known limitations entry on realistic performance expectations for this hardware before spending time tuning individual games"
+    return 0
+}
+
 # RetroPie-Setup's own basic_install builds RetroArch from source but leaves
 # it unpatched. This re-patches the same source tree it already fetched
 # (under RetroPie-Setup/tmp/build/retroarch) and re-runs just the
@@ -2424,25 +2522,29 @@ phase_esde_retroarch_links() {
     [ -f /opt/retropie/configs/all/retroarch.cfg ] && ln -sf /opt/retropie/configs/all/retroarch.cfg "$PI_HOME/.config/retroarch/retroarch.cfg"
 
     mkdir -p "$PI_HOME/.config/retroarch/cores"
-    declare -A core_so=(
-        [lr-snes9x]=snes9x
-        [lr-pcsx-rearmed]=pcsx_rearmed
-        [lr-fceumm]=fceumm
-        [lr-gambatte]=gambatte
-        [lr-genesis-plus-gx]=genesis_plus_gx
-        [lr-nestopia]=nestopia
-        [lr-picodrive]=picodrive
-        [mupen64plus]=mupen64plus_next
-    )
-    local core cores
-    IFS=',' read -ra cores <<< "$EMULATOR_CORES"
-    for core in "${cores[@]}"; do
-        local so="${core_so[$core]:-}"
-        [ -z "$so" ] && continue
-        local src="/opt/retropie/libretrocores/${core}/${so}_libretro.so"
-        if [ -f "$src" ]; then
-            ln -sf "$src" "$PI_HOME/.config/retroarch/cores/${so}_libretro.so"
-        fi
+
+    # Symlink EVERY libretro core actually installed under
+    # /opt/retropie/libretrocores/*/ into RetroArch's own core directory
+    # (libretro_directory in retroarch.cfg), not just a fixed whitelist of
+    # EMULATOR_CORES package ids. This used to be a small hardcoded
+    # core_so map (one entry per EMULATOR_CORES package) - confirmed live
+    # that it silently missed several cores that WERE actually installed
+    # (e.g. lr-mgba's mgba_libretro.so for GBA, lr-fbneo's fbneo_libretro.so
+    # for arcade) simply because they had no entry in the map, leaving
+    # ES-DE's own default emulator command for those systems unable to
+    # find a core at all even though one was sitting right there on disk.
+    # A libretrocores package dir can (rarely) ship more than one .so - fbneo
+    # ships fbneo_libretro.so, and some future core might ship extra
+    # variants - so this links every *_libretro.so found in each package
+    # dir, not just one per directory.
+    local core_dir so_file so_name
+    for core_dir in /opt/retropie/libretrocores/*/; do
+        [ -d "$core_dir" ] || continue
+        for so_file in "$core_dir"*_libretro.so; do
+            [ -f "$so_file" ] || continue
+            so_name="$(basename "$so_file")"
+            ln -sf "$so_file" "$PI_HOME/.config/retroarch/cores/$so_name"
+        done
     done
 
     # RetroPie's lr-mame ships as mamearcade_libretro.so; ES-DE's find-rules
@@ -2453,23 +2555,36 @@ phase_esde_retroarch_links() {
     else
         log_warn "mamearcade_libretro.so not found; MAME may not be picked up by ES-DE yet"
     fi
+
+    log "Symlinked $(find "$PI_HOME/.config/retroarch/cores" -maxdepth 1 -name '*_libretro.so' | wc -l) libretro core(s) from /opt/retropie/libretrocores into ~/.config/retroarch/cores"
     return 0
 }
 
-# ES-DE's built-in es_systems.xml lists "Mesen" as the first (i.e. default)
-# command for the nes/fds systems, which requires lr-mesen. As of this
-# writing, RetroPie's binary package repo has no lr-mesen (or lr-fceumm)
-# binary for aarch64 on this Debian release, so _binary_ installs of both
-# silently produce no .so (retropie_packages.sh exits 0 with just an
-# "Errors: Could not find a binary for ..." line) - confirmed live. Since
-# ES-DE still tries to launch the missing "Mesen" command by default, every
-# NES ROM fails with "Couldn't find emulator core 'MESEN_LIBRETRO.SO'" even
-# though lr-nestopia (already in EMULATOR_CORES) is installed and works
-# fine. Point ES-DE's default at Nestopia UE instead by pre-seeding each
-# system's gamelist.xml with the <alternativeEmulator> tag ES-DE's own
-# "Alternative Emulators" menu would otherwise write - this only sets the
-# system-wide default and does not touch per-game overrides or overwrite an
-# existing gamelist.xml.
+# ES-DE's built-in es_systems.xml lists a fixed FIRST <command> as the
+# default emulator for each system - and for several systems, that default
+# names a core this project doesn't (or can't reliably) install, even
+# though a perfectly good alternative core for the same system IS
+# installed. Originally found for nes/fds (default "Mesen", requires
+# lr-mesen - no aarch64 binary exists for it on this Debian release, nor
+# for lr-fceumm; retropie_packages.sh's _binary_ mode exits 0 with just an
+# "Errors: Could not find a binary for ..." line rather than failing, so
+# this is easy to miss). The exact same class of bug was later confirmed
+# live for two more systems: psx (default "Beetle PSX", requires
+# mednafen_psx_libretro.so - not in EMULATOR_CORES at all, where PCSX
+# ReARMed already is and works) and n64 (default "Mupen64Plus-Next",
+# requires mupen64plus_next_libretro.so - EMULATOR_CORES installs the
+# *standalone* Mupen64Plus package by default instead, since the libretro
+# core has a history of being flaky to build from source here - see the
+# README's Known limitations). Left alone, every ROM on an affected system
+# fails with "Couldn't find emulator core '<SOMETHING>_LIBRETRO.SO'" even
+# though a working core for that exact system is sitting right there.
+#
+# Fixed the same way for every affected system: pre-seed that system's
+# gamelist.xml with the <alternativeEmulator> tag ES-DE's own "Alternative
+# Emulators" menu would otherwise write, pointing at whichever ALREADY-
+# INSTALLED core/label this project actually provides for it. This only
+# sets the system-wide default and does not touch per-game overrides or
+# overwrite an existing gamelist.xml.
 #
 # IMPORTANT: per ES-DE's own GamelistFileParser.cpp (confirmed against the
 # actual source this build compiles), <alternativeEmulator> is read via
@@ -2478,11 +2593,33 @@ phase_esde_retroarch_links() {
 # <gameList> as a child. Nesting it inside <gameList> parses without error
 # but is silently never read, so the system-wide override has no effect
 # and every ROM keeps launching with the (missing) default core - confirmed
-# live: this was the actual reason the first version of this fix didn't
-# work even after a reboot.
-phase_esde_nes_default_emulator() {
-    local sys
-    for sys in nes fds; do
+# live: this was the actual reason the first version of this fix (for nes/
+# fds) didn't work even after a reboot.
+#
+# Every OTHER system this project installs a core for (snes, psx via PCSX
+# ReARMed as set below, psp, gb/gbc, genesis/megadrive, arcade/mame,
+# dreamcast) already has ES-DE's own default pointing at the exact core
+# this project installs, confirmed by cross-referencing the linuxarm
+# es_systems.xml's first <command> per system against phase_emulators_
+# install's EMULATOR_CORES and phase_esde_retroarch_links' now-general
+# core symlinking - so no override is needed for those, and none is
+# applied here.
+phase_esde_default_emulators() {
+    declare -A default_label=(
+        [nes]="Nestopia UE"
+        [fds]="Nestopia UE"
+        [psx]="PCSX ReARMed"
+        [n64]="Mupen64Plus (Standalone)"
+    )
+    declare -A default_reason=(
+        [nes]="Mesen has no aarch64 binary yet"
+        [fds]="Mesen has no aarch64 binary yet"
+        [psx]="Beetle PSX (mednafen_psx) isn't installed by this project - PCSX ReARMed is"
+        [n64]="EMULATOR_CORES installs standalone Mupen64Plus by default, not the lr-mupen64plus-next libretro core"
+    )
+    local sys label
+    for sys in "${!default_label[@]}"; do
+        label="${default_label[$sys]}"
         local gl_dir="$PI_HOME/ES-DE/gamelists/$sys"
         local gl_file="$gl_dir/gamelist.xml"
         mkdir -p "$gl_dir"
@@ -2492,20 +2629,20 @@ phase_esde_nes_default_emulator() {
                 log "$sys gamelist.xml already has an alternativeEmulator override, leaving as-is"
                 continue
             fi
-            sed -i '0,/<gameList>/s//<alternativeEmulator>\n\t<label>Nestopia UE<\/label>\n<\/alternativeEmulator>\n<gameList>/' "$gl_file" \
+            sed -i "0,/<gameList>/s//<alternativeEmulator>\n\t<label>${label}<\/label>\n<\/alternativeEmulator>\n<gameList>/" "$gl_file" \
                 || log_warn "could not patch existing $sys gamelist.xml with alternativeEmulator override"
         else
-            cat > "$gl_file" <<'EOF'
+            cat > "$gl_file" <<EOF
 <?xml version="1.0"?>
 <alternativeEmulator>
-	<label>Nestopia UE</label>
+	<label>${label}</label>
 </alternativeEmulator>
 <gameList>
 </gameList>
 EOF
         fi
         chown "$PI_USER:$PI_USER" "$gl_file" 2>/dev/null || true
-        log "Set Nestopia UE as the default emulator for $sys (Mesen has no aarch64 binary yet)"
+        log "Set $label as the default emulator for $sys (${default_reason[$sys]})"
     done
     return 0
 }
@@ -7527,6 +7664,7 @@ main() {
         emulators_install
         mame_arcade_overlay_build
         dreamcast_flycast_install
+        gamecube_install
         retroarch_menu_rotation_patch
         retroarch_autoconfig
         video_rotation_setup
@@ -7536,7 +7674,7 @@ main() {
         esde_build
         esde_config
         esde_retroarch_links
-        esde_nes_default_emulator
+        esde_default_emulators
         themes_install
         theme_system_art
         autostart_setup
