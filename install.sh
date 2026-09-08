@@ -148,7 +148,7 @@ EMULATOR_CORES="${EMULATOR_CORES:-lr-snes9x,lr-pcsx-rearmed,ppsspp,lr-fceumm,lr-
 # a RetroArch-Quick-Menu-styled overlay, opened directly by the Show/Hide Menu
 # hotkey (in-game, over the paused ROM - press it again to close, same as
 # RetroArch), with two controls that work for every arcade ROM (not a fixed
-# per-game list): a uniform Audio Boost (-96..+12dB, using MAME's own live
+# per-game list): a uniform Audio Boost (-96..+20dB, using MAME's own live
 # sound_manager mixer routing API - the same one the stock Audio Mixer menu
 # uses) and a Stereo/Mono toggle that forces a true mono downmix when the
 # ROM's emulated sound hardware supports it (auto-detected per game from its
@@ -865,9 +865,14 @@ _apply_mame_arcade_overlay_patch() {
     that particular ROM emulates, not a fixed per-game list):
 
       * Audio Boost   - a uniform +/-dB gain applied on top of MAME's
-                         normal mixer routing (-96..+12 dB, 1 dB step,
-                         0.1 dB with Shift, 10 dB with Ctrl, matching
-                         MAME's own Audio Mixer menu conventions).
+                         normal mixer routing (-96..+20 dB, 1 dB step,
+                         0.1 dB with Shift, 10 dB with Ctrl - the lower
+                         bound and step sizes match MAME's own Audio
+                         Mixer menu conventions, but the upper bound is
+                         raised from MAME's stock +12 dB ceiling for
+                         headroom on genuinely quiet boards; MAME's
+                         sound_manager clamps only at the final int16
+                         sample, not by dB, so this is safe to raise).
       * Stereo/Mono   - when the game's output layout allows it, forces
                          a true mono downmix (both channels summed,
                          each attenuated 6 dB to avoid clipping) or
@@ -1261,7 +1266,7 @@ void menu_arcade_overlay::populate()
 
 	item_append(
 			util::string_format(_("menu-arcadeoverlay", "Audio Boost: %1$+.1f dB"), m_boost_db),
-			(m_boost_db > -96.0f ? FLAG_LEFT_ARROW : 0) | (m_boost_db < 12.0f ? FLAG_RIGHT_ARROW : 0),
+			(m_boost_db > -96.0f ? FLAG_LEFT_ARROW : 0) | (m_boost_db < 20.0f ? FLAG_RIGHT_ARROW : 0),
 			reinterpret_cast<void *>(ITM_BOOST));
 
 	if (m_stereo_available)
@@ -1301,8 +1306,19 @@ bool menu_arcade_overlay::handle(event const *ev)
 				m_boost_db -= 10.0f;
 			else
 				m_boost_db -= 1.0f;
-			m_boost_db = std::clamp(m_boost_db, -96.0f, 12.0f);
+			m_boost_db = std::clamp(m_boost_db, -96.0f, 20.0f);
 			apply_boost();
+			// Re-populate so the displayed "Audio Boost: X dB" text
+			// actually reflects the new value on this same frame -
+			// do_rebuild() only calls populate() when m_items is
+			// empty, so without this the applied gain change is
+			// real (audible) but the on-screen number stays frozen
+			// at whatever it read when the menu was last (re)built,
+			// which looked like input wasn't registering in real
+			// time, especially with PROCESS_LR_REPEAT firing many
+			// times while a direction is held. REMEMBER_POSITION
+			// keeps the cursor on this same item across the rebuild.
+			reset(reset_options::REMEMBER_POSITION);
 			return true;
 		}
 		break;
@@ -1316,8 +1332,9 @@ bool menu_arcade_overlay::handle(event const *ev)
 				m_boost_db += 10.0f;
 			else
 				m_boost_db += 1.0f;
-			m_boost_db = std::clamp(m_boost_db, -96.0f, 12.0f);
+			m_boost_db = std::clamp(m_boost_db, -96.0f, 20.0f);
 			apply_boost();
+			reset(reset_options::REMEMBER_POSITION);
 			return true;
 		}
 		break;
@@ -1327,6 +1344,7 @@ bool menu_arcade_overlay::handle(event const *ev)
 		{
 			m_boost_db = 0.0f;
 			apply_boost();
+			reset(reset_options::REMEMBER_POSITION);
 			return true;
 		}
 		break;
