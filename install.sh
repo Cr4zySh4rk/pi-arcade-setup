@@ -41,6 +41,158 @@ PI_HOME="${PI_HOME:-$HOME}"
 LOCALE="${LOCALE:-en_US.UTF-8}"
 TIMEZONE="${TIMEZONE:-}"                     # e.g. "America/New_York"; empty = leave as-is
 
+# --------------------------------------------------------------------------
+# 0a. Hardware detection
+# --------------------------------------------------------------------------
+# Used to gate Raspberry-Pi-only phases (CPU/GPU overclock via config.txt,
+# DSI panel overlay, GPIO-driven WS2812 LED strip, and the raspi-config
+# console-autologin call) so the script degrades gracefully - skip with a
+# warning, not a hard failure - on other Debian-based hardware (another SBC,
+# or a generic x86_64/arm64 PC) instead of assuming Pi hardware
+# unconditionally everywhere. IMPORTANT: the non-Pi code paths this enables
+# (see phase_overclock, phase_display_setup, phase_led_strip_setup,
+# phase_autostart_setup) are reasoned through from source/documentation, not
+# physically verified - there's no non-Pi hardware in this project's own
+# test loop (everything else in this script continues to be verified live
+# against the reference Pi 4). Please open an issue if something's wrong
+# there on real non-Pi hardware.
+#
+# Detection reads the device-tree "model" string, which is how the kernel
+# itself identifies specific board models - present on Raspberry Pi and
+# other ARM SBCs with a device tree, entirely absent on a generic x86_64 PC
+# (itself already a reliable "not a Pi" signal). Override with
+# IS_RASPBERRY_PI=true/false directly if you ever need to force this.
+_detect_raspberry_pi() {
+    local model=""
+    if [ -r /proc/device-tree/model ]; then
+        model="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || true)"
+    elif [ -r /sys/firmware/devicetree/base/model ]; then
+        model="$(tr -d '\0' < /sys/firmware/devicetree/base/model 2>/dev/null || true)"
+    fi
+    case "$model" in
+        Raspberry\ Pi*) echo true ;;
+        *) echo false ;;
+    esac
+}
+IS_RASPBERRY_PI="${IS_RASPBERRY_PI:-$(_detect_raspberry_pi)}"
+
+# --------------------------------------------------------------------------
+# 0b. Interactive setup wizard
+# --------------------------------------------------------------------------
+# Asks a short series of questions about this machine's hardware/display and
+# derives the variables below from the answers, so a plain `curl ... | bash`
+# run on a fresh box - Pi or not, DSI panel or plain HDMI monitor - ends up
+# with a correctly-configured install rather than silently inheriting the
+# reference build's Pi+DSI-panel assumptions. Only runs when stdin is an
+# actual terminal (a piped `curl | bash` has no stdin of its own to read
+# answers from - not a bug, just falls back to the documented defaults
+# below, which still describe/reproduce the original reference build) and
+# this isn't a systemd-resumed run after a reboot (config.env from the
+# original interactive run already has the real answers - see main() and
+# the EnvironmentFile= line in request_reboot's generated service unit).
+# Every question is skipped individually - keeping whatever value is
+# already there - if its target variable is already set in the environment,
+# so e.g. `ENABLE_DSI_DISPLAY=false curl ... | bash` still short-circuits
+# that one question even when run interactively. Skip the whole wizard with
+# PI_ARCADE_SKIP_WIZARD=true for a fully unattended/scripted install that
+# just wants the plain defaults.
+_wizard_ask() {
+    # $1=prompt $2=default (shown in brackets; also what a bare Enter picks)
+    local prompt="$1" default="$2" reply=""
+    read -rp "$prompt [$default]: " reply </dev/tty || reply=""
+    echo "${reply:-$default}"
+}
+
+run_setup_wizard() {
+    [ -t 0 ] || return 0
+    [ "${PI_ARCADE_SKIP_WIZARD:-false}" = "true" ] && return 0
+    [ "${1:-}" = "--resume" ] && return 0
+
+    echo ""
+    echo "=== pi-arcade-setup interactive setup ==="
+    echo "Answer a few questions about this machine and its display - press"
+    echo "Enter at any prompt to accept the bracketed default. Set"
+    echo "PI_ARCADE_SKIP_WIZARD=true beforehand to skip this entirely and"
+    echo "use env vars/defaults only (e.g. for a scripted/unattended install)."
+    echo ""
+
+    local detected="$IS_RASPBERRY_PI" ans
+    ans="$(_wizard_ask "Is this a Raspberry Pi? (auto-detected: $detected)" "$([ "$detected" = true ] && echo y || echo n)")"
+    case "$ans" in
+        y|Y|yes|true) IS_RASPBERRY_PI=true ;;
+        *) IS_RASPBERRY_PI=false ;;
+    esac
+    [ "$IS_RASPBERRY_PI" = "true" ] || echo "Continuing as generic Debian-based hardware - Pi-only steps (overclock, DSI panel overlay, GPIO LED strip) will be skipped automatically."
+
+    if [ -z "${ENABLE_DSI_DISPLAY+x}" ]; then
+        echo ""
+        echo "Display:"
+        echo "  1) Official/vendor DSI touchscreen panel (this project's reference build used a Waveshare 10.1\" DSI panel)"
+        echo "  2) HDMI monitor/TV"
+        ans="$(_wizard_ask "Choice" "$([ "$IS_RASPBERRY_PI" = true ] && echo 1 || echo 2)")"
+        if [ "$ans" = "1" ] && [ "$IS_RASPBERRY_PI" = "true" ]; then
+            ENABLE_DSI_DISPLAY=true
+            echo "Using this project's DSI panel defaults (Waveshare 10.1\" DSI Touch A, rotated 90). If you have a different DSI panel, Ctrl-C now and re-run with DSI_OVERLAY/DSI_CMDLINE_ROTATE/FBCON_ROTATE set to match its vendor overlay first - see the README."
+        else
+            [ "$ans" = "1" ] && echo "DSI panels are a Raspberry-Pi-specific overlay mechanism - treating this as HDMI instead."
+            ENABLE_DSI_DISPLAY=false
+            echo ""
+            ans="$(_wizard_ask "Is the HDMI screen mounted rotated (e.g. a portrait arcade-cabinet monitor)?" "n")"
+            case "$ans" in
+                y|Y|yes|true)
+                    local deg native nw nh
+                    deg="$(_wizard_ask "Rotation, clockwise degrees (90/180/270)" "90")"
+                    case "$deg" in
+                        90|180|270) : ;;
+                        *) echo "Unrecognized value, defaulting to 90"; deg=90 ;;
+                    esac
+                    native="$(_wizard_ask "Screen's native (unrotated) resolution as WIDTHxHEIGHT - check its spec sheet; e.g. a 1920x1080 monitor is still \"1920x1080\" here even mounted sideways" "1920x1080")"
+                    nw="${native%x*}"; nh="${native#*x}"
+                    { [ "$nw" -gt 0 ] && [ "$nh" -gt 0 ]; } 2>/dev/null || { echo "Unrecognized resolution, defaulting to 1920x1080"; nw=1920; nh=1080; }
+                    RETROARCH_VIDEO_ROTATION="$deg"
+                    PANEL_NATIVE_WIDTH="$nw"
+                    PANEL_NATIVE_HEIGHT="$nh"
+                    case "$deg" in
+                        90)  ESDE_SCREENROTATE=270; CLASSIC_ES_SCREENROTATE=3; CLASSIC_ES_SCREENSIZE="$nh $nw" ;;
+                        180) ESDE_SCREENROTATE=180; CLASSIC_ES_SCREENROTATE=2; CLASSIC_ES_SCREENSIZE="$nw $nh" ;;
+                        270) ESDE_SCREENROTATE=90;  CLASSIC_ES_SCREENROTATE=1; CLASSIC_ES_SCREENSIZE="$nh $nw" ;;
+                    esac
+                    echo "NOTE: this rotated-HDMI mapping is reasoned through from the DSI panel's own working convention (same underlying RetroArch/ES-DE rotation settings, just parameterized off your resolution instead of the panel's), not physically verified on rotated-HDMI hardware yet. If menu/game orientation ends up wrong, RETROARCH_VIDEO_ROTATION/ESDE_SCREENROTATE/CLASSIC_ES_SCREENROTATE are the three values to try adjusting - see the README."
+                    ;;
+                *)
+                    RETROARCH_VIDEO_ROTATION=0
+                    ESDE_SCREENROTATE=0
+                    CLASSIC_ES_SCREENROTATE=0
+                    ;;
+            esac
+        fi
+    fi
+
+    if [ "$IS_RASPBERRY_PI" = "true" ] && [ -z "${ENABLE_OVERCLOCK+x}" ]; then
+        echo ""
+        ans="$(_wizard_ask "Enable Pi 4 CPU/GPU overclock? (needs real cooling - heatsink+fan case, not passive)" "y")"
+        case "$ans" in y|Y|yes|true) ENABLE_OVERCLOCK=true ;; *) ENABLE_OVERCLOCK=false ;; esac
+    fi
+
+    if [ "$IS_RASPBERRY_PI" = "true" ] && [ -z "${ENABLE_LED_STRIP+x}" ]; then
+        echo ""
+        ans="$(_wizard_ask "Enable an addressable WS2812B LED strip wired to a GPIO pin?" "n")"
+        case "$ans" in
+            y|Y|yes|true)
+                ENABLE_LED_STRIP=true
+                LED_GPIO_PIN="$(_wizard_ask "GPIO pin (must be 12, 13, 18, 19, 21, or 10 - the ones wired to PWM/PCM/SPI0 in silicon)" "21")"
+                ;;
+            *) ENABLE_LED_STRIP=false ;;
+        esac
+    fi
+
+    echo ""
+    echo "Setup questions done - starting the install now."
+    echo ""
+}
+
+run_setup_wizard "${1:-}"
+
 # --- Display (Waveshare 10.1" DSI Touch A in the reference build) ---------
 # On by default to reproduce the reference build exactly. Set to "false"
 # for a generic HDMI setup with no DSI panel, or point the *_OVERLAY/
@@ -426,6 +578,7 @@ run_phase() {
 write_config_file() {
     sudo mkdir -p "$STATE_DIR"
     sudo tee "$CONFIG_FILE" >/dev/null <<EOF
+IS_RASPBERRY_PI=$IS_RASPBERRY_PI
 PI_USER=$PI_USER
 PI_HOME=$PI_HOME
 LOCALE=$LOCALE
@@ -594,6 +747,10 @@ phase_preflight() {
 }
 
 phase_overclock() {
+    if [ "$IS_RASPBERRY_PI" != "true" ]; then
+        log "IS_RASPBERRY_PI=false, skipping (arm_freq/gpu_freq/over_voltage in config.txt are Raspberry-Pi-specific; this hardware isn't one)"
+        return 0
+    fi
     if [ "$ENABLE_OVERCLOCK" != "true" ]; then
         log "ENABLE_OVERCLOCK=false, skipping"
         return 0
@@ -738,6 +895,10 @@ PSEOF
 phase_display_setup() {
     if [ "$ENABLE_DSI_DISPLAY" != "true" ]; then
         log "ENABLE_DSI_DISPLAY=false, skipping DSI display configuration"
+        return 0
+    fi
+    if [ "$IS_RASPBERRY_PI" != "true" ]; then
+        log_warn "ENABLE_DSI_DISPLAY=true but IS_RASPBERRY_PI=false - the dtoverlay/config.txt mechanism this phase uses is Raspberry-Pi-specific, so there's nothing correct to do here on this hardware. Skipping; set ENABLE_DSI_DISPLAY=false (the default the setup wizard picks for non-Pi hardware) if this is intentional, or IS_RASPBERRY_PI=true if detection got this wrong."
         return 0
     fi
 
@@ -2161,27 +2322,47 @@ phase_video_rotation_setup() {
     _set_retroarch_key "$all_cfg" "input_quit_gamepad_combo" "4"
 
     # See the PANEL_NATIVE_WIDTH/HEIGHT comment above for *why* a manual
-    # custom viewport is needed at all. Computed here (not hardcoded) so it
-    # scales with PANEL_NATIVE_WIDTH/HEIGHT for a different panel: fills the
-    # native width fully (becomes the final height post-rotation), height is
-    # a standard 4:3 box (becomes the final width post-rotation), vertically
-    # centered in native coordinates (becomes horizontally centered
-    # post-rotation). All values are in *native* (pre-rotation) panel
-    # coordinates - see the comment above, this is not the same coordinate
-    # space as the final displayed image.
-    local viewport_w=$PANEL_NATIVE_WIDTH
-    local viewport_h=$(( PANEL_NATIVE_WIDTH * 4 / 3 ))
-    local viewport_x=0
-    local viewport_y=$(( (PANEL_NATIVE_HEIGHT - viewport_h) / 2 ))
-    _set_retroarch_key "$all_cfg" "video_aspect_ratio_auto" "false"
-    _set_retroarch_key "$all_cfg" "video_scale_integer" "false"
-    _set_retroarch_key "$all_cfg" "video_scale_integer_overscale" "false"
-    _set_retroarch_key "$all_cfg" "aspect_ratio_index" "23"
-    _set_retroarch_key "$all_cfg" "custom_viewport_width" "$viewport_w"
-    _set_retroarch_key "$all_cfg" "custom_viewport_height" "$viewport_h"
-    _set_retroarch_key "$all_cfg" "custom_viewport_x" "$viewport_x"
-    _set_retroarch_key "$all_cfg" "custom_viewport_y" "$viewport_y"
-    log "Set aspect_ratio_index=23 (Custom), custom_viewport=${viewport_w}x${viewport_h}+${viewport_x}+${viewport_y} (native/pre-rotation coordinates), video_aspect_ratio_auto=false, video_scale_integer=false"
+    # custom viewport is needed at all - it exists purely to compensate for
+    # a RetroArch aspect-fit bug that only bites when a rotated panel/
+    # monitor is involved (the viewport gets fit against the panel's
+    # *native*, pre-rotation dimensions, not the actual displayed
+    # orientation). With RETROARCH_VIDEO_ROTATION=0 (a plain, unrotated
+    # HDMI monitor - the setup wizard's own default for HDMI-without-
+    # rotation) there is no coordinate-space mismatch to correct: native and
+    # displayed dimensions are the same thing, so RetroArch's own normal
+    # auto-aspect handling already does the right thing unassisted.
+    # Confirmed by re-reading the same aspect-fit code path this override
+    # was originally written against - the bug is specifically in how a
+    # non-zero video_rotation is combined with the aspect calculation, not
+    # present at all when video_rotation is 0. Skipping this whole override
+    # in that case also means PANEL_NATIVE_WIDTH/HEIGHT don't need to be
+    # known at all for the common plain-HDMI case, which the wizard doesn't
+    # even ask about when rotation is off.
+    if [ "$RETROARCH_VIDEO_ROTATION" = "0" ]; then
+        log "RETROARCH_VIDEO_ROTATION=0 - leaving aspect_ratio_index/custom_viewport/video_aspect_ratio_auto/video_scale_integer at RetroArch's own defaults (no rotation-compensation viewport needed)"
+    else
+        # Computed here (not hardcoded) so it scales with PANEL_NATIVE_WIDTH/
+        # HEIGHT for a different panel/monitor: fills the native width fully
+        # (becomes the final height post-rotation), height is a standard 4:3
+        # box (becomes the final width post-rotation), vertically centered in
+        # native coordinates (becomes horizontally centered post-rotation).
+        # All values are in *native* (pre-rotation) coordinates - see the
+        # comment above, this is not the same coordinate space as the final
+        # displayed image.
+        local viewport_w=$PANEL_NATIVE_WIDTH
+        local viewport_h=$(( PANEL_NATIVE_WIDTH * 4 / 3 ))
+        local viewport_x=0
+        local viewport_y=$(( (PANEL_NATIVE_HEIGHT - viewport_h) / 2 ))
+        _set_retroarch_key "$all_cfg" "video_aspect_ratio_auto" "false"
+        _set_retroarch_key "$all_cfg" "video_scale_integer" "false"
+        _set_retroarch_key "$all_cfg" "video_scale_integer_overscale" "false"
+        _set_retroarch_key "$all_cfg" "aspect_ratio_index" "23"
+        _set_retroarch_key "$all_cfg" "custom_viewport_width" "$viewport_w"
+        _set_retroarch_key "$all_cfg" "custom_viewport_height" "$viewport_h"
+        _set_retroarch_key "$all_cfg" "custom_viewport_x" "$viewport_x"
+        _set_retroarch_key "$all_cfg" "custom_viewport_y" "$viewport_y"
+        log "Set aspect_ratio_index=23 (Custom), custom_viewport=${viewport_w}x${viewport_h}+${viewport_x}+${viewport_y} (native/pre-rotation coordinates), video_aspect_ratio_auto=false, video_scale_integer=false"
+    fi
 
     # configs/arcade/retroarch.cfg #includes the global file above, and per
     # its own header comment, keys placed *after* that #include line are
@@ -2805,9 +2986,34 @@ EOF
         #   2. /etc/profile.d/10-retropie.sh - the actual trigger that runs
         #      autostart.sh on tty1 login (not ~/.bashrc, despite older
         #      documentation/folklore describing it that way).
-        # Without this, the Pi boots to a plain login prompt and nothing
+        # Without this, the box boots to a plain login prompt and nothing
         # ever launches the frontend.
-        sudo raspi-config nonint do_boot_behaviour B2 || log_warn "Could not set console autologin via raspi-config"
+        if [ "$IS_RASPBERRY_PI" = "true" ] && command -v raspi-config >/dev/null 2>&1; then
+            sudo raspi-config nonint do_boot_behaviour B2 || log_warn "Could not set console autologin via raspi-config"
+        else
+            # Generic Debian equivalent of raspi-config's B2 (console
+            # autologin): a systemd getty@tty1 drop-in that adds --autologin
+            # <user> to agetty's own invocation, plus making sure the box
+            # actually boots to a plain text console (multi-user.target, not
+            # a graphical target) so tty1 is what's active at boot. This is
+            # the standard systemd-native way to do this on any Debian-based
+            # box - raspi-config's own do_boot_behaviour does effectively
+            # the same drop-in-file mechanism under the hood on Bookworm+
+            # anyway, just via its own codepath - not something that only
+            # works because it's a Pi. NOT physically verified on non-Pi
+            # hardware; report an issue if this doesn't take effect on real
+            # hardware.
+            sudo systemctl set-default multi-user.target 2>/dev/null || log_warn "Could not set default systemd target to multi-user.target"
+            sudo mkdir -p /etc/systemd/system/getty@tty1.service.d
+            sudo tee /etc/systemd/system/getty@tty1.service.d/autologin.conf >/dev/null <<AUTOEOF
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin $PI_USER --noclear %I \$TERM
+AUTOEOF
+            sudo systemctl daemon-reload 2>/dev/null || true
+            sudo systemctl enable getty@tty1.service >/dev/null 2>&1 || log_warn "Could not enable getty@tty1.service"
+            log "Console autologin configured via a systemd getty@tty1 drop-in (generic Debian path, not raspi-config)"
+        fi
         sudo rm -f /etc/profile.d/10-emulationstation.sh
         sudo tee /etc/profile.d/10-retropie.sh >/dev/null <<PROFEOF
 # launch our autostart apps (if we are on the correct tty and not in X)
@@ -3718,6 +3924,10 @@ PYEOF
 phase_led_strip_setup() {
     if [ "$ENABLE_LED_STRIP" != "true" ]; then
         log "ENABLE_LED_STRIP=false, skipping"
+        return 0
+    fi
+    if [ "$IS_RASPBERRY_PI" != "true" ]; then
+        log_warn "ENABLE_LED_STRIP=true but IS_RASPBERRY_PI=false - rpi_ws281x drives the strip via the BCM SoC's own PWM/PCM peripheral + DMA, which doesn't exist on non-Pi hardware. Skipping; a different board would need its own GPIO/LED library wired in here instead."
         return 0
     fi
     # rpi_ws281x is the standard hardware-DMA-timed WS2812 driver for the
