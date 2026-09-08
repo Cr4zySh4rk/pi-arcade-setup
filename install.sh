@@ -2084,9 +2084,39 @@ phase_video_rotation_setup() {
         else
             sudo sed -i "/^#include/i video_rotation = $RETROARCH_VIDEO_ROTATION" "$arcade_cfg"
         fi
-        log "Set video_allow_rotate=true, video_rotation=$RETROARCH_VIDEO_ROTATION in all/retroarch.cfg and arcade/retroarch.cfg; input_quit_gamepad_combo=4 (Start+Select) in all/retroarch.cfg"
+        # Makes the left analog stick also work as a digital d-pad for the
+        # arcade system specifically - needed for MAME's own in-game UI
+        # (including the custom Arcade Audio Mixer overlay's Left/Right
+        # boost adjustment and menu navigation, when ENABLE_MAME_CUSTOM_
+        # OVERLAY=true) to respond to stick input at all. Confirmed live:
+        # RetroArch's per-controller autoconfig binds a real D-pad/HAT to
+        # digital left/right (e.g. input_left_btn="h0left") but leaves the
+        # analog stick axes bound only to the *analog* RETRO_DEVICE_ANALOG
+        # inputs, not the digital retropad directions - and
+        # input_player*_analog_dpad_mode defaults to "0" (None), so without
+        # this, moving the stick produces no digital signal at all. MAME's
+        # own ioport-driven UI (IPT_UI_LEFT/RIGHT/UP/DOWN - used by both the
+        # stock in-game menu and the custom overlay) only ever sees digital
+        # retropad directions, so it's otherwise unreachable by the stick,
+        # even though RetroArch's own separate RGUI quick-menu navigates
+        # fine by stick already (it reads raw analog axes directly, an
+        # entirely different, core-independent code path). Scoped to this
+        # arcade-only config (not the global all/retroarch.cfg) since MAME
+        # ROMs are overwhelmingly digital-input hardware to begin with -
+        # enabling this only adds a redundant, harmless second way to move
+        # for arcade content, rather than affecting real analog gameplay on
+        # PSX/N64/etc. Set for players 1 and 2 to cover common two-player
+        # cabinets; higher player numbers are left alone.
+        for _p in 1 2; do
+            if grep -q "^input_player${_p}_analog_dpad_mode" "$arcade_cfg"; then
+                sudo sed -i "s|^input_player${_p}_analog_dpad_mode.*|input_player${_p}_analog_dpad_mode = \"1\"|" "$arcade_cfg"
+            else
+                sudo sed -i "/^#include/i input_player${_p}_analog_dpad_mode = \"1\"" "$arcade_cfg"
+            fi
+        done
+        log "Set video_allow_rotate=true, video_rotation=$RETROARCH_VIDEO_ROTATION, input_player1/2_analog_dpad_mode=1 (Left Analog) in arcade/retroarch.cfg; input_quit_gamepad_combo=4 (Start+Select) in all/retroarch.cfg"
     else
-        log_warn "arcade/retroarch.cfg not found yet - set video_allow_rotate/video_rotation in all/retroarch.cfg only; the arcade system will still inherit it via #include"
+        log_warn "arcade/retroarch.cfg not found yet - set video_allow_rotate/video_rotation in all/retroarch.cfg only; the arcade system will still inherit it via #include, but the analog-stick-as-dpad fix (arcade-only) will be skipped"
     fi
 
     # RGUI's own aspect-lock setting is separate from the content viewport
@@ -7077,79 +7107,66 @@ PYEOF
     return 0
 }
 
-# Per-game audio boost / stereo-mono tool for pi-arcade-setup's MAME
-# (lr-mame, mamearcade_libretro.so) games. Some boards are quiet even at
-# max in-game volume - this is the original arcade hardware's own
-# characteristic, accurately emulated, not a bug (MAME Testers #06521,
-# "Low sound volume in all Mortal Kombat games", resolution: no change
-# required). Rather than a live in-game overlay, this is a RetroPie menu
-# tool: pick a game from the list, set a dB boost and stereo/mono
-# toggle, and it's written straight into that ROM's own MAME cfg file
-# (roms/arcade/mame/cfg/<romname>.cfg) using the exact same
-# <mixer><sound_map>/<node_mapping>/<channel_mapping> schema MAME's own
-# live Audio Mixer menu (Select+X while playing -> Audio Mixer) writes
-# to - confirmed against the real save/load code in mamedev/mame's
-# src/emu/sound.cpp (sound_manager::config_save/config_load): a plain
-# node_mapping is a "full route" (all of a device's channels auto-mapped
-# to one host output, gain in "db"); a channel_mapping is an explicit
-# guest_channel -> node_channel route with its own "db" - used here to
-# force a stereo device's left+right channels to both host channels
-# equally (an explicit mono downmix), replacing the plain full route.
-# Only games that have already been launched at least once are editable
-# - MAME auto-writes cfg/<romname>.cfg (with the correct sound device
-# tag(s) for that specific driver, e.g. ":speaker" or ":mono" - verified
-# these vary per game live on this Pi) the first time a game runs, and
-# guessing a tag for a game that's never run risks silently doing
-# nothing. The stereo/mono toggle is a no-op (harmless) on games whose
-# board only ever had one audio channel to begin with (this covers the
-# actual Mortal Kombat titles - their cfg files already show a single
-# ":speaker" tag, i.e. already-mono hardware, so the toggle has nothing
-# to do there; it's only meaningful on genuinely stereo boards).
+# RetroPie-menu tool that ONLY configures which physical combo opens/closes
+# MAME's in-game Show/Hide Menu (IPT_UI_MENU/IPT_UI_CANCEL) - nothing else.
+# Historically this tool also had a per-game offline audio boost/stereo-mono
+# editor bolted on, but that's now redundant: when ENABLE_MAME_CUSTOM_OVERLAY
+# =true (the default - see that comment above, and step 4c/phase_mame_
+# arcade_overlay_build), the same Show/Hide Menu combo this tool configures
+# opens the custom in-game Arcade Audio Mixer overlay directly over the
+# paused game, which does the identical boost/stereo-mono job live, with
+# real-time dB feedback, no SSH or pre-launch requirement, and no per-game
+# guessing about sound-device tags. So this tool now does exactly one
+# thing: pick the combo. MAME's own stock default is Select+X to open,
+# Select+Start to cancel - but Select+Start is also this project's own
+# project-wide RetroArch quit-to-frontend shortcut (input_quit_gamepad_combo
+# =4, see phase_video_rotation_setup), so this installer defaults to L3+R3
+# instead (a single combo, held together, toggles the menu open and closed -
+# the same way MAME's own Show/Hide Menu input is designed to work). L3+R3
+# specifically (not L1+R1) because it's the only physical combo that means
+# the same thing on every game regardless of that driver's own button
+# profile - confirmed via src/osd/modules/input/input_retro.cpp: L3/R3 are
+# unconditionally bound to JOYCODE_1_BUTTON7/BUTTON8 regardless of profile,
+# where L1/R1 share physical slots with ordinary numbered gameplay buttons
+# that shift meaning per-game. Written into roms/arcade/mame/cfg/
+# default.cfg - confirmed against MAME's own source
+# (ioport_manager::save_default_inputs/load_config in src/emu/ioport.cpp,
+# and the JOYCODE token format in input_manager::code_to_token/
+# seq_from_tokens in src/emu/input.cpp) and live: writing this combo and
+# launching a game produces a clean run with no "Dropping invalid input
+# token" warning, and MAME re-saves the identical binding back out on exit.
 phase_mame_mixer_hotkey_tool() {
     mkdir -p "$PI_HOME/scripts"
     tee "$PI_HOME/scripts/mame-mixer-hotkey.py" >/dev/null <<PYEOF
 #!/usr/bin/env python3
 """
-MAME Audio Mixer Hotkey - per-game audio boost / stereo-mono tool, and the
-in-game MAME menu hotkey toggle, for pi-arcade-setup. Run from the
-RetroPie menu ("MAME Audio Mixer Hotkey") or directly:
+MAME Audio Mixer Hotkey - configures which controller combo opens/closes
+MAME's in-game Show/Hide Menu, for pi-arcade-setup. Run from the RetroPie
+menu ("MAME Audio Mixer Hotkey") or directly:
     python3 mame-mixer-hotkey.py
 
-Top row: toggles the combo used to open/close MAME's own internal menu
-while a game is running (its "Slider Controls"/Audio Mixer submenu is
-what MAME's own live per-game volume/mixer adjustment actually lives
-in). MAME's stock combo for this is Select+X to open, Select+Start to
-cancel - but Select+Start is also this project's own project-wide
-RetroArch quit-to-frontend shortcut, so this installer sets it to L3+R3
-by default instead (a single button held together toggles the menu
-open and closed, the same way MAME's own "Show/Hide Menu" input is
-designed to work) - this row lets you switch back to the stock combo,
-or back to L3+R3, at any time. Written into roms/arcade/mame/cfg/
-default.cfg - confirmed against MAME's own source
-(ioport_manager::save_default_inputs/load_config in src/emu/ioport.cpp,
-and the JOYCODE token format in input_manager::code_to_token/
-seq_from_tokens in src/emu/input.cpp) and live: writing this combo and
-launching a game produces a clean run with no "Dropping invalid input
-token" warning, and MAME re-saves the identical binding back out on
-exit. L3+R3 specifically (not L1+R1) because it's the only physical
-combo that means the same thing on every game regardless of that
-driver's own button profile - confirmed via input_retro.cpp.
+This is a hotkey selector only. With the custom in-game Arcade Audio Mixer
+overlay enabled (ENABLE_MAME_CUSTOM_OVERLAY=true, the default), the exact
+same combo this tool sets also opens that overlay directly over the paused
+game - Audio Boost and Stereo/Mono live there now, with real-time feedback,
+rather than in an offline per-game editor here. See install.sh's
+ENABLE_MAME_CUSTOM_OVERLAY comment and phase_mame_arcade_overlay_build for
+the overlay itself.
 
-Everything else in the list: pick a game, set a dB boost (-96 to +12,
-MAME's own Audio Mixer range) and a stereo/mono toggle, written into
-that ROM's own MAME cfg file (roms/arcade/mame/cfg/<romname>.cfg) - the
-exact same file and XML schema MAME's own live Audio Mixer menu uses,
-confirmed against sound_manager::config_save/config_load in
-mamedev/mame's src/emu/sound.cpp. Effects are scoped to that one game
-only - MAME's own per-driver cfg file mechanism, nothing this tool has
-to enforce itself. Only games with an existing cfg file (i.e. launched
-at least once) are editable - that's the only way to know the correct
-sound device tag(s) for that specific driver without guessing
-(confirmed live: it varies, e.g. ":speaker" vs ":mono" across different
-games on this exact Pi).
+MAME's stock combo is Select+X to open, Select+Start to cancel - but
+Select+Start is also this project's own quit-to-frontend shortcut, so this
+installer defaults to L3+R3 instead (a single combo, held together, toggles
+the menu open and closed). This tool switches between the two at any time.
+Written into roms/arcade/mame/cfg/default.cfg - confirmed against MAME's
+own source (ioport_manager::save_default_inputs/load_config in
+src/emu/ioport.cpp, and the JOYCODE token format in
+input_manager::code_to_token/seq_from_tokens in src/emu/input.cpp) and
+live: writing this combo and launching a game produces a clean run with no
+"Dropping invalid input token" warning, and MAME re-saves the identical
+binding back out on exit - proof it round-tripped through MAME's real
+load/save path, not just tolerated by the XML parser.
 """
 import curses
-import glob
 import os
 import select
 import shutil
@@ -7160,48 +7177,19 @@ import xml.etree.ElementTree as ET
 ROMS_DIR = "$PI_HOME/RetroPie/roms/arcade"
 CFG_DIR = os.path.join(ROMS_DIR, "mame", "cfg")
 DEFAULT_CFG_PATH = os.path.join(CFG_DIR, "default.cfg")
-DB_MIN, DB_MAX, DB_STEP = -96.0, 12.0, 1.0
-MONO_COMPENSATION_DB = 6.0  # summing two full-level channels into one needs ~-6dB to avoid clipping
 
-# The combo used to open/close MAME's own internal menu (Show/Hide Menu,
-# IPT_UI_MENU) and to back all the way out of it (IPT_UI_CANCEL). L3+R3
-# is the only choice that's consistent across every game regardless of
-# its own button layout - confirmed by reading input_retro.cpp: L3/R3
-# are unconditionally bound to ITEM_ID_BUTTON7/BUTTON8 (JOYCODE_1_BUTTON7/8)
-# no matter what per-game button *profile* is active, whereas L1/R1 (which
-# would otherwise be the obvious alternative) share physical slots with
-# ordinary numbered gameplay buttons (BUTTON5/6) that shift meaning
-# per-game depending on that driver's own profile - not safe to reuse
-# here. MAME's own stock default for both of these is Select+X (open)
-# and Select+Start (cancel) - the same Select+Start this project already
-# uses, project-wide, as the RetroArch quit-to-frontend shortcut
-# (input_quit_gamepad_combo=4), so leaving the stock combo in place risks
-# Select+Start doing the wrong thing depending on which one sees the
-# press first. Verified against MAME's own source
-# (sound_manager::config_save/config_load equivalent for input -
-# ioport_manager::save_default_inputs/load_config in src/emu/ioport.cpp,
-# and the JOYCODE token format in input_manager::code_to_token/
-# seq_from_tokens in src/emu/input.cpp) and confirmed live: writing this
-# into default.cfg and launching a game produces a clean run with no
-# "Dropping invalid input token" warning (MAME's own diagnostic for a
-# bad cfg token), and MAME re-saves the exact same binding back out on
-# exit - proof it round-tripped through MAME's real load/save path, not
-# just tolerated by the XML parser.
-MENU_HOTKEY_TOKEN = "JOYCODE_1_BUTTON7 JOYCODE_1_BUTTON8"  # L3+R3
+# L3+R3 - see the phase's own comment above for why this combo specifically.
+MENU_HOTKEY_TOKEN = "JOYCODE_1_BUTTON7 JOYCODE_1_BUTTON8"
 
 JS_DEVICE = "/dev/input/js0"
 JS_EVENT_INIT = 0x80
 JS_EVENT_BUTTON = 0x01
-JS_EVENT_AXIS = 0x02
 EVENT_FORMAT = "IhBB"
 EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
-AXIS_THRESHOLD = 16000
 BTN_CONFIRM = $BTN_X       # X / Cross / A - same role as the rest of the RetroPie menu
 BTN_BACK = $BTN_CIRCLE     # Circle / B - same role as the rest of the RetroPie menu
 
-COL_HEADER, COL_LABEL, COL_HINT, COL_GOOD, COL_DIM, COL_SEL = 1, 2, 3, 4, 5, 6
-
-MENU_HOTKEY_ROW = "__menu_hotkey__"
+COL_HEADER, COL_LABEL, COL_HINT, COL_GOOD = 1, 2, 3, 4
 
 
 def load_default_cfg():
@@ -7288,109 +7276,6 @@ def set_menu_hotkey_mode(mode):
     write_default_cfg(tree)
 
 
-def list_roms():
-    names = set()
-    if os.path.isdir(ROMS_DIR):
-        for ext in ("*.zip", "*.7z", "*.chd"):
-            for p in glob.glob(os.path.join(ROMS_DIR, ext)):
-                names.add(os.path.splitext(os.path.basename(p))[0])
-    return sorted(names)
-
-
-def cfg_path(shortname):
-    return os.path.join(CFG_DIR, shortname + ".cfg")
-
-
-def load_cfg(shortname):
-    """Returns (tree, sound_map_elems) or None if there's no usable cfg
-    yet (game never launched, or cfg has no sound_map to key off)."""
-    path = cfg_path(shortname)
-    if not os.path.isfile(path):
-        return None
-    try:
-        tree = ET.parse(path)
-    except ET.ParseError:
-        return None
-    system = tree.getroot().find("system")
-    if system is None:
-        return None
-    mixer = system.find("mixer")
-    if mixer is None:
-        return None
-    sound_maps = mixer.findall("sound_map")
-    if not sound_maps:
-        return None
-    return tree, sound_maps
-
-
-def get_state(shortname):
-    """Returns (boost_db, mono, editable)."""
-    loaded = load_cfg(shortname)
-    if loaded is None:
-        return 0.0, False, False
-    _tree, sound_maps = loaded
-    boost, mono = 0.0, False
-    for sm in sound_maps:
-        cmaps = sm.findall("channel_mapping")
-        nmaps = sm.findall("node_mapping")
-        if cmaps:
-            mono = True
-            try:
-                boost = round(float(cmaps[0].get("db", "0")) + MONO_COMPENSATION_DB, 1)
-            except ValueError:
-                boost = 0.0
-        elif nmaps:
-            try:
-                boost = round(float(nmaps[0].get("db", "0")), 1)
-            except ValueError:
-                boost = 0.0
-    return boost, mono, True
-
-
-def save_state(shortname, boost_db, mono):
-    loaded = load_cfg(shortname)
-    if loaded is None:
-        return False
-    tree, sound_maps = loaded
-    for sm in sound_maps:
-        for child in list(sm):
-            sm.remove(child)
-        if mono:
-            comp_db = round(boost_db - MONO_COMPENSATION_DB, 6)
-            for guest in (0, 1):
-                for node_channel in (0, 1):
-                    cmap = ET.SubElement(sm, "channel_mapping")
-                    cmap.set("guest_channel", str(guest))
-                    cmap.set("node", "")
-                    cmap.set("node_channel", str(node_channel))
-                    cmap.set("db", f"{comp_db:.6f}")
-        else:
-            nmap = ET.SubElement(sm, "node_mapping")
-            nmap.set("node", "")
-            nmap.set("db", f"{boost_db:.6f}")
-    try:
-        ET.indent(tree, space="    ")
-    except Exception:
-        pass
-    path = cfg_path(shortname)
-    try:
-        if os.path.exists(path):
-            shutil.copy2(path, path + ".bak")
-    except OSError:
-        pass
-    body = ET.tostring(tree.getroot(), encoding="unicode")
-    content = (
-        "﻿<?xml version=\\"1.0\\"?>\n"
-        "<!-- This file is autogenerated; comments and unknown tags will be stripped -->\n"
-        + body + "\n"
-    )
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(content)
-    os.replace(tmp, path)
-    return True
-
-
 def open_joystick():
     try:
         return open(JS_DEVICE, "rb")
@@ -7412,164 +7297,60 @@ def safe_addstr(win, y, x, text, attr=0):
             pass
 
 
-class InputPoller:
-    """Shared controller+keyboard polling: up/down/left/right/confirm/back,
-    press-edge only (no repeat-while-held spam) - same approach as the
-    rest of this project's controller-navigable RetroPie menu tools."""
+def poll(stdscr, js_file, button_state, timeout=0.15):
+    """confirm/back only - press-edge, no repeat-while-held spam."""
+    fds = [sys.stdin] + ([js_file] if js_file is not None else [])
+    try:
+        ready, _, _ = select.select(fds, [], [], timeout)
+    except (OSError, ValueError):
+        ready = []
 
-    def __init__(self):
-        self.js_file = open_joystick()
-        self.axis_state = {}
-        self.button_state = {}
+    if js_file is not None and js_file in ready:
+        data = js_file.read(EVENT_SIZE)
+        if data and len(data) == EVENT_SIZE:
+            _t, value, typ, number = struct.unpack(EVENT_FORMAT, data)
+            is_init = bool(typ & JS_EVENT_INIT)
+            typ &= ~JS_EVENT_INIT
+            if not is_init and typ == JS_EVENT_BUTTON and number in (BTN_CONFIRM, BTN_BACK):
+                was_held = button_state.get(number, False)
+                button_state[number] = bool(value)
+                if value == 1 and not was_held:
+                    return "confirm" if number == BTN_CONFIRM else "back"
 
-    def close(self):
-        if self.js_file is not None:
-            self.js_file.close()
-
-    def poll(self, stdscr, timeout=0.15):
-        fds = [sys.stdin] + ([self.js_file] if self.js_file is not None else [])
-        try:
-            ready, _, _ = select.select(fds, [], [], timeout)
-        except (OSError, ValueError):
-            ready = []
-
-        if self.js_file is not None and self.js_file in ready:
-            data = self.js_file.read(EVENT_SIZE)
-            if data and len(data) == EVENT_SIZE:
-                _t, value, typ, number = struct.unpack(EVENT_FORMAT, data)
-                is_init = bool(typ & JS_EVENT_INIT)
-                typ &= ~JS_EVENT_INIT
-                if not is_init:
-                    if typ == JS_EVENT_BUTTON and number in (BTN_CONFIRM, BTN_BACK):
-                        was_held = self.button_state.get(number, False)
-                        self.button_state[number] = bool(value)
-                        if value == 1 and not was_held:
-                            return "confirm" if number == BTN_CONFIRM else "back"
-                    elif typ == JS_EVENT_AXIS and number in (0, 1):
-                        past = abs(value) > AXIS_THRESHOLD
-                        was_past = self.axis_state.get(number, False)
-                        self.axis_state[number] = past
-                        if past and not was_past:
-                            if number == 1:
-                                return "down" if value > 0 else "up"
-                            return "right" if value > 0 else "left"
-
-        if sys.stdin in ready:
-            ch = stdscr.getch()
-            if ch == curses.KEY_UP:
-                return "up"
-            if ch == curses.KEY_DOWN:
-                return "down"
-            if ch == curses.KEY_LEFT:
-                return "left"
-            if ch == curses.KEY_RIGHT:
-                return "right"
-            if ch in (10, 13, ord(" ")):
-                return "confirm"
-            if ch in (27, ord("q"), ord("Q")):
-                return "back"
-        return None
+    if sys.stdin in ready:
+        ch = stdscr.getch()
+        if ch in (10, 13, ord(" ")):
+            return "confirm"
+        if ch in (27, ord("q"), ord("Q")):
+            return "back"
+    return None
 
 
-def build_row_list():
-    """Row 0 is always the menu-hotkey toggle; the rest are ROMs."""
-    hotkey_label = "Menu Hotkey: L3+R3" if get_menu_hotkey_mode() == "l3r3" else "Menu Hotkey: Stock (Select+X / Select+Start)"
-    rows = [(MENU_HOTKEY_ROW, hotkey_label, True)]
-    for name in list_roms():
-        rows.append((name, name, get_state(name)[2]))
-    return rows
-
-
-def draw_list(win, rows, sel, scroll):
+def draw(win):
     win.erase()
     h, w = win.getmaxyx()
     title = " MAME AUDIO MIXER HOTKEY "
     safe_addstr(win, 1, cx(win, title), title, curses.color_pair(COL_HEADER) | curses.A_BOLD)
 
-    visible_rows = h - 6
-    if sel < scroll:
-        scroll = sel
-    elif sel >= scroll + visible_rows:
-        scroll = sel - visible_rows + 1
-    for i in range(scroll, min(len(rows), scroll + visible_rows)):
-        key, label, editable = rows[i]
-        y = 3 + (i - scroll)
-        sel_attr = curses.A_REVERSE if i == sel else 0
-        if key == MENU_HOTKEY_ROW:
-            attr = curses.color_pair(COL_GOOD) | curses.A_BOLD | sel_attr
-        elif editable:
-            attr = curses.color_pair(COL_LABEL) | sel_attr
-        else:
-            label = f"{label}  (launch once first)"
-            attr = curses.color_pair(COL_DIM) | sel_attr
-        safe_addstr(win, y, 4, label, attr)
-        if key == MENU_HOTKEY_ROW:
-            safe_addstr(win, y + 1, 4, "-" * min(w - 8, 60), curses.color_pair(COL_DIM))
+    mode = get_menu_hotkey_mode()
+    label = "L3 + R3" if mode == "l3r3" else "Select + X  (cancel: Select + Start)"
+    other = "Select + X / Select + Start" if mode == "l3r3" else "L3 + R3"
 
-    footer = "UP/DOWN: select   X: edit/toggle   Circle/B: exit"
+    mid = h // 2
+    line1 = "Show/Hide Menu combo:"
+    line2 = label
+    safe_addstr(win, mid - 2, cx(win, line1), line1, curses.color_pair(COL_LABEL) | curses.A_BOLD)
+    safe_addstr(win, mid - 1, cx(win, line2), line2, curses.color_pair(COL_GOOD) | curses.A_BOLD | curses.A_REVERSE)
+
+    note = "This is what opens the in-game Arcade Audio Mixer overlay"
+    safe_addstr(win, mid + 1, cx(win, note), note, curses.color_pair(COL_HINT))
+
+    hint = f"X: switch to {other}"
+    safe_addstr(win, mid + 3, cx(win, hint), hint, curses.color_pair(COL_LABEL))
+
+    footer = "X: toggle combo   Circle/B: exit"
     safe_addstr(win, h - 2, cx(win, footer), footer, curses.color_pair(COL_HINT))
     win.refresh()
-    return scroll
-
-
-def draw_editor(win, name, boost_db, mono, field, dirty):
-    win.erase()
-    h, w = win.getmaxyx()
-    title = f" {name} "
-    safe_addstr(win, 1, cx(win, title), title, curses.color_pair(COL_HEADER) | curses.A_BOLD)
-
-    top = h // 2 - 5
-    rows = [
-        ("Audio Boost", f"{boost_db:+.1f} dB"),
-        ("Stereo", "ON" if not mono else "OFF (forced mono)"),
-        ("Save", ""),
-        ("Cancel", ""),
-    ]
-    for i, (label, value) in enumerate(rows):
-        y = top + i * 2
-        sel_attr = curses.A_REVERSE if i == field else 0
-        safe_addstr(win, y, cx(win, f"{label:<12}{value}"), f"{label:<12}{value}",
-                    curses.color_pair(COL_LABEL) | sel_attr | curses.A_BOLD)
-
-    if dirty:
-        msg = "unsaved changes"
-        safe_addstr(win, top + len(rows) * 2 + 1, cx(win, msg), msg, curses.color_pair(COL_HINT))
-
-    footer = "UP/DOWN: field   LEFT/RIGHT: adjust   X: activate   Circle/B: back"
-    safe_addstr(win, h - 2, cx(win, footer), footer, curses.color_pair(COL_HINT))
-    win.refresh()
-
-
-def edit_game(stdscr, poller, name):
-    boost_db, mono, _editable = get_state(name)
-    orig = (boost_db, mono)
-    field = 0
-    while True:
-        dirty = (boost_db, mono) != orig
-        draw_editor(stdscr, name, boost_db, mono, field, dirty)
-        action = poller.poll(stdscr)
-        if action is None:
-            continue
-        if action == "back":
-            return
-        if action == "up":
-            field = (field - 1) % 4
-        elif action == "down":
-            field = (field + 1) % 4
-        elif action == "left" and field == 0:
-            boost_db = max(DB_MIN, round(boost_db - DB_STEP, 1))
-        elif action == "right" and field == 0:
-            boost_db = min(DB_MAX, round(boost_db + DB_STEP, 1))
-        elif (action in ("left", "right")) and field == 1:
-            mono = not mono
-        elif action == "confirm":
-            if field == 1:
-                mono = not mono
-            elif field == 2:
-                save_state(name, boost_db, mono)
-                return
-            elif field == 3:
-                return
 
 
 def run(stdscr):
@@ -7580,37 +7361,25 @@ def run(stdscr):
     curses.init_pair(COL_LABEL, curses.COLOR_CYAN, -1)
     curses.init_pair(COL_HINT, curses.COLOR_YELLOW, -1)
     curses.init_pair(COL_GOOD, curses.COLOR_GREEN, -1)
-    curses.init_pair(COL_DIM, curses.COLOR_WHITE, -1)
-    curses.init_pair(COL_SEL, curses.COLOR_GREEN, -1)
     stdscr.nodelay(True)
     stdscr.keypad(True)
 
-    poller = InputPoller()
+    js_file = open_joystick()
+    button_state = {}
     try:
-        sel, scroll = 0, 0
         while True:
-            rows = build_row_list()
-            if sel >= len(rows):
-                sel = max(0, len(rows) - 1)
-            scroll = draw_list(stdscr, rows, sel, scroll)
-            action = poller.poll(stdscr)
+            draw(stdscr)
+            action = poll(stdscr, js_file, button_state)
             if action is None:
                 continue
             if action == "back":
                 break
-            elif action == "up" and rows:
-                sel = (sel - 1) % len(rows)
-            elif action == "down" and rows:
-                sel = (sel + 1) % len(rows)
-            elif action == "confirm" and rows:
-                key, _label, editable = rows[sel]
-                if key == MENU_HOTKEY_ROW:
-                    new_mode = "stock" if get_menu_hotkey_mode() == "l3r3" else "l3r3"
-                    set_menu_hotkey_mode(new_mode)
-                elif editable:
-                    edit_game(stdscr, poller, key)
+            if action == "confirm":
+                new_mode = "stock" if get_menu_hotkey_mode() == "l3r3" else "l3r3"
+                set_menu_hotkey_mode(new_mode)
     finally:
-        poller.close()
+        if js_file is not None:
+            js_file.close()
 
 
 def main():
@@ -7666,7 +7435,7 @@ open(path, "w").write(new_text)
 print("[mamemixerhotkey] wired into retropiemenu.sh")
 PYEOF
     fi
-    log "MAME Audio Mixer Hotkey installed - MAME's internal-menu combo defaults to L3+R3 (avoids the Select+Start clash with this project's quit-to-frontend shortcut); run it from the RetroPie menu ('MAME Audio Mixer Hotkey') to switch that back to stock, or to set a per-game audio boost (dB) and stereo/mono toggle for any arcade ROM that's been launched at least once"
+    log "MAME Audio Mixer Hotkey installed - a hotkey selector only: MAME's internal Show/Hide Menu combo defaults to L3+R3 (avoids the Select+Start clash with this project's quit-to-frontend shortcut). Run it from the RetroPie menu ('MAME Audio Mixer Hotkey') to switch that back to stock (Select+X / Select+Start) or back to L3+R3 at any time. With ENABLE_MAME_CUSTOM_OVERLAY=true (the default), this same combo opens the custom in-game Arcade Audio Mixer overlay directly, where boost/stereo-mono are set live, in-game, per ROM - see phase_mame_arcade_overlay_build."
     return 0
 }
 
