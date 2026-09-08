@@ -142,6 +142,35 @@ OC_OVER_VOLTAGE="${OC_OVER_VOLTAGE:-6}" # +0.025V per step; 6 = +0.15V, needed f
 # a comma-separated list of RetroPie-Setup package ids.
 EMULATOR_CORES="${EMULATOR_CORES:-lr-snes9x,lr-pcsx-rearmed,ppsspp,lr-fceumm,lr-gambatte,lr-genesis-plus-gx,lr-nestopia,lr-picodrive,mupen64plus}"
 
+# --- MAME custom in-game audio overlay ---------------------------------------
+# When true (default), this builds lr-mame from full source with a custom
+# patch instead of installing RetroPie's stock lr-mame binary. The patch adds
+# a RetroArch-Quick-Menu-styled overlay, opened directly by the Show/Hide Menu
+# hotkey (in-game, over the paused ROM - press it again to close, same as
+# RetroArch), with two controls that work for every arcade ROM (not a fixed
+# per-game list): a uniform Audio Boost (-96..+12dB, using MAME's own live
+# sound_manager mixer routing API - the same one the stock Audio Mixer menu
+# uses) and a Stereo/Mono toggle that forces a true mono downmix when the
+# ROM's emulated sound hardware supports it (auto-detected per game from its
+# actual sound_io_device topology at runtime - single stereo speaker, split
+# L/R speaker boards, or mono-only), and falls back to boost-only otherwise.
+# All changes save automatically per-game via MAME's existing configuration
+# save on exit, same as the stock menu.
+#
+# This is a genuinely large build: compiling MAME's full SUBTARGET=arcade
+# target from source on a Pi 4 takes roughly 12 hours and pushes the board
+# through sustained heavy memory pressure (confirmed safe on an 8GB Pi 4 with
+# swap enabled, but SSH and other services can become briefly unresponsive
+# under load during the heaviest files). It is scripted end-to-end (adds
+# temporary swap via RetroPie-Setup's own rpSwap mechanism, same as the
+# lr-mame scriptmodule's own build path) and requires no manual intervention,
+# but budget the time before running with this enabled.
+#
+# Set to false to skip all of this and install RetroPie's stock lr-mame
+# binary instead (fast, but no in-game overlay - just MAME's normal nested
+# menu tree via the Show/Hide Menu hotkey).
+ENABLE_MAME_CUSTOM_OVERLAY="${ENABLE_MAME_CUSTOM_OVERLAY:-true}"
+
 # --- Dreamcast (Flycast) -----------------------------------------------------
 # Redream (the other well-known Dreamcast emulator) has no real aarch64 Linux
 # build - its public source only targets x86_64, the Raspberry Pi/"premium"
@@ -393,6 +422,7 @@ OC_ARM_FREQ=$OC_ARM_FREQ
 OC_GPU_FREQ=$OC_GPU_FREQ
 OC_OVER_VOLTAGE=$OC_OVER_VOLTAGE
 EMULATOR_CORES=$EMULATOR_CORES
+ENABLE_MAME_CUSTOM_OVERLAY=$ENABLE_MAME_CUSTOM_OVERLAY
 ENABLE_DREAMCAST=$ENABLE_DREAMCAST
 APPLY_GCC14_CFLAGS_PATCH=$APPLY_GCC14_CFLAGS_PATCH
 APPLY_RETROARCH_MENU_ROTATION_PATCH=$APPLY_RETROARCH_MENU_ROTATION_PATCH
@@ -781,8 +811,12 @@ phase_gcc14_cflags_patch() {
 
 phase_emulators_install() {
     cd "$PI_HOME/RetroPie-Setup" || die "RetroPie-Setup missing"
-    log "Installing MAME (lr-mame)"
-    sudo ./retropie_packages.sh lr-mame _binary_ || die "lr-mame install failed"
+    if [ "$ENABLE_MAME_CUSTOM_OVERLAY" = "true" ]; then
+        log "Skipping stock lr-mame binary install - ENABLE_MAME_CUSTOM_OVERLAY=true, a source build with the custom in-game overlay happens in a later phase instead"
+    else
+        log "Installing MAME (lr-mame)"
+        sudo ./retropie_packages.sh lr-mame _binary_ || die "lr-mame install failed"
+    fi
 
     local core sys
     IFS=',' read -ra cores <<< "$EMULATOR_CORES"
@@ -802,6 +836,695 @@ phase_emulators_install() {
     for sys in snes psx psp arcade nes gb gbc megadrive n64 dreamcast; do
         mkdir -p "$PI_HOME/RetroPie/roms/$sys"
     done
+    return 0
+}
+
+# Writes the two new MAME UI source files for the custom in-game overlay
+# (see ENABLE_MAME_CUSTOM_OVERLAY above for the full design rationale) into
+# a freshly-cloned lr-mame source checkout, then patches ui.cpp (the hotkey
+# hook - jump straight to our overlay instead of MAME's normal nested main
+# menu, exactly like RetroArch's own Quick Menu) and frontend.lua (registers
+# the two new files with MAME's own build system) - both patches are
+# idempotent and anchor-checked, matching every other source patch in this
+# script (see _apply_flycast_libzip_patch above for the same pattern).
+_apply_mame_arcade_overlay_patch() {
+    local mame_src_dir="$1"
+    mkdir -p "$mame_src_dir/src/frontend/mame/ui"
+
+    cat > "$mame_src_dir/src/frontend/mame/ui/arcadeoverlay.h" <<'CPPHEOF'
+// license:BSD-3-Clause
+// copyright-holders:pi-arcade-setup
+/*********************************************************************
+
+    ui/arcadeoverlay.h
+
+    RetroArch Quick-Menu-styled in-game overlay for arcade titles.
+
+    Provides two controls that act on every emulated sound output
+    device the running game has (so it works for whatever audio chip
+    that particular ROM emulates, not a fixed per-game list):
+
+      * Audio Boost   - a uniform +/-dB gain applied on top of MAME's
+                         normal mixer routing (-96..+12 dB, 1 dB step,
+                         0.1 dB with Shift, 10 dB with Ctrl, matching
+                         MAME's own Audio Mixer menu conventions).
+      * Stereo/Mono   - when the game's output layout allows it, forces
+                         a true mono downmix (both channels summed,
+                         each attenuated 6 dB to avoid clipping) or
+                         restores normal stereo routing.
+
+    The overlay is opened directly (bypassing MAME's normal nested
+    main menu) by the configurable Show/Hide Menu hotkey, so pressing
+    it behaves like RetroArch's own Quick Menu: one press opens this
+    screen over the paused game, the same press again closes it and
+    resumes play exactly where it left off. All changes take effect
+    immediately and are saved automatically per-game by MAME's
+    existing "Save Configuration" on exit (mame_saves=game), the same
+    mechanism the stock Audio Mixer menu relies on.
+
+*********************************************************************/
+
+#ifndef MAME_FRONTEND_UI_ARCADEOVERLAY_H
+#define MAME_FRONTEND_UI_ARCADEOVERLAY_H
+
+#pragma once
+
+#include "ui/menu.h"
+
+#include <vector>
+
+class sound_io_device;
+
+namespace ui {
+
+class menu_arcade_overlay : public menu
+{
+public:
+	menu_arcade_overlay(mame_ui_manager &mui, render_target &target);
+	virtual ~menu_arcade_overlay() override;
+
+protected:
+	virtual void menu_activated() override;
+	virtual void menu_deactivated() override;
+	virtual void populate() override;
+	virtual bool handle(event const *ev) override;
+	virtual void custom_render(uint32_t flags, void *selectedref, float top, float bottom, float origx1, float origy1, float origx2, float origy2) override;
+	virtual void recompute_metrics(uint32_t width, uint32_t height, float aspect) override;
+
+private:
+	enum : uintptr_t
+	{
+		ITM_BOOST = 1,
+		ITM_STEREO,
+		ITM_RESET,
+		ITM_FULL_MENU
+	};
+
+	// how this game's sound output devices are laid out, decided once
+	// per activation by scanning machine().sound().get_mappings()
+	enum class layout_type
+	{
+		NONE,           // no output devices - overlay shows a message only
+		SINGLE_MULTI,   // one output device, >= 2 guest channels (typical stereo speaker)
+		SINGLE_MONO,    // one output device, 1 guest channel (already mono at emulation level)
+		SPLIT_STEREO,   // exactly two output devices, 1 guest channel each (separate L/R speakers)
+		OTHER           // anything else - boost only, stereo toggle unavailable
+	};
+
+	float m_boost_db;
+	bool m_stereo;
+	bool m_stereo_available;
+	layout_type m_layout;
+	std::vector<sound_io_device *> m_out_devs;
+
+	void scan_devices();
+	void read_current_state();
+	void apply_boost();
+	void apply_stereo(bool stereo);
+	void clear_all_routes(sound_io_device *dev);
+	std::string find_node_name(uint32_t node) const;
+};
+
+} // namespace ui
+
+#endif // MAME_FRONTEND_UI_ARCADEOVERLAY_H
+CPPHEOF
+
+    cat > "$mame_src_dir/src/frontend/mame/ui/arcadeoverlay.cpp" <<'CPPCPPEOF'
+// license:BSD-3-Clause
+// copyright-holders:pi-arcade-setup
+/*********************************************************************
+
+    ui/arcadeoverlay.cpp
+
+    RetroArch Quick-Menu-styled in-game overlay: per-game audio boost
+    and stereo/mono toggle. See arcadeoverlay.h for the full design
+    rationale.
+
+*********************************************************************/
+
+#include "emu.h"
+#include "ui/arcadeoverlay.h"
+
+// frontend
+#include "ui/mainmenu.h"
+#include "ui/ui.h"
+
+// emu
+#include "input.h"
+#include "speaker.h"
+
+// osd
+#include "osdepend.h"
+
+#include <algorithm>
+
+
+namespace ui {
+
+menu_arcade_overlay::menu_arcade_overlay(mame_ui_manager &mui, render_target &target)
+	: menu(mui, target)
+	, m_boost_db(0.0f)
+	, m_stereo(true)
+	, m_stereo_available(false)
+	, m_layout(layout_type::NONE)
+{
+	set_heading(_("menu-arcadeoverlay", "Arcade Audio Mixer"));
+}
+
+menu_arcade_overlay::~menu_arcade_overlay()
+{
+}
+
+
+//-------------------------------------------------
+//  menu_activated / menu_deactivated
+//-------------------------------------------------
+
+void menu_arcade_overlay::menu_activated()
+{
+	// re-scan every time the overlay is (re)shown - the running game's
+	// mixer state may have changed since we were last on screen
+	scan_devices();
+	read_current_state();
+	reset(reset_options::REMEMBER_POSITION);
+}
+
+void menu_arcade_overlay::menu_deactivated()
+{
+}
+
+
+//-------------------------------------------------
+//  scan_devices - classify this game's sound
+//  output layout
+//-------------------------------------------------
+
+void menu_arcade_overlay::scan_devices()
+{
+	m_out_devs.clear();
+	for (const auto &omap : machine().sound().get_mappings())
+		if (omap.m_dev && omap.m_dev->is_output())
+			m_out_devs.push_back(omap.m_dev);
+
+	if (m_out_devs.empty())
+	{
+		m_layout = layout_type::NONE;
+		m_stereo_available = false;
+	}
+	else if (m_out_devs.size() == 1)
+	{
+		if (m_out_devs[0]->inputs() >= 2)
+		{
+			m_layout = layout_type::SINGLE_MULTI;
+			m_stereo_available = true;
+		}
+		else
+		{
+			m_layout = layout_type::SINGLE_MONO;
+			m_stereo_available = false;
+		}
+	}
+	else if (m_out_devs.size() == 2 && m_out_devs[0]->inputs() == 1 && m_out_devs[1]->inputs() == 1)
+	{
+		m_layout = layout_type::SPLIT_STEREO;
+		m_stereo_available = true;
+	}
+	else
+	{
+		m_layout = layout_type::OTHER;
+		m_stereo_available = false;
+	}
+}
+
+
+//-------------------------------------------------
+//  read_current_state - initialise the displayed
+//  boost/stereo values from the live mixer state
+//-------------------------------------------------
+
+void menu_arcade_overlay::read_current_state()
+{
+	m_boost_db = 0.0f;
+	m_stereo = true;
+
+	if (m_out_devs.empty())
+		return;
+
+	sound_io_device *const dev = m_out_devs[0];
+	for (const auto &omap : machine().sound().get_mappings())
+	{
+		if (omap.m_dev != dev)
+			continue;
+
+		if (!omap.m_node_mappings.empty())
+		{
+			m_boost_db = omap.m_node_mappings.front().m_db;
+			m_stereo = true;
+		}
+		else if (!omap.m_channel_mappings.empty())
+		{
+			if (m_layout == layout_type::SPLIT_STEREO && omap.m_channel_mappings.size() == 1)
+			{
+				m_boost_db = omap.m_channel_mappings.front().m_db;
+				m_stereo = true;
+			}
+			else
+			{
+				// our own mono downmix always writes at boost_db - 6 dB
+				m_boost_db = omap.m_channel_mappings.front().m_db + 6.0f;
+				m_stereo = false;
+			}
+		}
+		break;
+	}
+}
+
+
+//-------------------------------------------------
+//  find_node_name
+//-------------------------------------------------
+
+std::string menu_arcade_overlay::find_node_name(uint32_t node) const
+{
+	const auto &info = machine().sound().get_osd_info();
+	for (const auto &n : info.m_nodes)
+		if (n.m_id == node)
+			return n.name();
+	return "";
+}
+
+
+//-------------------------------------------------
+//  clear_all_routes - remove every route (full or
+//  per-channel) currently configured for a device
+//-------------------------------------------------
+
+void menu_arcade_overlay::clear_all_routes(sound_io_device *dev)
+{
+	for (;;)
+	{
+		bool changed = false;
+		for (const auto &omap : machine().sound().get_mappings())
+		{
+			if (omap.m_dev != dev)
+				continue;
+
+			if (!omap.m_node_mappings.empty())
+			{
+				const auto &nmap = omap.m_node_mappings.front();
+				if (nmap.m_is_system_default)
+					machine().sound().config_remove_sound_io_connection_default(dev);
+				else
+					machine().sound().config_remove_sound_io_connection_node(dev, find_node_name(nmap.m_node));
+				changed = true;
+			}
+			else if (!omap.m_channel_mappings.empty())
+			{
+				const auto &cmap = omap.m_channel_mappings.front();
+				if (cmap.m_is_system_default)
+					machine().sound().config_remove_sound_io_channel_connection_default(dev, cmap.m_guest_channel, cmap.m_node_channel);
+				else
+					machine().sound().config_remove_sound_io_channel_connection_node(dev, cmap.m_guest_channel, find_node_name(cmap.m_node), cmap.m_node_channel);
+				changed = true;
+			}
+			break;
+		}
+		if (!changed)
+			break;
+	}
+}
+
+
+//-------------------------------------------------
+//  apply_boost - re-apply m_boost_db to whatever
+//  routes currently exist, without changing topology
+//-------------------------------------------------
+
+void menu_arcade_overlay::apply_boost()
+{
+	for (sound_io_device *dev : m_out_devs)
+	{
+		bool any = false;
+		for (const auto &omap : machine().sound().get_mappings())
+		{
+			if (omap.m_dev != dev)
+				continue;
+
+			for (const auto &nmap : omap.m_node_mappings)
+			{
+				if (nmap.m_is_system_default)
+					machine().sound().config_set_volume_sound_io_connection_default(dev, m_boost_db);
+				else
+					machine().sound().config_set_volume_sound_io_connection_node(dev, find_node_name(nmap.m_node), m_boost_db);
+				any = true;
+			}
+
+			const bool downmixed = !m_stereo && (m_layout == layout_type::SINGLE_MULTI || m_layout == layout_type::SPLIT_STEREO);
+			const float ch_db = downmixed ? (m_boost_db - 6.0f) : m_boost_db;
+			for (const auto &cmap : omap.m_channel_mappings)
+			{
+				if (cmap.m_is_system_default)
+					machine().sound().config_set_volume_sound_io_channel_connection_default(dev, cmap.m_guest_channel, cmap.m_node_channel, ch_db);
+				else
+					machine().sound().config_set_volume_sound_io_channel_connection_node(dev, cmap.m_guest_channel, find_node_name(cmap.m_node), cmap.m_node_channel, ch_db);
+				any = true;
+			}
+			break;
+		}
+
+		if (!any)
+			machine().sound().config_add_sound_io_connection_default(dev, m_boost_db);
+	}
+}
+
+
+//-------------------------------------------------
+//  apply_stereo - switch topology between stereo
+//  and a true mono downmix
+//-------------------------------------------------
+
+void menu_arcade_overlay::apply_stereo(bool stereo)
+{
+	m_stereo = stereo;
+
+	if (m_layout == layout_type::SINGLE_MULTI)
+	{
+		sound_io_device *const dev = m_out_devs[0];
+		clear_all_routes(dev);
+		if (stereo)
+		{
+			machine().sound().config_add_sound_io_connection_default(dev, m_boost_db);
+		}
+		else
+		{
+			const float ch_db = m_boost_db - 6.0f;
+			const uint32_t guest_channels = std::min<uint32_t>(2, dev->inputs());
+			for (uint32_t g = 0; g < guest_channels; g++)
+				for (uint32_t n = 0; n < 2; n++)
+					machine().sound().config_add_sound_io_channel_connection_default(dev, g, n, ch_db);
+		}
+	}
+	else if (m_layout == layout_type::SPLIT_STEREO)
+	{
+		for (size_t i = 0; i < m_out_devs.size() && i < 2; i++)
+		{
+			sound_io_device *const dev = m_out_devs[i];
+			clear_all_routes(dev);
+			if (stereo)
+			{
+				machine().sound().config_add_sound_io_channel_connection_default(dev, 0, uint32_t(i), m_boost_db);
+			}
+			else
+			{
+				const float ch_db = m_boost_db - 6.0f;
+				machine().sound().config_add_sound_io_channel_connection_default(dev, 0, 0, ch_db);
+				machine().sound().config_add_sound_io_channel_connection_default(dev, 0, 1, ch_db);
+			}
+		}
+	}
+}
+
+
+//-------------------------------------------------
+//  populate
+//-------------------------------------------------
+
+void menu_arcade_overlay::populate()
+{
+	if (m_layout == layout_type::NONE)
+	{
+		item_append(_("menu-arcadeoverlay", "This game has no configurable sound output"), FLAG_DISABLE, nullptr);
+		item_append(menu_item_type::SEPARATOR);
+		return;
+	}
+
+	item_append(
+			util::string_format(_("menu-arcadeoverlay", "Audio Boost: %1$+.1f dB"), m_boost_db),
+			(m_boost_db > -96.0f ? FLAG_LEFT_ARROW : 0) | (m_boost_db < 12.0f ? FLAG_RIGHT_ARROW : 0),
+			reinterpret_cast<void *>(ITM_BOOST));
+
+	if (m_stereo_available)
+		item_append_on_off(_("menu-arcadeoverlay", "Stereo"), m_stereo, 0, reinterpret_cast<void *>(ITM_STEREO));
+	else
+		item_append(_("menu-arcadeoverlay", "Stereo/Mono: not available for this game"), FLAG_DISABLE, nullptr);
+
+	item_append(menu_item_type::SEPARATOR);
+	item_append(_("menu-arcadeoverlay", "Reset to Default (0 dB, Stereo)"), 0, reinterpret_cast<void *>(ITM_RESET));
+	item_append(_("menu-arcadeoverlay", "Full MAME Menu (save state, DIP switches, etc.)..."), 0, reinterpret_cast<void *>(ITM_FULL_MENU));
+}
+
+
+//-------------------------------------------------
+//  handle
+//-------------------------------------------------
+
+bool menu_arcade_overlay::handle(event const *ev)
+{
+	if (!ev)
+		return false;
+
+	const auto item_ref = reinterpret_cast<uintptr_t>(ev->itemref);
+	set_process_flags((item_ref == ITM_BOOST) ? PROCESS_LR_REPEAT : 0);
+
+	const bool shift_pressed = machine().input().code_pressed(KEYCODE_LSHIFT) || machine().input().code_pressed(KEYCODE_RSHIFT);
+	const bool ctrl_pressed = machine().input().code_pressed(KEYCODE_LCONTROL) || machine().input().code_pressed(KEYCODE_RCONTROL);
+
+	switch (ev->iptkey)
+	{
+	case IPT_UI_LEFT:
+		if (item_ref == ITM_BOOST)
+		{
+			if (shift_pressed)
+				m_boost_db -= 0.1f;
+			else if (ctrl_pressed)
+				m_boost_db -= 10.0f;
+			else
+				m_boost_db -= 1.0f;
+			m_boost_db = std::clamp(m_boost_db, -96.0f, 12.0f);
+			apply_boost();
+			return true;
+		}
+		break;
+
+	case IPT_UI_RIGHT:
+		if (item_ref == ITM_BOOST)
+		{
+			if (shift_pressed)
+				m_boost_db += 0.1f;
+			else if (ctrl_pressed)
+				m_boost_db += 10.0f;
+			else
+				m_boost_db += 1.0f;
+			m_boost_db = std::clamp(m_boost_db, -96.0f, 12.0f);
+			apply_boost();
+			return true;
+		}
+		break;
+
+	case IPT_UI_CLEAR:
+		if (item_ref == ITM_BOOST)
+		{
+			m_boost_db = 0.0f;
+			apply_boost();
+			return true;
+		}
+		break;
+
+	case IPT_UI_SELECT:
+		if (item_ref == ITM_STEREO)
+		{
+			apply_stereo(!m_stereo);
+			reset(reset_options::REMEMBER_POSITION);
+			return true;
+		}
+		if (item_ref == ITM_RESET)
+		{
+			m_boost_db = 0.0f;
+			if (m_stereo_available)
+				apply_stereo(true);
+			else
+				apply_boost();
+			reset(reset_options::REMEMBER_POSITION);
+			return true;
+		}
+		if (item_ref == ITM_FULL_MENU)
+		{
+			menu::stack_push<menu_main>(ui(), target());
+			return true;
+		}
+		break;
+
+	default:
+		break;
+	}
+
+	return false;
+}
+
+
+//-------------------------------------------------
+//  recompute_metrics / custom_render - RetroArch
+//  Quick-Menu-styled hint bar drawn beneath the item
+//  list
+//-------------------------------------------------
+
+void menu_arcade_overlay::recompute_metrics(uint32_t width, uint32_t height, float aspect)
+{
+	menu::recompute_metrics(width, height, aspect);
+	set_custom_space(0.0f, 2.0f * line_height() + 2.0f * tb_border());
+}
+
+void menu_arcade_overlay::custom_render(uint32_t flags, void *selectedref, float top, float bottom, float origx1, float origy1, float origx2, float origy2)
+{
+	// RetroArch-style dark navy panel with a cyan accent line
+	const rgb_t accent(0xff, 0x22, 0xa8, 0xe0);
+	const rgb_t panel_bg(0xe6, 0x14, 0x16, 0x20);
+
+	float const y2 = 1.0f - tb_border();
+	float const y1 = y2 - bottom;
+	float const x1 = lr_border();
+	float const x2 = 1.0f - lr_border();
+
+	ui().draw_outlined_box(container(), x1, y1, x2, y2, panel_bg);
+	container().add_line(x1, y1, x2, y1, UI_LINE_WIDTH * 2.0f, accent, PRIMFLAG_BLENDMODE(BLENDMODE_ALPHA));
+
+	float const text_x1 = x1 + lr_border();
+	float const text_w = x2 - x1 - 2.0f * lr_border();
+	float const line1_y = y1 + tb_border();
+	float const line2_y = line1_y + line_height();
+
+	draw_text_normal(
+			_("menu-arcadeoverlay", "ARCADE AUDIO MIXER"),
+			text_x1, line1_y, text_w,
+			text_layout::text_justify::CENTER, text_layout::word_wrapping::TRUNCATE,
+			ui().colors().text_color());
+
+	std::string const hint = m_stereo_available
+			? _("menu-arcadeoverlay", "Left/Right: Adjust   Select: Toggle Stereo   Shift: Fine   Ctrl: +/-10dB")
+			: _("menu-arcadeoverlay", "Left/Right: Adjust   Shift: Fine   Ctrl: +/-10dB");
+
+	draw_text_normal(
+			hint,
+			text_x1, line2_y, text_w,
+			text_layout::text_justify::CENTER, text_layout::word_wrapping::TRUNCATE,
+			accent);
+}
+
+} // namespace ui
+CPPCPPEOF
+
+    python3 - "$mame_src_dir" <<'PYEOF'
+import sys, pathlib
+
+root = pathlib.Path(sys.argv[1])
+
+# --- ui.cpp: include the new header ---
+ui_cpp = root / "src/frontend/mame/ui/ui.cpp"
+if not ui_cpp.exists():
+    print("[patch] ui.cpp: file not found, skipping (MAME source may have changed)")
+    sys.exit(3)
+text = ui_cpp.read_text()
+
+old_inc = '#include "ui/filemngr.h"'
+new_inc = '#include "ui/arcadeoverlay.h"\n#include "ui/filemngr.h"'
+if new_inc in text:
+    print("[patch] ui.cpp include: already applied")
+elif old_inc not in text:
+    print("[patch] ui.cpp include: anchor text not found, skipping (MAME source may have changed)")
+    sys.exit(3)
+else:
+    text = text.replace(old_inc, new_inc, 1)
+    print("[patch] ui.cpp include: applied")
+
+old_hook = """	// turn on menus if requested
+	if (inp.pressed(IPT_UI_MENU))
+	{
+		m_ui_target = &current_ui_target();
+		if (!machine().paused() && options().menu_pause())
+		{
+			machine().pause();
+			m_paused_for_menu = true;
+		}
+		if (ui::menu::stack_empty(*this))
+			ui::menu::stack_push<ui::menu_main>(*this, *m_ui_target);
+		activate_menu();
+		return 0;
+	}"""
+new_hook = """	// turn on menus if requested - jump straight to the arcade audio
+	// overlay (RetroArch Quick-Menu style) instead of MAME's normal
+	// nested main menu; the overlay itself offers a "Full MAME Menu"
+	// item for save states, DIP switches, and everything else
+	if (inp.pressed(IPT_UI_MENU))
+	{
+		m_ui_target = &current_ui_target();
+		if (!machine().paused() && options().menu_pause())
+		{
+			machine().pause();
+			m_paused_for_menu = true;
+		}
+		if (ui::menu::stack_empty(*this))
+			ui::menu::stack_push<ui::menu_arcade_overlay>(*this, *m_ui_target);
+		activate_menu();
+		return 0;
+	}"""
+if new_hook in text:
+    print("[patch] ui.cpp hotkey hook: already applied")
+elif old_hook not in text:
+    print("[patch] ui.cpp hotkey hook: anchor text not found, skipping (MAME source may have changed)")
+    sys.exit(3)
+else:
+    text = text.replace(old_hook, new_hook, 1)
+    print("[patch] ui.cpp hotkey hook: applied")
+
+ui_cpp.write_text(text)
+
+# --- frontend.lua: register the new source files with the build ---
+frontend_lua = root / "scripts/src/mame/frontend.lua"
+if not frontend_lua.exists():
+    print("[patch] frontend.lua: file not found, skipping (MAME source may have changed)")
+    sys.exit(3)
+text = frontend_lua.read_text()
+
+old = '\tMAME_DIR .. "src/frontend/mame/ui/audiomix.cpp",\n\tMAME_DIR .. "src/frontend/mame/ui/audiomix.h",'
+new = '\tMAME_DIR .. "src/frontend/mame/ui/arcadeoverlay.cpp",\n\tMAME_DIR .. "src/frontend/mame/ui/arcadeoverlay.h",\n\tMAME_DIR .. "src/frontend/mame/ui/audiomix.cpp",\n\tMAME_DIR .. "src/frontend/mame/ui/audiomix.h",'
+if new in text:
+    print("[patch] frontend.lua registration: already applied")
+elif old not in text:
+    print("[patch] frontend.lua registration: anchor text not found, skipping (MAME source may have changed)")
+    sys.exit(3)
+else:
+    text = text.replace(old, new, 1)
+    print("[patch] frontend.lua registration: applied")
+
+frontend_lua.write_text(text)
+sys.exit(0)
+PYEOF
+}
+
+# Builds MAME (lr-mame) from source with the custom Arcade Audio Mixer
+# overlay - see ENABLE_MAME_CUSTOM_OVERLAY above. Mirrors the exact
+# sources/patch/_source_ sequence phase_dreamcast_flycast_install uses for
+# Flycast (see that phase's own comment for why retropie_packages.sh is
+# split into two calls rather than one).
+phase_mame_arcade_overlay_build() {
+    if [ "$ENABLE_MAME_CUSTOM_OVERLAY" != "true" ]; then
+        log "ENABLE_MAME_CUSTOM_OVERLAY=false, stock prebuilt MAME from phase_emulators_install stands"
+        return 0
+    fi
+    cd "$PI_HOME/RetroPie-Setup" || die "RetroPie-Setup missing"
+    log "Fetching MAME source"
+    sudo ./retropie_packages.sh lr-mame sources || die "lr-mame sources step failed"
+
+    _apply_mame_arcade_overlay_patch "$PI_HOME/RetroPie-Setup/tmp/build/lr-mame" \
+        || log_warn "MAME arcade overlay patch did not fully apply - build may fail, or may succeed but fall back to MAME's stock in-game menu, if MAME's source has changed since this script was written"
+
+    log "Building MAME with the custom Arcade Audio Mixer overlay - full arcade subtarget build, confirmed ~12 hours wall-clock on a Pi 4 with -j4"
+    sudo ./retropie_packages.sh lr-mame _source_ || die "lr-mame build/install failed"
+
+    if [ ! -f /opt/retropie/libretrocores/lr-mame/mamearcade_libretro.so ]; then
+        die "mamearcade_libretro.so not found after build - MAME emulation would not be available at all, aborting"
+    fi
     return 0
 }
 
@@ -7013,6 +7736,7 @@ main() {
         retropie_install
         gcc14_cflags_patch
         emulators_install
+        mame_arcade_overlay_build
         dreamcast_flycast_install
         retroarch_menu_rotation_patch
         retroarch_autoconfig
