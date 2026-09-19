@@ -314,20 +314,23 @@ EMULATOR_CORES="${EMULATOR_CORES:-lr-snes9x,lr-pcsx-rearmed,lr-ppsspp,lr-fceumm,
 # core in EMULATOR_CORES ever turns out to have the same no-binary problem.
 EMULATOR_CORES_SOURCE_FALLBACK="${EMULATOR_CORES_SOURCE_FALLBACK:-lr-ppsspp}"
 
-# --- MAME custom in-game audio overlay ---------------------------------------
-# When true (default), this builds lr-mame from full source with a custom
-# patch instead of installing RetroPie's stock lr-mame binary. The patch adds
-# a RetroArch-Quick-Menu-styled overlay, opened directly by the Show/Hide Menu
-# hotkey (in-game, over the paused ROM - press it again to close, same as
-# RetroArch), with two controls that work for every arcade ROM (not a fixed
-# per-game list): a uniform Audio Boost (-96..+20dB, using MAME's own live
-# sound_manager mixer routing API - the same one the stock Audio Mixer menu
-# uses) and a Stereo/Mono toggle that forces a true mono downmix when the
-# ROM's emulated sound hardware supports it (auto-detected per game from its
-# actual sound_io_device topology at runtime - single stereo speaker, split
-# L/R speaker boards, or mono-only), and falls back to boost-only otherwise.
-# All changes save automatically per-game via MAME's existing configuration
-# save on exit, same as the stock menu.
+# --- MAME per-game arcade audio options --------------------------------------
+# When true (default), this builds lr-mame from full source with a small
+# patch that registers two extra libretro core options - Audio Boost
+# (-96..+20dB, using MAME's own live sound_manager mixer routing API, the
+# same one the stock Audio Mixer menu uses) and Stereo/Mono (forces a true
+# mono downmix when the ROM's emulated sound hardware supports it,
+# auto-detected per game from its actual sound_io_device topology at
+# runtime - single stereo speaker, split L/R speaker boards, or mono-only -
+# falling back to boost-only otherwise). Because these are ordinary libretro
+# core options, they show up automatically under RetroArch's own Quick Menu
+# > Core Options, AND (via _apply_retroarch_quickmenu_extensions_patch, see
+# phase_retroarch_menu_rotation_patch) as a dedicated top-level "Game Audio"
+# entry directly in RetroArch's Quick Menu, alongside the Display Brightness
+# and Sound entries - one unified in-game overlay reachable with the Home
+# button, no separate MAME-only screen. All changes save automatically
+# per-game via MAME's existing configuration save on exit, same as any other
+# core option.
 #
 # This is a genuinely large build: compiling MAME's full SUBTARGET=arcade
 # target from source on a Pi 4 takes roughly 12 hours and pushes the board
@@ -339,9 +342,9 @@ EMULATOR_CORES_SOURCE_FALLBACK="${EMULATOR_CORES_SOURCE_FALLBACK:-lr-ppsspp}"
 # but budget the time before running with this enabled.
 #
 # Set to false to skip all of this and install RetroPie's stock lr-mame
-# binary instead (fast, but no in-game overlay - just MAME's normal nested
-# menu tree via the Show/Hide Menu hotkey).
-ENABLE_MAME_CUSTOM_OVERLAY="${ENABLE_MAME_CUSTOM_OVERLAY:-true}"
+# binary instead (fast, but no Audio Boost / Stereo-Mono core options - just
+# MAME's normal built-in options).
+ENABLE_MAME_ARCADE_AUDIO_OPTIONS="${ENABLE_MAME_ARCADE_AUDIO_OPTIONS:-true}"
 
 # --- Dreamcast (Flycast) -----------------------------------------------------
 # Redream (the other well-known Dreamcast emulator) has no real aarch64 Linux
@@ -452,25 +455,16 @@ INITIAL_FRONTEND="${INITIAL_FRONTEND:-esde}"            # esde | classic
 # to wire up autostart some other way yourself.
 ENABLE_CONSOLE_AUTOSTART="${ENABLE_CONSOLE_AUTOSTART:-true}"
 
-# --- Controller hotkeys (brightness/volume) ------------------------------
-# Safe to leave on for generic hardware: the daemon auto-detects the
-# backlight path, no-ops gracefully if no controller/backlight is present,
-# and the button numbers below can be re-captured at any time from the
-# in-frontend "Hotkey Config" tool this script installs (see README).
-ENABLE_CONTROLLER_HOTKEYS="${ENABLE_CONTROLLER_HOTKEYS:-true}"
-ALSA_CARD_INDEX="${ALSA_CARD_INDEX:-0}"
 # Pins the aux/headphone jack as the default PipeWire/WirePlumber audio
 # output (see phase_audio_output_setup) - this build has no HDMI-audio
 # display, so HDMI should never be picked as the output even if something
 # later gets plugged into it.
 ENABLE_AUX_AUDIO_FORCE="${ENABLE_AUX_AUDIO_FORCE:-true}"
-BTN_L3="${BTN_L3:-9}"
-BTN_R3="${BTN_R3:-10}"
-BTN_SQUARE="${BTN_SQUARE:-2}"
+# Shared "confirm"/"back" button roles used by this project's various
+# in-frontend RetroPie-menu tools (LED Config, Bluetooth pairing, etc.) -
+# not specific to any one tool.
 BTN_X="${BTN_X:-0}"
 BTN_CIRCLE="${BTN_CIRCLE:-1}"
-BTN_TRIANGLE="${BTN_TRIANGLE:-3}"
-HOTKEY_STEP="${HOTKEY_STEP:-5}"
 
 # --- Addressable LED strip ---------------------------------------------------
 # WS2812B strip(s) on the reference build (two 14-LED strips wired in
@@ -604,7 +598,7 @@ OC_GPU_FREQ=$OC_GPU_FREQ
 OC_OVER_VOLTAGE=$OC_OVER_VOLTAGE
 EMULATOR_CORES=$EMULATOR_CORES
 EMULATOR_CORES_SOURCE_FALLBACK=$EMULATOR_CORES_SOURCE_FALLBACK
-ENABLE_MAME_CUSTOM_OVERLAY=$ENABLE_MAME_CUSTOM_OVERLAY
+ENABLE_MAME_ARCADE_AUDIO_OPTIONS=$ENABLE_MAME_ARCADE_AUDIO_OPTIONS
 ENABLE_DREAMCAST=$ENABLE_DREAMCAST
 ENABLE_GAMECUBE=$ENABLE_GAMECUBE
 APPLY_GCC14_CFLAGS_PATCH=$APPLY_GCC14_CFLAGS_PATCH
@@ -616,16 +610,9 @@ INSTALL_THEMES=$INSTALL_THEMES
 ESDE_THEME_NAME=$ESDE_THEME_NAME
 INITIAL_FRONTEND=$INITIAL_FRONTEND
 ENABLE_CONSOLE_AUTOSTART=$ENABLE_CONSOLE_AUTOSTART
-ENABLE_CONTROLLER_HOTKEYS=$ENABLE_CONTROLLER_HOTKEYS
-ALSA_CARD_INDEX=$ALSA_CARD_INDEX
 ENABLE_AUX_AUDIO_FORCE=$ENABLE_AUX_AUDIO_FORCE
-BTN_L3=$BTN_L3
-BTN_R3=$BTN_R3
-BTN_SQUARE=$BTN_SQUARE
 BTN_X=$BTN_X
 BTN_CIRCLE=$BTN_CIRCLE
-BTN_TRIANGLE=$BTN_TRIANGLE
-HOTKEY_STEP=$HOTKEY_STEP
 ENABLE_LED_STRIP=$ENABLE_LED_STRIP
 LED_GPIO_PIN=$LED_GPIO_PIN
 LED_COUNT=$LED_COUNT
@@ -1002,8 +989,8 @@ phase_gcc14_cflags_patch() {
 
 phase_emulators_install() {
     cd "$PI_HOME/RetroPie-Setup" || die "RetroPie-Setup missing"
-    if [ "$ENABLE_MAME_CUSTOM_OVERLAY" = "true" ]; then
-        log "Skipping stock lr-mame binary install - ENABLE_MAME_CUSTOM_OVERLAY=true, a source build with the custom in-game overlay happens in a later phase instead"
+    if [ "$ENABLE_MAME_ARCADE_AUDIO_OPTIONS" = "true" ]; then
+        log "Skipping stock lr-mame binary install - ENABLE_MAME_ARCADE_AUDIO_OPTIONS=true, a source build with the extra Audio Boost/Stereo-Mono core options happens in a later phase instead"
     else
         log "Installing MAME (lr-mame)"
         sudo ./retropie_packages.sh lr-mame _binary_ || die "lr-mame install failed"
@@ -1055,705 +1042,482 @@ phase_emulators_install() {
     return 0
 }
 
-# Writes the two new MAME UI source files for the custom in-game overlay
-# (see ENABLE_MAME_CUSTOM_OVERLAY above for the full design rationale) into
-# a freshly-cloned lr-mame source checkout, then patches ui.cpp (the hotkey
-# hook - jump straight to our overlay instead of MAME's normal nested main
-# menu, exactly like RetroArch's own Quick Menu) and frontend.lua (registers
-# the two new files with MAME's own build system) - both patches are
-# idempotent and anchor-checked, matching every other source patch in this
-# script (see _apply_flycast_libzip_patch above for the same pattern).
+# NOTE (superseded design): MAME's own in-game menu used to be hijacked to
+# open a ~600-line custom ui::menu subclass (menu_arcade_overlay) offering
+# audio boost / stereo-mono controls, bypassing MAME's stock menu_main
+# entirely. That has been replaced by the implementation below: MAME's own
+# menu is left completely stock (its IPT_UI_MENU hotkey is untouched), and
+# the audio boost / stereo-mono controls are instead exposed as two ordinary
+# libretro core options ("Game Audio" category) which RetroArch's own Quick
+# Menu > Core Options screen already renders generically - and which are
+# ALSO surfaced as a dedicated top-level "Game Audio" entry directly in
+# RetroArch's Quick Menu by _apply_retroarch_quickmenu_extensions_patch
+# (see phase_retroarch_menu_rotation_patch). This is both much smaller
+# (2 new option entries + a small check_variables()/retro_run() hook vs. an
+# entire menu subclass + ui.cpp/frontend.lua hooks) and matches how the
+# user actually wants this surfaced: as part of the single RetroArch
+# overlay menu, not a separate MAME-only screen.
+#
+# Patches two files in a freshly-cloned lr-mame source checkout:
+#   src/osd/libretro/libretro_core_options.h - registers the "game_audio"
+#     option category and the two new options (mame_arcade_audio_boost_db,
+#     mame_arcade_audio_stereo) in MAME's existing, already-working
+#     core-options machinery (option_cats_us[]/option_defs_us[], consumed
+#     generically by libretro_set_core_options()) - no changes needed there.
+#   src/osd/libretro/libretro.cpp - adds free functions that read those two
+#     option values and apply them to the running game's sound_manager
+#     routing (ported from the old menu_arcade_overlay class's
+#     scan_devices/apply_boost/apply_stereo/clear_all_routes/find_node_name
+#     methods, adapted to take a running_machine& instead of member access),
+#     hooked into check_variables() (fires whenever RetroArch signals an
+#     option changed) and into retro_run()'s first-frame block (a safety net
+#     ensuring a per-game persisted value is actually applied even if
+#     check_variables() ran too early, before mame_machine_manager had a
+#     running_machine yet).
+# Both patches are idempotent and anchor-checked, matching every other
+# source patch in this script (see _apply_flycast_libzip_patch for the same
+# pattern).
 _apply_mame_arcade_overlay_patch() {
     local mame_src_dir="$1"
-    mkdir -p "$mame_src_dir/src/frontend/mame/ui"
+    # libretro/mame's master branch moved these two files into a
+    # src/osd/libretro/libretro-internal/ subdirectory at some point after
+    # this patch was first written against the old src/osd/libretro/ layout
+    # (confirmed live: a fresh clone no longer has them at the old path) -
+    # try the current location first, falling back to the old one so this
+    # keeps working if it ever moves back or a pinned older checkout is used.
+    local opts_h="$mame_src_dir/src/osd/libretro/libretro-internal/libretro_core_options.h"
+    local lr_cpp="$mame_src_dir/src/osd/libretro/libretro-internal/libretro.cpp"
+    if [ ! -f "$opts_h" ] || [ ! -f "$lr_cpp" ]; then
+        opts_h="$mame_src_dir/src/osd/libretro/libretro_core_options.h"
+        lr_cpp="$mame_src_dir/src/osd/libretro/libretro.cpp"
+    fi
 
-    cat > "$mame_src_dir/src/frontend/mame/ui/arcadeoverlay.h" <<'CPPHEOF'
-// license:BSD-3-Clause
-// copyright-holders:pi-arcade-setup
-/*********************************************************************
+    if [ ! -f "$opts_h" ] || [ ! -f "$lr_cpp" ]; then
+        echo "[patch] mame core-options: libretro_core_options.h or libretro.cpp not found under $mame_src_dir/src/osd/libretro(-internal) - MAME source layout may have changed, skipping"
+        return 3
+    fi
 
-    ui/arcadeoverlay.h
+    python3 - "$opts_h" "$lr_cpp" <<'PYEOF'
+import sys
 
-    RetroArch Quick-Menu-styled in-game overlay for arcade titles.
+opts_path, cpp_path = sys.argv[1], sys.argv[2]
+rc = 0
 
-    Provides two controls that act on every emulated sound output
-    device the running game has (so it works for whatever audio chip
-    that particular ROM emulates, not a fixed per-game list):
+# ---------------------------------------------------------------
+# libretro_core_options.h: add the "game_audio" category and the
+# two new options (dB boost + stereo/mono) to MAME's existing,
+# already-working core-options tables.
+# ---------------------------------------------------------------
+text = open(opts_path).read()
 
-      * Audio Boost   - a uniform +/-dB gain applied on top of MAME's
-                         normal mixer routing (-96..+20 dB, 1 dB step,
-                         0.1 dB with Shift, 10 dB with Ctrl - the lower
-                         bound and step sizes match MAME's own Audio
-                         Mixer menu conventions, but the upper bound is
-                         raised from MAME's stock +12 dB ceiling for
-                         headroom on genuinely quiet boards; MAME's
-                         sound_manager clamps only at the final int16
-                         sample, not by dB, so this is safe to raise).
-      * Stereo/Mono   - when the game's output layout allows it, forces
-                         a true mono downmix (both channels summed,
-                         each attenuated 6 dB to avoid clipping) or
-                         restores normal stereo routing.
+old_cat_tail = '''   {
+      "hacks",
+      "Emulation Hacks",
+      "Configure emulation hack options."
+   },
+   { NULL, NULL, NULL },
+};'''
+new_cat_tail = '''   {
+      "hacks",
+      "Emulation Hacks",
+      "Configure emulation hack options."
+   },
+   {
+      "game_audio",
+      "Game Audio",
+      "Per-game audio boost and stereo/mono downmix, also mirrored as a dedicated 'Game Audio' entry in RetroArch's own Quick Menu."
+   },
+   { NULL, NULL, NULL },
+};'''
+if new_cat_tail in text:
+    print("[patch] libretro_core_options.h category: already applied")
+elif old_cat_tail not in text:
+    print("[patch] libretro_core_options.h category: anchor text not found, skipping (MAME source may have changed)")
+    rc = 3
+else:
+    text = text.replace(old_cat_tail, new_cat_tail, 1)
+    print("[patch] libretro_core_options.h category: applied")
 
-    The overlay is opened directly (bypassing MAME's normal nested
-    main menu) by the configurable Show/Hide Menu hotkey, so pressing
-    it behaves like RetroArch's own Quick Menu: one press opens this
-    screen over the paused game, the same press again closes it and
-    resumes play exactly where it left off. All changes take effect
-    immediately and are saved automatically per-game by MAME's
-    existing "Save Configuration" on exit (mame_saves=game), the same
-    mechanism the stock Audio Mixer menu relies on.
+db_choices = []
+for n in range(-96, 21):
+    label = f'{n:+d} dB' if n != 0 else '0 dB'
+    db_choices.append(f'         {{ "{n}", "{label}" }},')
+db_choices_block = "\n".join(db_choices)
 
-*********************************************************************/
+old_defs_tail = '''         { "20", NULL },
+         { NULL, NULL },
+      },
+      "0"
+   },
+   { NULL, NULL, NULL, NULL, NULL, NULL, {{0}}, NULL },
+};'''
+new_defs_tail = '''         { "20", NULL },
+         { NULL, NULL },
+      },
+      "0"
+   },
+   {
+      CORE_NAME "_arcade_audio_boost_db",
+      "Arcade Audio Boost (dB)",
+      NULL,
+      "Uniform gain applied on top of the current arcade game's normal sound mixer routing. Takes effect immediately and is saved per-game. Also mirrored as 'Game Audio > Audio Boost' in RetroArch's own Quick Menu.",
+      NULL,
+      "game_audio",
+      {
+''' + db_choices_block + '''
+         { NULL, NULL },
+      },
+      "0"
+   },
+   {
+      CORE_NAME "_arcade_audio_stereo",
+      "Arcade Audio Stereo/Mono",
+      NULL,
+      "Toggles between true stereo and a mono downmix (both channels summed, each attenuated 6 dB to avoid clipping) for the current arcade game's sound output. Takes effect immediately and is saved per-game. Also mirrored as 'Game Audio > Stereo/Mono' in RetroArch's own Quick Menu.",
+      NULL,
+      "game_audio",
+      {
+         { "stereo", "Stereo" },
+         { "mono", "Mono" },
+         { NULL, NULL },
+      },
+      "stereo"
+   },
+   { NULL, NULL, NULL, NULL, NULL, NULL, {{0}}, NULL },
+};'''
+if new_defs_tail in text:
+    print("[patch] libretro_core_options.h definitions: already applied")
+elif old_defs_tail not in text:
+    print("[patch] libretro_core_options.h definitions: anchor text not found, skipping (MAME source may have changed)")
+    rc = 3
+else:
+    text = text.replace(old_defs_tail, new_defs_tail, 1)
+    print("[patch] libretro_core_options.h definitions: applied")
 
-#ifndef MAME_FRONTEND_UI_ARCADEOVERLAY_H
-#define MAME_FRONTEND_UI_ARCADEOVERLAY_H
+open(opts_path, "w").write(text)
 
-#pragma once
+# ---------------------------------------------------------------
+# libretro.cpp: includes, helper functions, and the two call sites
+# (check_variables() tail, retro_run()'s first_run block).
+# ---------------------------------------------------------------
+text = open(cpp_path).read()
 
-#include "ui/menu.h"
+old_inc = '''#include "libretro.h"
+#include "libretro_shared.h"
+#include "libretro_core_options.h"
+#include "libretro_vfs.h"'''
+new_inc = '''#include "libretro.h"
+#include "libretro_shared.h"
+#include "libretro_core_options.h"
+#include "libretro_vfs.h"
 
-#include <vector>
-
-class sound_io_device;
-
-namespace ui {
-
-class menu_arcade_overlay : public menu
-{
-public:
-	menu_arcade_overlay(mame_ui_manager &mui, render_target &target);
-	virtual ~menu_arcade_overlay() override;
-
-protected:
-	virtual void menu_activated() override;
-	virtual void menu_deactivated() override;
-	virtual void populate() override;
-	virtual bool handle(event const *ev) override;
-	virtual void custom_render(uint32_t flags, void *selectedref, float top, float bottom, float origx1, float origy1, float origx2, float origy2) override;
-	virtual void recompute_metrics(uint32_t width, uint32_t height, float aspect) override;
-
-private:
-	enum : uintptr_t
-	{
-		ITM_BOOST = 1,
-		ITM_STEREO,
-		ITM_RESET,
-		ITM_FULL_MENU
-	};
-
-	// how this game's sound output devices are laid out, decided once
-	// per activation by scanning machine().sound().get_mappings()
-	enum class layout_type
-	{
-		NONE,           // no output devices - overlay shows a message only
-		SINGLE_MULTI,   // one output device, >= 2 guest channels (typical stereo speaker)
-		SINGLE_MONO,    // one output device, 1 guest channel (already mono at emulation level)
-		SPLIT_STEREO,   // exactly two output devices, 1 guest channel each (separate L/R speakers)
-		OTHER           // anything else - boost only, stereo toggle unavailable
-	};
-
-	float m_boost_db;
-	bool m_stereo;
-	bool m_stereo_available;
-	layout_type m_layout;
-	std::vector<sound_io_device *> m_out_devs;
-
-	void scan_devices();
-	void read_current_state();
-	void apply_boost();
-	void apply_stereo(bool stereo);
-	void clear_all_routes(sound_io_device *dev);
-	std::string find_node_name(uint32_t node) const;
-};
-
-} // namespace ui
-
-#endif // MAME_FRONTEND_UI_ARCADEOVERLAY_H
-CPPHEOF
-
-    cat > "$mame_src_dir/src/frontend/mame/ui/arcadeoverlay.cpp" <<'CPPCPPEOF'
-// license:BSD-3-Clause
-// copyright-holders:pi-arcade-setup
-/*********************************************************************
-
-    ui/arcadeoverlay.cpp
-
-    RetroArch Quick-Menu-styled in-game overlay: per-game audio boost
-    and stereo/mono toggle. See arcadeoverlay.h for the full design
-    rationale.
-
-*********************************************************************/
-
-#include "emu.h"
-#include "ui/arcadeoverlay.h"
-
-// frontend
-#include "ui/mainmenu.h"
-#include "ui/ui.h"
-
-// emu
-#include "input.h"
 #include "speaker.h"
 
-// osd
-#include "osdepend.h"
-
+#include <vector>
 #include <algorithm>
-
-
-namespace ui {
-
-menu_arcade_overlay::menu_arcade_overlay(mame_ui_manager &mui, render_target &target)
-	: menu(mui, target)
-	, m_boost_db(0.0f)
-	, m_stereo(true)
-	, m_stereo_available(false)
-	, m_layout(layout_type::NONE)
-{
-	set_heading(_("menu-arcadeoverlay", "Arcade Audio Mixer"));
-}
-
-menu_arcade_overlay::~menu_arcade_overlay()
-{
-}
-
-
-//-------------------------------------------------
-//  menu_activated / menu_deactivated
-//-------------------------------------------------
-
-void menu_arcade_overlay::menu_activated()
-{
-	// re-scan every time the overlay is (re)shown - the running game's
-	// mixer state may have changed since we were last on screen
-	scan_devices();
-	read_current_state();
-	reset(reset_options::REMEMBER_POSITION);
-}
-
-void menu_arcade_overlay::menu_deactivated()
-{
-}
-
-
-//-------------------------------------------------
-//  scan_devices - classify this game's sound
-//  output layout
-//-------------------------------------------------
-
-void menu_arcade_overlay::scan_devices()
-{
-	m_out_devs.clear();
-	for (const auto &omap : machine().sound().get_mappings())
-		if (omap.m_dev && omap.m_dev->is_output())
-			m_out_devs.push_back(omap.m_dev);
-
-	if (m_out_devs.empty())
-	{
-		m_layout = layout_type::NONE;
-		m_stereo_available = false;
-	}
-	else if (m_out_devs.size() == 1)
-	{
-		if (m_out_devs[0]->inputs() >= 2)
-		{
-			m_layout = layout_type::SINGLE_MULTI;
-			m_stereo_available = true;
-		}
-		else
-		{
-			m_layout = layout_type::SINGLE_MONO;
-			m_stereo_available = false;
-		}
-	}
-	else if (m_out_devs.size() == 2 && m_out_devs[0]->inputs() == 1 && m_out_devs[1]->inputs() == 1)
-	{
-		m_layout = layout_type::SPLIT_STEREO;
-		m_stereo_available = true;
-	}
-	else
-	{
-		m_layout = layout_type::OTHER;
-		m_stereo_available = false;
-	}
-}
-
-
-//-------------------------------------------------
-//  read_current_state - initialise the displayed
-//  boost/stereo values from the live mixer state
-//-------------------------------------------------
-
-void menu_arcade_overlay::read_current_state()
-{
-	m_boost_db = 0.0f;
-	m_stereo = true;
-
-	if (m_out_devs.empty())
-		return;
-
-	sound_io_device *const dev = m_out_devs[0];
-	for (const auto &omap : machine().sound().get_mappings())
-	{
-		if (omap.m_dev != dev)
-			continue;
-
-		if (!omap.m_node_mappings.empty())
-		{
-			m_boost_db = omap.m_node_mappings.front().m_db;
-			m_stereo = true;
-		}
-		else if (!omap.m_channel_mappings.empty())
-		{
-			if (m_layout == layout_type::SPLIT_STEREO && omap.m_channel_mappings.size() == 1)
-			{
-				m_boost_db = omap.m_channel_mappings.front().m_db;
-				m_stereo = true;
-			}
-			else
-			{
-				// our own mono downmix always writes at boost_db - 6 dB
-				m_boost_db = omap.m_channel_mappings.front().m_db + 6.0f;
-				m_stereo = false;
-			}
-		}
-		break;
-	}
-}
-
-
-//-------------------------------------------------
-//  find_node_name
-//-------------------------------------------------
-
-std::string menu_arcade_overlay::find_node_name(uint32_t node) const
-{
-	const auto &info = machine().sound().get_osd_info();
-	for (const auto &n : info.m_nodes)
-		if (n.m_id == node)
-			return n.name();
-	return "";
-}
-
-
-//-------------------------------------------------
-//  clear_all_routes - remove every route (full or
-//  per-channel) currently configured for a device
-//-------------------------------------------------
-
-void menu_arcade_overlay::clear_all_routes(sound_io_device *dev)
-{
-	for (;;)
-	{
-		bool changed = false;
-		for (const auto &omap : machine().sound().get_mappings())
-		{
-			if (omap.m_dev != dev)
-				continue;
-
-			if (!omap.m_node_mappings.empty())
-			{
-				const auto &nmap = omap.m_node_mappings.front();
-				if (nmap.m_is_system_default)
-					machine().sound().config_remove_sound_io_connection_default(dev);
-				else
-					machine().sound().config_remove_sound_io_connection_node(dev, find_node_name(nmap.m_node));
-				changed = true;
-			}
-			else if (!omap.m_channel_mappings.empty())
-			{
-				const auto &cmap = omap.m_channel_mappings.front();
-				if (cmap.m_is_system_default)
-					machine().sound().config_remove_sound_io_channel_connection_default(dev, cmap.m_guest_channel, cmap.m_node_channel);
-				else
-					machine().sound().config_remove_sound_io_channel_connection_node(dev, cmap.m_guest_channel, find_node_name(cmap.m_node), cmap.m_node_channel);
-				changed = true;
-			}
-			break;
-		}
-		if (!changed)
-			break;
-	}
-}
-
-
-//-------------------------------------------------
-//  apply_boost - re-apply m_boost_db to whatever
-//  routes currently exist, without changing topology
-//-------------------------------------------------
-
-void menu_arcade_overlay::apply_boost()
-{
-	for (sound_io_device *dev : m_out_devs)
-	{
-		bool any = false;
-		for (const auto &omap : machine().sound().get_mappings())
-		{
-			if (omap.m_dev != dev)
-				continue;
-
-			for (const auto &nmap : omap.m_node_mappings)
-			{
-				if (nmap.m_is_system_default)
-					machine().sound().config_set_volume_sound_io_connection_default(dev, m_boost_db);
-				else
-					machine().sound().config_set_volume_sound_io_connection_node(dev, find_node_name(nmap.m_node), m_boost_db);
-				any = true;
-			}
-
-			const bool downmixed = !m_stereo && (m_layout == layout_type::SINGLE_MULTI || m_layout == layout_type::SPLIT_STEREO);
-			const float ch_db = downmixed ? (m_boost_db - 6.0f) : m_boost_db;
-			for (const auto &cmap : omap.m_channel_mappings)
-			{
-				if (cmap.m_is_system_default)
-					machine().sound().config_set_volume_sound_io_channel_connection_default(dev, cmap.m_guest_channel, cmap.m_node_channel, ch_db);
-				else
-					machine().sound().config_set_volume_sound_io_channel_connection_node(dev, cmap.m_guest_channel, find_node_name(cmap.m_node), cmap.m_node_channel, ch_db);
-				any = true;
-			}
-			break;
-		}
-
-		if (!any)
-			machine().sound().config_add_sound_io_connection_default(dev, m_boost_db);
-	}
-}
-
-
-//-------------------------------------------------
-//  apply_stereo - switch topology between stereo
-//  and a true mono downmix
-//-------------------------------------------------
-
-void menu_arcade_overlay::apply_stereo(bool stereo)
-{
-	m_stereo = stereo;
-
-	if (m_layout == layout_type::SINGLE_MULTI)
-	{
-		sound_io_device *const dev = m_out_devs[0];
-		clear_all_routes(dev);
-		if (stereo)
-		{
-			machine().sound().config_add_sound_io_connection_default(dev, m_boost_db);
-		}
-		else
-		{
-			const float ch_db = m_boost_db - 6.0f;
-			const uint32_t guest_channels = std::min<uint32_t>(2, dev->inputs());
-			for (uint32_t g = 0; g < guest_channels; g++)
-				for (uint32_t n = 0; n < 2; n++)
-					machine().sound().config_add_sound_io_channel_connection_default(dev, g, n, ch_db);
-		}
-	}
-	else if (m_layout == layout_type::SPLIT_STEREO)
-	{
-		for (size_t i = 0; i < m_out_devs.size() && i < 2; i++)
-		{
-			sound_io_device *const dev = m_out_devs[i];
-			clear_all_routes(dev);
-			if (stereo)
-			{
-				machine().sound().config_add_sound_io_channel_connection_default(dev, 0, uint32_t(i), m_boost_db);
-			}
-			else
-			{
-				const float ch_db = m_boost_db - 6.0f;
-				machine().sound().config_add_sound_io_channel_connection_default(dev, 0, 0, ch_db);
-				machine().sound().config_add_sound_io_channel_connection_default(dev, 0, 1, ch_db);
-			}
-		}
-	}
-}
-
-
-//-------------------------------------------------
-//  populate
-//-------------------------------------------------
-
-void menu_arcade_overlay::populate()
-{
-	if (m_layout == layout_type::NONE)
-	{
-		item_append(_("menu-arcadeoverlay", "This game has no configurable sound output"), FLAG_DISABLE, nullptr);
-		item_append(menu_item_type::SEPARATOR);
-		return;
-	}
-
-	item_append(
-			util::string_format(_("menu-arcadeoverlay", "Audio Boost: %1$+.1f dB"), m_boost_db),
-			(m_boost_db > -96.0f ? FLAG_LEFT_ARROW : 0) | (m_boost_db < 20.0f ? FLAG_RIGHT_ARROW : 0),
-			reinterpret_cast<void *>(ITM_BOOST));
-
-	if (m_stereo_available)
-		item_append_on_off(_("menu-arcadeoverlay", "Stereo"), m_stereo, 0, reinterpret_cast<void *>(ITM_STEREO));
-	else
-		item_append(_("menu-arcadeoverlay", "Stereo/Mono: not available for this game"), FLAG_DISABLE, nullptr);
-
-	item_append(menu_item_type::SEPARATOR);
-	item_append(_("menu-arcadeoverlay", "Reset to Default (0 dB, Stereo)"), 0, reinterpret_cast<void *>(ITM_RESET));
-	item_append(_("menu-arcadeoverlay", "Full MAME Menu (save state, DIP switches, etc.)..."), 0, reinterpret_cast<void *>(ITM_FULL_MENU));
-}
-
-
-//-------------------------------------------------
-//  handle
-//-------------------------------------------------
-
-bool menu_arcade_overlay::handle(event const *ev)
-{
-	if (!ev)
-		return false;
-
-	const auto item_ref = reinterpret_cast<uintptr_t>(ev->itemref);
-	set_process_flags((item_ref == ITM_BOOST) ? PROCESS_LR_REPEAT : 0);
-
-	const bool shift_pressed = machine().input().code_pressed(KEYCODE_LSHIFT) || machine().input().code_pressed(KEYCODE_RSHIFT);
-	const bool ctrl_pressed = machine().input().code_pressed(KEYCODE_LCONTROL) || machine().input().code_pressed(KEYCODE_RCONTROL);
-
-	switch (ev->iptkey)
-	{
-	case IPT_UI_LEFT:
-		if (item_ref == ITM_BOOST)
-		{
-			if (shift_pressed)
-				m_boost_db -= 0.1f;
-			else if (ctrl_pressed)
-				m_boost_db -= 10.0f;
-			else
-				m_boost_db -= 1.0f;
-			m_boost_db = std::clamp(m_boost_db, -96.0f, 20.0f);
-			apply_boost();
-			// Re-populate so the displayed "Audio Boost: X dB" text
-			// actually reflects the new value on this same frame -
-			// do_rebuild() only calls populate() when m_items is
-			// empty, so without this the applied gain change is
-			// real (audible) but the on-screen number stays frozen
-			// at whatever it read when the menu was last (re)built,
-			// which looked like input wasn't registering in real
-			// time, especially with PROCESS_LR_REPEAT firing many
-			// times while a direction is held. REMEMBER_POSITION
-			// keeps the cursor on this same item across the rebuild.
-			reset(reset_options::REMEMBER_POSITION);
-			return true;
-		}
-		break;
-
-	case IPT_UI_RIGHT:
-		if (item_ref == ITM_BOOST)
-		{
-			if (shift_pressed)
-				m_boost_db += 0.1f;
-			else if (ctrl_pressed)
-				m_boost_db += 10.0f;
-			else
-				m_boost_db += 1.0f;
-			m_boost_db = std::clamp(m_boost_db, -96.0f, 20.0f);
-			apply_boost();
-			reset(reset_options::REMEMBER_POSITION);
-			return true;
-		}
-		break;
-
-	case IPT_UI_CLEAR:
-		if (item_ref == ITM_BOOST)
-		{
-			m_boost_db = 0.0f;
-			apply_boost();
-			reset(reset_options::REMEMBER_POSITION);
-			return true;
-		}
-		break;
-
-	case IPT_UI_SELECT:
-		if (item_ref == ITM_STEREO)
-		{
-			apply_stereo(!m_stereo);
-			reset(reset_options::REMEMBER_POSITION);
-			return true;
-		}
-		if (item_ref == ITM_RESET)
-		{
-			m_boost_db = 0.0f;
-			if (m_stereo_available)
-				apply_stereo(true);
-			else
-				apply_boost();
-			reset(reset_options::REMEMBER_POSITION);
-			return true;
-		}
-		if (item_ref == ITM_FULL_MENU)
-		{
-			menu::stack_push<menu_main>(ui(), target());
-			return true;
-		}
-		break;
-
-	default:
-		break;
-	}
-
-	return false;
-}
-
-
-//-------------------------------------------------
-//  recompute_metrics / custom_render - RetroArch
-//  Quick-Menu-styled hint bar drawn beneath the item
-//  list
-//-------------------------------------------------
-
-void menu_arcade_overlay::recompute_metrics(uint32_t width, uint32_t height, float aspect)
-{
-	menu::recompute_metrics(width, height, aspect);
-	set_custom_space(0.0f, 2.0f * line_height() + 2.0f * tb_border());
-}
-
-void menu_arcade_overlay::custom_render(uint32_t flags, void *selectedref, float top, float bottom, float origx1, float origy1, float origx2, float origy2)
-{
-	// RetroArch-style dark navy panel with a cyan accent line
-	const rgb_t accent(0xff, 0x22, 0xa8, 0xe0);
-	const rgb_t panel_bg(0xe6, 0x14, 0x16, 0x20);
-
-	float const y2 = 1.0f - tb_border();
-	float const y1 = y2 - bottom;
-	float const x1 = lr_border();
-	float const x2 = 1.0f - lr_border();
-
-	ui().draw_outlined_box(container(), x1, y1, x2, y2, panel_bg);
-	container().add_line(x1, y1, x2, y1, UI_LINE_WIDTH * 2.0f, accent, PRIMFLAG_BLENDMODE(BLENDMODE_ALPHA));
-
-	float const text_x1 = x1 + lr_border();
-	float const text_w = x2 - x1 - 2.0f * lr_border();
-	float const line1_y = y1 + tb_border();
-	float const line2_y = line1_y + line_height();
-
-	draw_text_normal(
-			_("menu-arcadeoverlay", "ARCADE AUDIO MIXER"),
-			text_x1, line1_y, text_w,
-			text_layout::text_justify::CENTER, text_layout::word_wrapping::TRUNCATE,
-			ui().colors().text_color());
-
-	std::string const hint = m_stereo_available
-			? _("menu-arcadeoverlay", "Left/Right: Adjust   Select: Toggle Stereo   Shift: Fine   Ctrl: +/-10dB")
-			: _("menu-arcadeoverlay", "Left/Right: Adjust   Shift: Fine   Ctrl: +/-10dB");
-
-	draw_text_normal(
-			hint,
-			text_x1, line2_y, text_w,
-			text_layout::text_justify::CENTER, text_layout::word_wrapping::TRUNCATE,
-			accent);
-}
-
-} // namespace ui
-CPPCPPEOF
-
-    python3 - "$mame_src_dir" <<'PYEOF'
-import sys, pathlib
-
-root = pathlib.Path(sys.argv[1])
-
-# --- ui.cpp: include the new header ---
-ui_cpp = root / "src/frontend/mame/ui/ui.cpp"
-if not ui_cpp.exists():
-    print("[patch] ui.cpp: file not found, skipping (MAME source may have changed)")
-    sys.exit(3)
-text = ui_cpp.read_text()
-
-old_inc = '#include "ui/filemngr.h"'
-new_inc = '#include "ui/arcadeoverlay.h"\n#include "ui/filemngr.h"'
+#include <cstdlib>'''
 if new_inc in text:
-    print("[patch] ui.cpp include: already applied")
+    print("[patch] libretro.cpp includes: already applied")
 elif old_inc not in text:
-    print("[patch] ui.cpp include: anchor text not found, skipping (MAME source may have changed)")
-    sys.exit(3)
+    print("[patch] libretro.cpp includes: anchor text not found, skipping (MAME source may have changed)")
+    rc = 3
 else:
     text = text.replace(old_inc, new_inc, 1)
-    print("[patch] ui.cpp include: applied")
+    print("[patch] libretro.cpp includes: applied")
 
-old_hook = """	// turn on menus if requested
-	if (inp.pressed(IPT_UI_MENU))
-	{
-		m_ui_target = &current_ui_target();
-		if (!machine().paused() && options().menu_pause())
-		{
-			machine().pause();
-			m_paused_for_menu = true;
-		}
-		if (ui::menu::stack_empty(*this))
-			ui::menu::stack_push<ui::menu_main>(*this, *m_ui_target);
-		activate_menu();
-		return 0;
-	}"""
-new_hook = """	// turn on menus if requested - jump straight to the arcade audio
-	// overlay (RetroArch Quick-Menu style) instead of MAME's normal
-	// nested main menu; the overlay itself offers a "Full MAME Menu"
-	// item for save states, DIP switches, and everything else
-	if (inp.pressed(IPT_UI_MENU))
-	{
-		m_ui_target = &current_ui_target();
-		if (!machine().paused() && options().menu_pause())
-		{
-			machine().pause();
-			m_paused_for_menu = true;
-		}
-		if (ui::menu::stack_empty(*this))
-			ui::menu::stack_push<ui::menu_arcade_overlay>(*this, *m_ui_target);
-		activate_menu();
-		return 0;
-	}"""
-if new_hook in text:
-    print("[patch] ui.cpp hotkey hook: already applied")
-elif old_hook not in text:
-    print("[patch] ui.cpp hotkey hook: anchor text not found, skipping (MAME source may have changed)")
-    sys.exit(3)
-else:
-    text = text.replace(old_hook, new_hook, 1)
-    print("[patch] ui.cpp hotkey hook: applied")
+helper_marker = "/* pi-arcade-setup: per-game audio boost / stereo-mono */"
+helper_block = helper_marker + '''
+enum class pi_arcade_layout_type
+{
+   NONE,
+   SINGLE_MULTI,
+   SINGLE_MONO,
+   SPLIT_STEREO,
+   OTHER
+};
 
-ui_cpp.write_text(text)
+static float pi_arcade_last_boost_db              = 0.0f;
+static bool  pi_arcade_last_stereo                = true;
+static bool  pi_arcade_audio_options_initialized  = false;
 
-# --- frontend.lua: register the new source files with the build ---
-frontend_lua = root / "scripts/src/mame/frontend.lua"
-if not frontend_lua.exists():
-    print("[patch] frontend.lua: file not found, skipping (MAME source may have changed)")
-    sys.exit(3)
-text = frontend_lua.read_text()
+static pi_arcade_layout_type pi_arcade_scan_layout(running_machine &machine, std::vector<sound_io_device *> &out_devs)
+{
+   out_devs.clear();
+   for (const auto &omap : machine.sound().get_mappings())
+      if (omap.m_dev && omap.m_dev->is_output())
+         out_devs.push_back(omap.m_dev);
 
-old = '\tMAME_DIR .. "src/frontend/mame/ui/audiomix.cpp",\n\tMAME_DIR .. "src/frontend/mame/ui/audiomix.h",'
-new = '\tMAME_DIR .. "src/frontend/mame/ui/arcadeoverlay.cpp",\n\tMAME_DIR .. "src/frontend/mame/ui/arcadeoverlay.h",\n\tMAME_DIR .. "src/frontend/mame/ui/audiomix.cpp",\n\tMAME_DIR .. "src/frontend/mame/ui/audiomix.h",'
-if new in text:
-    print("[patch] frontend.lua registration: already applied")
-elif old not in text:
-    print("[patch] frontend.lua registration: anchor text not found, skipping (MAME source may have changed)")
-    sys.exit(3)
-else:
-    text = text.replace(old, new, 1)
-    print("[patch] frontend.lua registration: applied")
-
-frontend_lua.write_text(text)
-sys.exit(0)
-PYEOF
+   if (out_devs.empty())
+      return pi_arcade_layout_type::NONE;
+   if (out_devs.size() == 1)
+      return (out_devs[0]->inputs() >= 2) ? pi_arcade_layout_type::SINGLE_MULTI : pi_arcade_layout_type::SINGLE_MONO;
+   if (out_devs.size() == 2 && out_devs[0]->inputs() == 1 && out_devs[1]->inputs() == 1)
+      return pi_arcade_layout_type::SPLIT_STEREO;
+   return pi_arcade_layout_type::OTHER;
 }
 
-# Builds MAME (lr-mame) from source with the custom Arcade Audio Mixer
-# overlay - see ENABLE_MAME_CUSTOM_OVERLAY above. Mirrors the exact
-# sources/patch/_source_ sequence phase_dreamcast_flycast_install uses for
-# Flycast (see that phase's own comment for why retropie_packages.sh is
+static std::string pi_arcade_find_node_name(running_machine &machine, uint32_t node)
+{
+   const auto &info = machine.sound().get_osd_info();
+   for (const auto &n : info.m_nodes)
+      if (n.m_id == node)
+         return n.name();
+   return "";
+}
+
+static void pi_arcade_clear_all_routes(running_machine &machine, sound_io_device *dev)
+{
+   for (;;)
+   {
+      bool changed = false;
+      for (const auto &omap : machine.sound().get_mappings())
+      {
+         if (omap.m_dev != dev)
+            continue;
+
+         if (!omap.m_node_mappings.empty())
+         {
+            const auto &nmap = omap.m_node_mappings.front();
+            if (nmap.m_is_system_default)
+               machine.sound().config_remove_sound_io_connection_default(dev);
+            else
+               machine.sound().config_remove_sound_io_connection_node(dev, pi_arcade_find_node_name(machine, nmap.m_node));
+            changed = true;
+         }
+         else if (!omap.m_channel_mappings.empty())
+         {
+            const auto &cmap = omap.m_channel_mappings.front();
+            if (cmap.m_is_system_default)
+               machine.sound().config_remove_sound_io_channel_connection_default(dev, cmap.m_guest_channel, cmap.m_node_channel);
+            else
+               machine.sound().config_remove_sound_io_channel_connection_node(dev, cmap.m_guest_channel, pi_arcade_find_node_name(machine, cmap.m_node), cmap.m_node_channel);
+            changed = true;
+         }
+         break;
+      }
+      if (!changed)
+         break;
+   }
+}
+
+static void pi_arcade_apply_audio_options(running_machine &machine, float boost_db, bool stereo)
+{
+   std::vector<sound_io_device *> out_devs;
+   const pi_arcade_layout_type layout = pi_arcade_scan_layout(machine, out_devs);
+   const bool want_downmix = !stereo && (layout == pi_arcade_layout_type::SINGLE_MULTI || layout == pi_arcade_layout_type::SPLIT_STEREO);
+
+   if (layout == pi_arcade_layout_type::SINGLE_MULTI)
+   {
+      sound_io_device *const dev = out_devs[0];
+      pi_arcade_clear_all_routes(machine, dev);
+      if (!want_downmix)
+      {
+         machine.sound().config_add_sound_io_connection_default(dev, boost_db);
+      }
+      else
+      {
+         const float ch_db = boost_db - 6.0f;
+         const uint32_t guest_channels = std::min<uint32_t>(2, dev->inputs());
+         for (uint32_t g = 0; g < guest_channels; g++)
+            for (uint32_t n = 0; n < 2; n++)
+               machine.sound().config_add_sound_io_channel_connection_default(dev, g, n, ch_db);
+      }
+   }
+   else if (layout == pi_arcade_layout_type::SPLIT_STEREO)
+   {
+      for (size_t i = 0; i < out_devs.size() && i < 2; i++)
+      {
+         sound_io_device *const dev = out_devs[i];
+         pi_arcade_clear_all_routes(machine, dev);
+         if (!want_downmix)
+         {
+            machine.sound().config_add_sound_io_channel_connection_default(dev, 0, uint32_t(i), boost_db);
+         }
+         else
+         {
+            const float ch_db = boost_db - 6.0f;
+            machine.sound().config_add_sound_io_channel_connection_default(dev, 0, 0, ch_db);
+            machine.sound().config_add_sound_io_channel_connection_default(dev, 0, 1, ch_db);
+         }
+      }
+   }
+   else
+   {
+      /* NONE / SINGLE_MONO / OTHER: no meaningful stereo/mono topology
+         change available - just re-apply gain to whatever routes already
+         exist (or add a default one if none exist yet), unchanged. */
+      for (sound_io_device *dev : out_devs)
+      {
+         bool any = false;
+         for (const auto &omap : machine.sound().get_mappings())
+         {
+            if (omap.m_dev != dev)
+               continue;
+            for (const auto &nmap : omap.m_node_mappings)
+            {
+               if (nmap.m_is_system_default)
+                  machine.sound().config_set_volume_sound_io_connection_default(dev, boost_db);
+               else
+                  machine.sound().config_set_volume_sound_io_connection_node(dev, pi_arcade_find_node_name(machine, nmap.m_node), boost_db);
+               any = true;
+            }
+            for (const auto &cmap : omap.m_channel_mappings)
+            {
+               if (cmap.m_is_system_default)
+                  machine.sound().config_set_volume_sound_io_channel_connection_default(dev, cmap.m_guest_channel, cmap.m_node_channel, boost_db);
+               else
+                  machine.sound().config_set_volume_sound_io_channel_connection_node(dev, cmap.m_guest_channel, pi_arcade_find_node_name(machine, cmap.m_node), cmap.m_node_channel, boost_db);
+               any = true;
+            }
+            break;
+         }
+         if (!any)
+            machine.sound().config_add_sound_io_connection_default(dev, boost_db);
+      }
+   }
+}
+
+static void pi_arcade_check_audio_variables(void)
+{
+   struct retro_variable var = {0};
+   bool changed = !pi_arcade_audio_options_initialized;
+
+   var.key   = CORE_NAME "_arcade_audio_boost_db";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      const float db = (float)atof(var.value);
+      if (db != pi_arcade_last_boost_db)
+      {
+         pi_arcade_last_boost_db = db;
+         changed = true;
+      }
+   }
+
+   var.key   = CORE_NAME "_arcade_audio_stereo";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      const bool stereo = !strcmp(var.value, "stereo");
+      if (stereo != pi_arcade_last_stereo)
+      {
+         pi_arcade_last_stereo = stereo;
+         changed = true;
+      }
+   }
+
+   if (!changed)
+      return;
+
+   if (   mame_machine_manager::instance() != NULL
+       && mame_machine_manager::instance()->machine() != NULL)
+   {
+      pi_arcade_apply_audio_options(*mame_machine_manager::instance()->machine(), pi_arcade_last_boost_db, pi_arcade_last_stereo);
+      pi_arcade_audio_options_initialized = true;
+   }
+}
+'''
+
+old_cv_tail = '''   var.key   = CORE_NAME "_media_type";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      sprintf(mediaType,"-%s",var.value);
+   }
+}'''
+new_cv_tail = '''   var.key   = CORE_NAME "_media_type";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      sprintf(mediaType,"-%s",var.value);
+   }
+
+   pi_arcade_check_audio_variables();
+}'''
+
+if helper_marker in text:
+    print("[patch] libretro.cpp helper functions: already applied")
+elif old_cv_tail not in text:
+    print("[patch] libretro.cpp check_variables() hook: anchor text not found, skipping (MAME source may have changed)")
+    rc = 3
+else:
+    # Insert the helper block immediately before check_variables()'s own
+    # definition, then hook its tail.
+    cv_def = "static void check_variables(void)"
+    idx = text.find(cv_def)
+    if idx == -1:
+        print("[patch] libretro.cpp: check_variables() definition not found, skipping")
+        rc = 3
+    else:
+        text = text[:idx] + helper_block + "\n" + text[idx:]
+        text = text.replace(old_cv_tail, new_cv_tail, 1)
+        print("[patch] libretro.cpp helper functions + check_variables() hook: applied")
+
+old_first_run = '''   if (first_run)
+   {
+      /* Skip drawing the first frame due to a gray border */
+      first_run       = false;
+      draw_this_frame = false;
+   }'''
+new_first_run = '''   if (first_run)
+   {
+      /* Skip drawing the first frame due to a gray border */
+      first_run       = false;
+      draw_this_frame = false;
+
+      /* pi-arcade-setup: safety net - apply the per-game persisted audio
+         boost/stereo options here too, in case check_variables() ran
+         earlier (from retro_load_game()) before mame_machine_manager had
+         a running_machine yet. Idempotent: no-ops if already applied. */
+      pi_arcade_check_audio_variables();
+   }'''
+if "safety net - apply the per-game persisted audio" in text:
+    print("[patch] libretro.cpp retro_run() hook: already applied")
+elif old_first_run not in text:
+    print("[patch] libretro.cpp retro_run() hook: anchor text not found, skipping (MAME source may have changed)")
+    rc = 3
+else:
+    text = text.replace(old_first_run, new_first_run, 1)
+    print("[patch] libretro.cpp retro_run() hook: applied")
+
+open(cpp_path, "w").write(text)
+sys.exit(rc)
+PYEOF
+    local status=$?
+    if [ $status -ne 0 ]; then
+        return $status
+    fi
+    return 0
+}
+
+
+# Builds MAME (lr-mame) from source with the extra Audio Boost / Stereo-Mono
+# core options - see ENABLE_MAME_ARCADE_AUDIO_OPTIONS above. Mirrors the
+# exact sources/patch/_source_ sequence phase_dreamcast_flycast_install uses
+# for Flycast (see that phase's own comment for why retropie_packages.sh is
 # split into two calls rather than one).
 phase_mame_arcade_overlay_build() {
-    if [ "$ENABLE_MAME_CUSTOM_OVERLAY" != "true" ]; then
-        log "ENABLE_MAME_CUSTOM_OVERLAY=false, stock prebuilt MAME from phase_emulators_install stands"
+    if [ "$ENABLE_MAME_ARCADE_AUDIO_OPTIONS" != "true" ]; then
+        log "ENABLE_MAME_ARCADE_AUDIO_OPTIONS=false, stock prebuilt MAME from phase_emulators_install stands"
         return 0
     fi
     cd "$PI_HOME/RetroPie-Setup" || die "RetroPie-Setup missing"
     log "Fetching MAME source"
     sudo ./retropie_packages.sh lr-mame sources || die "lr-mame sources step failed"
 
-    _apply_mame_arcade_overlay_patch "$PI_HOME/RetroPie-Setup/tmp/build/lr-mame" \
-        || log_warn "MAME arcade overlay patch did not fully apply - build may fail, or may succeed but fall back to MAME's stock in-game menu, if MAME's source has changed since this script was written"
+    # retropie_packages.sh's "sources" step runs as root (via the sudo
+    # above), so the cloned tree is root-owned - confirmed live
+    # (PermissionError writing libretro_core_options.h as $PI_USER without
+    # this). Hand it back to $PI_USER before patching as a plain user below;
+    # the subsequent "_source_" build step re-invokes retropie_packages.sh
+    # with sudo again regardless, so this doesn't affect the build itself.
+    sudo chown -R "$PI_USER:$PI_USER" "$PI_HOME/RetroPie-Setup/tmp/build/lr-mame" \
+        || log_warn "Could not chown MAME source tree to $PI_USER - the patch step below may fail with a permission error"
 
-    log "Building MAME with the custom Arcade Audio Mixer overlay - full arcade subtarget build, confirmed ~12 hours wall-clock on a Pi 4 with -j4"
+    _apply_mame_arcade_overlay_patch "$PI_HOME/RetroPie-Setup/tmp/build/lr-mame" \
+        || log_warn "MAME arcade audio core-options patch did not fully apply - build may fail, or may succeed but without the extra Audio Boost/Stereo-Mono options, if MAME's source has changed since this script was written"
+
+    log "Building MAME with the extra Audio Boost/Stereo-Mono core options - full arcade subtarget build, confirmed ~12 hours wall-clock on a Pi 4 with -j4"
     sudo ./retropie_packages.sh lr-mame _source_ || die "lr-mame build/install failed"
 
     if [ ! -f /opt/retropie/libretrocores/lr-mame/mamearcade_libretro.so ]; then
@@ -2256,7 +2020,1425 @@ phase_retroarch_menu_rotation_patch() {
     # with no error to indicate it.
     sudo ./retropie_packages.sh retroarch build || die "RetroArch rebuild after menu rotation patch failed"
     sudo ./retropie_packages.sh retroarch install || die "RetroArch install after menu rotation patch rebuild failed"
+
+    if ! _apply_retroarch_quickmenu_extensions_patch "$ra_src_dir"; then
+        log_warn "RetroArch Quick Menu extensions patch (Display Brightness/Sound/Game Audio) did not fully apply - continuing with whatever subset did apply, or none at all"
+    else
+        log "Rebuilding RetroArch again with the Quick Menu extensions (Display Brightness/Sound/Game Audio)"
+        sudo ./retropie_packages.sh retroarch build || die "RetroArch rebuild after Quick Menu extensions patch failed"
+        sudo ./retropie_packages.sh retroarch install || die "RetroArch install after Quick Menu extensions patch rebuild failed"
+    fi
     return 0
+}
+
+# Extends RetroArch's own Quick Menu (opened in-game by the Home/Menu-
+# Toggle hotkey; the same screen _apply_retroarch_menu_rotation_patch above
+# already source-patches purely for rotation) with three new top-level
+# entries - "Display Brightness", "Sound", and "Game Audio" - so every
+# per-game hardware control this project offers lives in ONE place,
+# reachable with just an arcade-style gamepad (Home button to open,
+# D-pad/analog-stick Left-Right to adjust, B/Select to back out) - this
+# replaces the old separate "Hotkey Config" L3+R3+face-button mechanism
+# entirely (see that tool's own removal, and controller-hotkeys's removal,
+# elsewhere in this script).
+#
+#   - Display Brightness: a single adjustable percentage entry. Reuses
+#     RetroArch's OWN already-complete, already-working brightness
+#     mechanism end-to-end (frontend_driver_set_screen_brightness(),
+#     already wired to a real Settings-menu entry via
+#     MENU_ENUM_LABEL_BRIGHTNESS_CONTROL) - the only RetroArch menu-code
+#     change needed is ONE line pulling that existing setting into the
+#     Quick Menu too, via MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM (the exact
+#     same macro RetroArch itself uses to inject "State Slot" alongside
+#     Save State/Load State in this same screen - confirmed live in
+#     RetroArch's own source). Separately, this patch also fixes the unix
+#     frontend driver's hardcoded "/sys/class/backlight/backlight/..."
+#     path (confirmed not to exist on this hardware's touchscreen panel)
+#     to auto-detect whatever backlight device sysfs actually exposes -
+#     the same glob-first-match approach this project's own (now removed)
+#     controller-hotkeys.py used for the same problem. Write permission
+#     for the non-root RetroArch process is handled by a separate udev
+#     rule - see phase_backlight_udev_permission.
+#   - Sound: a new submenu (Output Device / Volume / Mute) driving the
+#     system's actual PipeWire/WirePlumber audio output via wpctl - the
+#     exact same commands this project's standalone "Audio settings" tool
+#     already uses, ported here rather than reinvented, so both stay
+#     consistent. This needs genuinely new menu code since it's OS-level
+#     state RetroArch has no existing concept of: three small new
+#     get_value/left/right dispatch cases (MENU_SETTING_ARCADE_SOUND_
+#     DEVICE/VOLUME/MUTE), each adjustable with EITHER Left or Right
+#     (toggling/stepping either direction) rather than needing a separate
+#     confirm/select step - deliberately simple for a 4-button arcade
+#     stick with no dedicated "confirm" affordance beyond one face button.
+#   - Game Audio: a new submenu exposing the two MAME core options this
+#     project registers (mame_arcade_audio_boost_db / mame_arcade_audio_
+#     stereo - see _apply_mame_arcade_overlay_patch) as ordinary Quick
+#     Menu entries, using RetroArch's OWN generic core-option rendering
+#     (MENU_SETTINGS_CORE_OPTION_START + index - the exact same mechanism
+#     "Core Options" itself uses internally) - zero new get/left/right
+#     code needed for these two specific items, they are just looked up
+#     by key and appended. Shows a placeholder message when the running
+#     core isn't MAME (those two core options only exist for lr-mame).
+#
+# The two new top-level pushes ("Sound", "Game Audio") get their own small
+# msg_hash_us.h string-table entries (unlike the earlier MAME-side patch,
+# which deliberately avoided touching MAME's own string tables) - confirmed
+# live in RetroArch's own source that its OK-callback binding table
+# (menu_cbs_init_bind_ok_compare_label) matches Quick Menu push entries by
+# comparing their *resolved display label string*, not their raw enum
+# value as initially assumed; giving these two entries real, unique string
+# entries (rather than relying on the "null" fallback every OTHER
+# unregistered label enum also falls back to) is what makes that string
+# comparison collision-free and deterministic.
+#
+# Same idempotent, anchor-checked, fail-soft pattern as every other source
+# patch in this script.
+_apply_retroarch_quickmenu_extensions_patch() {
+    local ra_src_dir="$1"
+    python3 - "$ra_src_dir" <<'PYEOF'
+import sys, pathlib
+
+root = pathlib.Path(sys.argv[1])
+overall_rc = [0]
+
+def patch_file(relpath, replacements):
+    path = root / relpath
+    if not path.exists():
+        print(f"[patch] {relpath}: file not found, skipping (RetroArch source may have changed)")
+        overall_rc[0] = 3
+        return
+    text = path.read_text()
+    changed = False
+    for name, old, new in replacements:
+        if new in text:
+            print(f"[patch] {relpath} :: {name}: already applied")
+            continue
+        if old not in text:
+            print(f"[patch] {relpath} :: {name}: anchor text not found, skipping (RetroArch source may have changed)")
+            overall_rc[0] = 3
+            continue
+        text = text.replace(old, new, 1)
+        changed = True
+        print(f"[patch] {relpath} :: {name}: applied")
+    if changed:
+        path.write_text(text)
+
+# -----------------------------------------------------------------------
+# msg_hash.h: declare the two new label enums (LABEL/SUBLABEL/VALUE triple
+# each, via the same MENU_LABEL() macro every other Quick Menu entry uses)
+# -----------------------------------------------------------------------
+patch_file("msg_hash.h", [
+    ("declare QUICK_MENU_SOUND/GAME_AUDIO enums",
+     "   MENU_LABEL(CORE_OPTIONS),\n",
+     "   MENU_LABEL(CORE_OPTIONS),\n"
+     "   MENU_LABEL(QUICK_MENU_SOUND),\n"
+     "   MENU_LABEL(QUICK_MENU_GAME_AUDIO),\n"),
+])
+
+# -----------------------------------------------------------------------
+# intl/msg_hash_us.h: English strings for those two labels (LABEL bare +
+# SUBLABEL + VALUE) - the bare LABEL string specifically is what makes
+# menu_cbs_init_bind_ok_compare_label's string match collision-free (see
+# this function's own top comment).
+# -----------------------------------------------------------------------
+patch_file("intl/msg_hash_us.h", [
+    ("QUICK_MENU_SOUND/GAME_AUDIO strings",
+     'MSG_HASH(\n'
+     '   MENU_ENUM_SUBLABEL_CORE_OPTIONS,\n'
+     '   "Change the options for the currently running content."\n'
+     '   )\n',
+     'MSG_HASH(\n'
+     '   MENU_ENUM_SUBLABEL_CORE_OPTIONS,\n'
+     '   "Change the options for the currently running content."\n'
+     '   )\n'
+     'MSG_HASH(\n'
+     '   MENU_ENUM_LABEL_QUICK_MENU_SOUND,\n'
+     '   "quick_menu_sound"\n'
+     '   )\n'
+     'MSG_HASH(\n'
+     '   MENU_ENUM_LABEL_VALUE_QUICK_MENU_SOUND,\n'
+     '   "Sound"\n'
+     '   )\n'
+     'MSG_HASH(\n'
+     '   MENU_ENUM_SUBLABEL_QUICK_MENU_SOUND,\n'
+     '   "Configure the system audio output device, volume, and mute (via WirePlumber/PipeWire)."\n'
+     '   )\n'
+     'MSG_HASH(\n'
+     '   MENU_ENUM_LABEL_QUICK_MENU_GAME_AUDIO,\n'
+     '   "quick_menu_game_audio"\n'
+     '   )\n'
+     'MSG_HASH(\n'
+     '   MENU_ENUM_LABEL_VALUE_QUICK_MENU_GAME_AUDIO,\n'
+     '   "Game Audio"\n'
+     '   )\n'
+     'MSG_HASH(\n'
+     '   MENU_ENUM_SUBLABEL_QUICK_MENU_GAME_AUDIO,\n'
+     '   "Per-game arcade audio boost and stereo/mono downmix (MAME only)."\n'
+     '   )\n'),
+])
+
+# -----------------------------------------------------------------------
+# menu/menu_driver.h: three new leaf item "type" constants for the Sound
+# screen (Display Brightness and Game Audio need no new type constants -
+# see this patch's own top comment).
+# -----------------------------------------------------------------------
+patch_file("menu/menu_driver.h", [
+    ("MENU_SETTING_ARCADE_SOUND_* constants",
+     "   MENU_SETTING_ACTION_CONTENTLESS_CORE_RUN,\n\n   MENU_SETTINGS_LAST\n};",
+     "   MENU_SETTING_ACTION_CONTENTLESS_CORE_RUN,\n\n"
+     "   MENU_SETTING_ARCADE_SOUND_DEVICE,\n"
+     "   MENU_SETTING_ARCADE_SOUND_VOLUME,\n"
+     "   MENU_SETTING_ARCADE_SOUND_MUTE,\n\n"
+     "   MENU_SETTINGS_LAST\n};"),
+])
+
+# -----------------------------------------------------------------------
+# menu/menu_displaylist.h: two new displaylist screen types (Sound,
+# Game Audio submenus).
+# -----------------------------------------------------------------------
+patch_file("menu/menu_displaylist.h", [
+    ("DISPLAYLIST_PI_ARCADE_* constants",
+     "   DISPLAYLIST_PENDING_CLEAR,\n"
+     "   DISPLAYLIST_SHADER_PRESET_PREPEND,\n"
+     "   DISPLAYLIST_SHADER_PRESET_APPEND\n};",
+     "   DISPLAYLIST_PENDING_CLEAR,\n"
+     "   DISPLAYLIST_SHADER_PRESET_PREPEND,\n"
+     "   DISPLAYLIST_SHADER_PRESET_APPEND,\n"
+     "   DISPLAYLIST_PI_ARCADE_SOUND,\n"
+     "   DISPLAYLIST_PI_ARCADE_GAME_AUDIO\n};"),
+])
+
+# -----------------------------------------------------------------------
+# menu/menu_cbs.h: two new OK-push action types for those two screens.
+# -----------------------------------------------------------------------
+patch_file("menu/menu_cbs.h", [
+    ("ACTION_OK_DL_PI_ARCADE_* constants",
+     "   ACTION_OK_DL_REMAP_FILE_MANAGER_LIST,\n   ACTION_OK_DL_ADD_TO_PLAYLIST\n};",
+     "   ACTION_OK_DL_REMAP_FILE_MANAGER_LIST,\n"
+     "   ACTION_OK_DL_ADD_TO_PLAYLIST,\n"
+     "   ACTION_OK_DL_PI_ARCADE_SOUND,\n"
+     "   ACTION_OK_DL_PI_ARCADE_GAME_AUDIO\n};"),
+])
+
+# -----------------------------------------------------------------------
+# menu/cbs/menu_cbs_ok.c: the two new pushes' OK-callback wiring, modeled
+# directly on ACTION_OK_DL_CONTENT_SETTINGS (a "push a new self-built
+# list" pattern already used throughout this same function).
+# -----------------------------------------------------------------------
+patch_file("menu/cbs/menu_cbs_ok.c", [
+    ("action_ok_push_pi_arcade_* declarations",
+     "STATIC_DEFAULT_ACTION_OK_FUNC(action_ok_push_core_options_list, ACTION_OK_DL_CORE_OPTIONS_LIST)\n",
+     "STATIC_DEFAULT_ACTION_OK_FUNC(action_ok_push_core_options_list, ACTION_OK_DL_CORE_OPTIONS_LIST)\n"
+     "STATIC_DEFAULT_ACTION_OK_FUNC(action_ok_push_pi_arcade_sound, ACTION_OK_DL_PI_ARCADE_SOUND)\n"
+     "STATIC_DEFAULT_ACTION_OK_FUNC(action_ok_push_pi_arcade_game_audio, ACTION_OK_DL_PI_ARCADE_GAME_AUDIO)\n"),
+    ("generic_action_ok_displaylist_push switch cases",
+     "      case ACTION_OK_DL_CONTENT_SETTINGS:\n"
+     "         info.list          = MENU_LIST_GET_SELECTION(menu_list, 0);\n"
+     "         info_path          = msg_hash_to_str(MENU_ENUM_LABEL_VALUE_CONTENT_SETTINGS);\n"
+     "         info_label         = msg_hash_to_str(MENU_ENUM_LABEL_CONTENT_SETTINGS);\n"
+     "         info.enum_idx      = MENU_ENUM_LABEL_CONTENT_SETTINGS;\n"
+     "         menu_entries_append(menu_stack, info_path, info_label,\n"
+     "               MENU_ENUM_LABEL_CONTENT_SETTINGS,\n"
+     "               0, 0, 0, NULL);\n"
+     "         dl_type            = DISPLAYLIST_CONTENT_SETTINGS;\n"
+     "         break;\n"
+     "   }",
+     "      case ACTION_OK_DL_CONTENT_SETTINGS:\n"
+     "         info.list          = MENU_LIST_GET_SELECTION(menu_list, 0);\n"
+     "         info_path          = msg_hash_to_str(MENU_ENUM_LABEL_VALUE_CONTENT_SETTINGS);\n"
+     "         info_label         = msg_hash_to_str(MENU_ENUM_LABEL_CONTENT_SETTINGS);\n"
+     "         info.enum_idx      = MENU_ENUM_LABEL_CONTENT_SETTINGS;\n"
+     "         menu_entries_append(menu_stack, info_path, info_label,\n"
+     "               MENU_ENUM_LABEL_CONTENT_SETTINGS,\n"
+     "               0, 0, 0, NULL);\n"
+     "         dl_type            = DISPLAYLIST_CONTENT_SETTINGS;\n"
+     "         break;\n"
+     "      case ACTION_OK_DL_PI_ARCADE_SOUND:\n"
+     "         info.list          = MENU_LIST_GET_SELECTION(menu_list, 0);\n"
+     "         info_path          = msg_hash_to_str(MENU_ENUM_LABEL_VALUE_QUICK_MENU_SOUND);\n"
+     "         info_label         = msg_hash_to_str(MENU_ENUM_LABEL_QUICK_MENU_SOUND);\n"
+     "         info.enum_idx      = MENU_ENUM_LABEL_QUICK_MENU_SOUND;\n"
+     "         menu_entries_append(menu_stack, info_path, info_label,\n"
+     "               MENU_ENUM_LABEL_QUICK_MENU_SOUND,\n"
+     "               0, 0, 0, NULL);\n"
+     "         dl_type            = DISPLAYLIST_PI_ARCADE_SOUND;\n"
+     "         break;\n"
+     "      case ACTION_OK_DL_PI_ARCADE_GAME_AUDIO:\n"
+     "         info.list          = MENU_LIST_GET_SELECTION(menu_list, 0);\n"
+     "         info_path          = msg_hash_to_str(MENU_ENUM_LABEL_VALUE_QUICK_MENU_GAME_AUDIO);\n"
+     "         info_label         = msg_hash_to_str(MENU_ENUM_LABEL_QUICK_MENU_GAME_AUDIO);\n"
+     "         info.enum_idx      = MENU_ENUM_LABEL_QUICK_MENU_GAME_AUDIO;\n"
+     "         menu_entries_append(menu_stack, info_path, info_label,\n"
+     "               MENU_ENUM_LABEL_QUICK_MENU_GAME_AUDIO,\n"
+     "               0, 0, 0, NULL);\n"
+     "         dl_type            = DISPLAYLIST_PI_ARCADE_GAME_AUDIO;\n"
+     "         break;\n"
+     "   }"),
+    ("ok_list[] table entries (string-compare fallback array - kept for\n"
+     "     safety/consistency, though the real fix is the enum-compare array\n"
+     "     below, since our entries always have a real enum_idx)",
+     "         {MENU_ENUM_LABEL_MANUAL_CONTENT_SCAN_DAT_FILE,        action_ok_manual_content_scan_dat_file},\n"
+     "      };\n"
+     "\n"
+     "      for (i = 0; i < ARRAY_SIZE(ok_list); i++)\n"
+     "      {\n"
+     "         if (string_is_equal(label, msg_hash_to_str(ok_list[i].type)))",
+     "         {MENU_ENUM_LABEL_MANUAL_CONTENT_SCAN_DAT_FILE,        action_ok_manual_content_scan_dat_file},\n"
+     "         {MENU_ENUM_LABEL_QUICK_MENU_SOUND,                    action_ok_push_pi_arcade_sound},\n"
+     "         {MENU_ENUM_LABEL_QUICK_MENU_GAME_AUDIO,               action_ok_push_pi_arcade_game_audio},\n"
+     "      };\n"
+     "\n"
+     "      for (i = 0; i < ARRAY_SIZE(ok_list); i++)\n"
+     "      {\n"
+     "         if (string_is_equal(label, msg_hash_to_str(ok_list[i].type)))"),
+    # BUG FOUND LIVE (disclosed per the user's request to note and fix any
+    # errors along the way): pressing OK/A on "Sound" or "Game Audio" did
+    # nothing at all. Root-caused via a live gdb-free strace of RetroArch's
+    # own stderr (temporary debug fprintf calls, since removed) which
+    # showed menu_cbs_init_bind_ok_compare_label() reaching its *string*-
+    # keyed ok_list[] scan (the one patched just above) and NOT matching -
+    # because that string-keyed array is only ever consulted in the
+    # `else` branch of `if (cbs->enum_idx != MSG_UNKNOWN) { ...enum-keyed
+    # ok_list...} else { ...string-keyed ok_list... }`. Since our two new
+    # entries DO have a real enum_idx (MENU_ENUM_LABEL_QUICK_MENU_SOUND/
+    # GAME_AUDIO, passed to menu_entries_append), they always take the
+    # *first* (enum-keyed, `cbs->enum_idx == ok_list[i].type`) branch,
+    # where they were never registered - the string-keyed addition above
+    # was therefore dead code for these two entries. Fixed by also
+    # registering them in the enum-keyed array, which is the one that
+    # actually gets consulted.
+    ("ok_list[] table entries (enum-compare array - this is the one that\n"
+     "     actually runs for entries with a real enum_idx, which ours have)",
+     "         {MENU_ENUM_LABEL_CONTENTLESS_CORES_TAB,               action_ok_push_default},\n"
+     "      };\n"
+     "\n"
+     "      for (i = 0; i < ARRAY_SIZE(ok_list); i++)\n"
+     "      {\n"
+     "         if (cbs->enum_idx == ok_list[i].type)",
+     "         {MENU_ENUM_LABEL_CONTENTLESS_CORES_TAB,               action_ok_push_default},\n"
+     "         {MENU_ENUM_LABEL_QUICK_MENU_SOUND,                    action_ok_push_pi_arcade_sound},\n"
+     "         {MENU_ENUM_LABEL_QUICK_MENU_GAME_AUDIO,               action_ok_push_pi_arcade_game_audio},\n"
+     "      };\n"
+     "\n"
+     "      for (i = 0; i < ARRAY_SIZE(ok_list); i++)\n"
+     "      {\n"
+     "         if (cbs->enum_idx == ok_list[i].type)"),
+])
+
+sys.exit(overall_rc[0])
+PYEOF
+    local status=$?
+
+    _apply_retroarch_pi_arcade_sound_header "$ra_src_dir" || status=3
+    _apply_retroarch_left_right_get_value_patch "$ra_src_dir" || status=3
+    _apply_retroarch_displaylist_content_patch "$ra_src_dir" || status=3
+    _apply_retroarch_backlight_path_patch "$ra_src_dir" || status=3
+    _apply_retroarch_brightness_wraparound_patch "$ra_src_dir" || status=3
+
+    return $status
+}
+
+# Small header-only declaration file for the wpctl-backed Sound helpers -
+# implemented (non-static, so every translation unit below can link
+# against them) directly inside menu_displaylist.c by
+# _apply_retroarch_displaylist_content_patch, rather than registering a
+# brand new .c file with RetroArch's own Makefile.common (lower risk: no
+# build-system changes needed at all, just an extra header include in
+# three already-compiled files).
+_apply_retroarch_pi_arcade_sound_header() {
+    local ra_src_dir="$1"
+    local header="$ra_src_dir/menu/pi_arcade_sound.h"
+    if [ -f "$header" ] && grep -q "pi_arcade_sound_get_device" "$header"; then
+        echo "[patch] menu/pi_arcade_sound.h: already applied"
+        return 0
+    fi
+    cat > "$header" <<'HEOF'
+/* pi-arcade-setup: system audio output control (device/volume/mute) for
+ * the RetroArch Quick Menu's "Sound" entry, via wpctl (PipeWire/
+ * WirePlumber) - the same tool this project's standalone "Audio settings"
+ * RetroPie-menu tool already uses, kept consistent rather than reinvented.
+ * Implemented in menu_displaylist.c; declared here so menu_cbs_left.c,
+ * menu_cbs_right.c, and menu_cbs_get_value.c can all link against the
+ * same implementation without RetroArch's build needing a new source
+ * file registered. */
+
+#ifndef PI_ARCADE_SOUND_H
+#define PI_ARCADE_SOUND_H
+
+#include <retro_common_api.h>
+
+RETRO_BEGIN_DECLS
+
+/* 0 = aux/headphone jack, 1 = HDMI, -1 = unknown/no matching sink found */
+int pi_arcade_sound_get_device(void);
+/* dev: 0 or 1 as above. No-op if that kind of sink isn't present. */
+void pi_arcade_sound_set_device(int dev);
+
+/* 0-100, or -1 if unavailable */
+int pi_arcade_sound_get_volume(void);
+/* delta_percent: e.g. +5 or -5 */
+void pi_arcade_sound_adjust_volume(int delta_percent);
+
+/* 1 = muted, 0 = unmuted, -1 = unknown */
+int pi_arcade_sound_get_mute(void);
+void pi_arcade_sound_toggle_mute(void);
+
+RETRO_END_DECLS
+
+#endif
+HEOF
+    echo "[patch] menu/pi_arcade_sound.h: applied (new file)"
+    return 0
+}
+
+# Wires the Sound screen's three leaf items (Output Device, Volume, Mute)
+# into menu_cbs_left.c/menu_cbs_right.c (adjustment - deliberately bound to
+# BOTH directions identically for the two binary items, so either Left or
+# Right on a 2-axis d-pad toggles them - simplest for a bare-bones arcade
+# stick) and menu_cbs_get_value.c (display text). Modeled directly on the
+# existing MENU_SETTINGS_CORE_DISK_OPTIONS_DISK_INDEX single-item pattern
+# already present in both left.c and right.c.
+_apply_retroarch_left_right_get_value_patch() {
+    local ra_src_dir="$1"
+    python3 - "$ra_src_dir" <<'PYEOF'
+import sys, pathlib
+
+root = pathlib.Path(sys.argv[1])
+overall_rc = [0]
+
+def patch_file(relpath, replacements):
+    path = root / relpath
+    if not path.exists():
+        print(f"[patch] {relpath}: file not found, skipping (RetroArch source may have changed)")
+        overall_rc[0] = 3
+        return
+    text = path.read_text()
+    changed = False
+    for name, old, new in replacements:
+        if new in text:
+            print(f"[patch] {relpath} :: {name}: already applied")
+            continue
+        if old not in text:
+            print(f"[patch] {relpath} :: {name}: anchor text not found, skipping (RetroArch source may have changed)")
+            overall_rc[0] = 3
+            continue
+        text = text.replace(old, new, 1)
+        changed = True
+        print(f"[patch] {relpath} :: {name}: applied")
+    if changed:
+        path.write_text(text)
+
+patch_file("menu/cbs/menu_cbs_left.c", [
+    ("include pi_arcade_sound.h",
+     '#include "../menu_setting.h"\n',
+     '#include "../menu_setting.h"\n#include "../pi_arcade_sound.h"\n'),
+    ("pi_arcade_sound_setting_left function",
+     "static int core_setting_left(unsigned type, const char *label,\n"
+     "      bool wraparound)\n"
+     "{\n"
+     "   unsigned idx     = type - MENU_SETTINGS_CORE_OPTION_START;\n"
+     "\n"
+     "   retroarch_ctl(RARCH_CTL_CORE_OPTION_PREV, &idx);\n"
+     "\n"
+     "   return 0;\n"
+     "}\n",
+     "static int pi_arcade_sound_setting_left(unsigned type, const char *label,\n"
+     "      bool wraparound)\n"
+     "{\n"
+     "   switch (type)\n"
+     "   {\n"
+     "      case MENU_SETTING_ARCADE_SOUND_DEVICE:\n"
+     "         pi_arcade_sound_set_device(pi_arcade_sound_get_device() == 1 ? 0 : 1);\n"
+     "         break;\n"
+     "      case MENU_SETTING_ARCADE_SOUND_VOLUME:\n"
+     "         pi_arcade_sound_adjust_volume(-5);\n"
+     "         break;\n"
+     "      case MENU_SETTING_ARCADE_SOUND_MUTE:\n"
+     "         pi_arcade_sound_toggle_mute();\n"
+     "         break;\n"
+     "      default:\n"
+     "         break;\n"
+     "   }\n"
+     "\n"
+     "   return 0;\n"
+     "}\n"
+     "\n"
+     "static int core_setting_left(unsigned type, const char *label,\n"
+     "      bool wraparound)\n"
+     "{\n"
+     "   unsigned idx     = type - MENU_SETTINGS_CORE_OPTION_START;\n"
+     "\n"
+     "   retroarch_ctl(RARCH_CTL_CORE_OPTION_PREV, &idx);\n"
+     "\n"
+     "   return 0;\n"
+     "}\n"),
+    ("dispatch case for MENU_SETTING_ARCADE_SOUND_*",
+     "      switch (type)\n"
+     "      {\n"
+     "         case MENU_SETTINGS_CORE_DISK_OPTIONS_DISK_INDEX:\n"
+     "            BIND_ACTION_LEFT(cbs, disk_options_disk_idx_left);\n"
+     "            break;\n",
+     "      switch (type)\n"
+     "      {\n"
+     "         case MENU_SETTING_ARCADE_SOUND_DEVICE:\n"
+     "         case MENU_SETTING_ARCADE_SOUND_VOLUME:\n"
+     "         case MENU_SETTING_ARCADE_SOUND_MUTE:\n"
+     "            BIND_ACTION_LEFT(cbs, pi_arcade_sound_setting_left);\n"
+     "            break;\n"
+     "         case MENU_SETTINGS_CORE_DISK_OPTIONS_DISK_INDEX:\n"
+     "            BIND_ACTION_LEFT(cbs, disk_options_disk_idx_left);\n"
+     "            break;\n"),
+])
+
+patch_file("menu/cbs/menu_cbs_right.c", [
+    ("include pi_arcade_sound.h",
+     '#include "../menu_setting.h"\n',
+     '#include "../menu_setting.h"\n#include "../pi_arcade_sound.h"\n'),
+    ("pi_arcade_sound_setting_right function",
+     "static int core_setting_right(unsigned type, const char *label,\n"
+     "      bool wraparound)\n"
+     "{\n"
+     "   unsigned idx     = type - MENU_SETTINGS_CORE_OPTION_START;\n"
+     "\n"
+     "   retroarch_ctl(RARCH_CTL_CORE_OPTION_NEXT, &idx);\n"
+     "\n"
+     "   return 0;\n"
+     "}\n",
+     "static int pi_arcade_sound_setting_right(unsigned type, const char *label,\n"
+     "      bool wraparound)\n"
+     "{\n"
+     "   switch (type)\n"
+     "   {\n"
+     "      case MENU_SETTING_ARCADE_SOUND_DEVICE:\n"
+     "         pi_arcade_sound_set_device(pi_arcade_sound_get_device() == 1 ? 0 : 1);\n"
+     "         break;\n"
+     "      case MENU_SETTING_ARCADE_SOUND_VOLUME:\n"
+     "         pi_arcade_sound_adjust_volume(5);\n"
+     "         break;\n"
+     "      case MENU_SETTING_ARCADE_SOUND_MUTE:\n"
+     "         pi_arcade_sound_toggle_mute();\n"
+     "         break;\n"
+     "      default:\n"
+     "         break;\n"
+     "   }\n"
+     "\n"
+     "   return 0;\n"
+     "}\n"
+     "\n"
+     "static int core_setting_right(unsigned type, const char *label,\n"
+     "      bool wraparound)\n"
+     "{\n"
+     "   unsigned idx     = type - MENU_SETTINGS_CORE_OPTION_START;\n"
+     "\n"
+     "   retroarch_ctl(RARCH_CTL_CORE_OPTION_NEXT, &idx);\n"
+     "\n"
+     "   return 0;\n"
+     "}\n"),
+    ("dispatch case for MENU_SETTING_ARCADE_SOUND_*",
+     "      switch (type)\n"
+     "      {\n"
+     "         case MENU_SETTINGS_CORE_DISK_OPTIONS_DISK_INDEX:\n"
+     "            BIND_ACTION_RIGHT(cbs, disk_options_disk_idx_right);\n"
+     "            break;\n",
+     "      switch (type)\n"
+     "      {\n"
+     "         case MENU_SETTING_ARCADE_SOUND_DEVICE:\n"
+     "         case MENU_SETTING_ARCADE_SOUND_VOLUME:\n"
+     "         case MENU_SETTING_ARCADE_SOUND_MUTE:\n"
+     "            BIND_ACTION_RIGHT(cbs, pi_arcade_sound_setting_right);\n"
+     "            break;\n"
+     "         case MENU_SETTINGS_CORE_DISK_OPTIONS_DISK_INDEX:\n"
+     "            BIND_ACTION_RIGHT(cbs, disk_options_disk_idx_right);\n"
+     "            break;\n"),
+])
+
+patch_file("menu/cbs/menu_cbs_get_value.c", [
+    ("include pi_arcade_sound.h",
+     '#include "../menu_cbs.h"\n',
+     '#include "../menu_cbs.h"\n#include "../pi_arcade_sound.h"\n'),
+    ("pi_arcade_sound_get_value function",
+     "static void menu_action_setting_disp_set_label_core_option(\n",
+     "static void pi_arcade_sound_get_value(\n"
+     "      file_list_t* list,\n"
+     "      unsigned *w, unsigned type, unsigned i,\n"
+     "      const char *label,\n"
+     "      char *s, size_t len,\n"
+     "      const char *path,\n"
+     "      char *s2, size_t len2)\n"
+     "{\n"
+     "   *w  = 19;\n"
+     "   *s  = '\\0';\n"
+     "   *s2 = '\\0';\n"
+     "\n"
+     "   switch (type)\n"
+     "   {\n"
+     "      case MENU_SETTING_ARCADE_SOUND_DEVICE:\n"
+     "         {\n"
+     "            int dev = pi_arcade_sound_get_device();\n"
+     "            if (dev == 1)\n"
+     "               strlcpy(s, \"HDMI\", len);\n"
+     "            else if (dev == 0)\n"
+     "               strlcpy(s, \"Aux / Headphone jack\", len);\n"
+     "            else\n"
+     "               strlcpy(s, \"Unknown\", len);\n"
+     "         }\n"
+     "         break;\n"
+     "      case MENU_SETTING_ARCADE_SOUND_VOLUME:\n"
+     "         {\n"
+     "            int vol = pi_arcade_sound_get_volume();\n"
+     "            if (vol < 0)\n"
+     "               strlcpy(s, \"N/A\", len);\n"
+     "            else\n"
+     "               snprintf(s, len, \"%d%%\", vol);\n"
+     "         }\n"
+     "         break;\n"
+     "      case MENU_SETTING_ARCADE_SOUND_MUTE:\n"
+     "         {\n"
+     "            int m = pi_arcade_sound_get_mute();\n"
+     "            if (m == 1)\n"
+     "               strlcpy(s, \"Muted\", len);\n"
+     "            else if (m == 0)\n"
+     "               strlcpy(s, \"Unmuted\", len);\n"
+     "            else\n"
+     "               strlcpy(s, \"Unknown\", len);\n"
+     "         }\n"
+     "         break;\n"
+     "      default:\n"
+     "         break;\n"
+     "   }\n"
+     "}\n"
+     "\n"
+     "static void menu_action_setting_disp_set_label_core_option(\n"),
+    ("dispatch for MENU_SETTING_ARCADE_SOUND_* in get_value",
+     "   if ((type >= MENU_SETTINGS_CORE_OPTION_START) &&\n"
+     "       (type < MENU_SETTINGS_CHEEVOS_START))\n"
+     "   {\n"
+     "      BIND_ACTION_GET_VALUE(cbs,\n"
+     "         menu_action_setting_disp_set_label_core_option);\n"
+     "      return 0;\n"
+     "   }\n",
+     "   if (type == MENU_SETTING_ARCADE_SOUND_DEVICE ||\n"
+     "       type == MENU_SETTING_ARCADE_SOUND_VOLUME ||\n"
+     "       type == MENU_SETTING_ARCADE_SOUND_MUTE)\n"
+     "   {\n"
+     "      BIND_ACTION_GET_VALUE(cbs, pi_arcade_sound_get_value);\n"
+     "      return 0;\n"
+     "   }\n"
+     "\n"
+     "   if ((type >= MENU_SETTINGS_CORE_OPTION_START) &&\n"
+     "       (type < MENU_SETTINGS_CHEEVOS_START))\n"
+     "   {\n"
+     "      BIND_ACTION_GET_VALUE(cbs,\n"
+     "         menu_action_setting_disp_set_label_core_option);\n"
+     "      return 0;\n"
+     "   }\n"),
+])
+
+sys.exit(overall_rc[0])
+PYEOF
+    return $?
+}
+
+# The big one: implements the wpctl-backed Sound helpers (non-static, per
+# menu/pi_arcade_sound.h above), the two new screens' content-builder
+# functions, and wires everything into menu_displaylist.c's two dispatch
+# points (menu_displaylist_build_list()'s per-type switch, and
+# menu_displaylist_ctl()'s big shared "clear + rebuild" case group used by
+# every simple self-built list screen) plus the three new top-level Quick
+# Menu pushes (Display Brightness/Sound/Game Audio) into
+# menu_displaylist_parse_load_content_settings(), right after the existing
+# "Core Options" push.
+_apply_retroarch_displaylist_content_patch() {
+    local ra_src_dir="$1"
+    python3 - "$ra_src_dir" <<'PYEOF'
+import sys, pathlib
+
+root = pathlib.Path(sys.argv[1])
+overall_rc = [0]
+
+def patch_file(relpath, replacements):
+    path = root / relpath
+    if not path.exists():
+        print(f"[patch] {relpath}: file not found, skipping (RetroArch source may have changed)")
+        overall_rc[0] = 3
+        return
+    text = path.read_text()
+    changed = False
+    for name, old, new in replacements:
+        if new in text:
+            print(f"[patch] {relpath} :: {name}: already applied")
+            continue
+        if old not in text:
+            print(f"[patch] {relpath} :: {name}: anchor text not found, skipping (RetroArch source may have changed)")
+            overall_rc[0] = 3
+            continue
+        text = text.replace(old, new, 1)
+        changed = True
+        print(f"[patch] {relpath} :: {name}: applied")
+    if changed:
+        path.write_text(text)
+
+helper_impl = '''/* pi-arcade-setup: wpctl (PipeWire/WirePlumber) helpers backing the Quick
+ * Menu's "Sound" entry - see menu/pi_arcade_sound.h. Ported from this
+ * project's own standalone "Audio settings" RetroPie-menu tool
+ * (audio-settings.py) rather than reinvented, so both stay consistent. */
+
+static bool pi_arcade_run_capture(const char *cmd, char *out, size_t out_len)
+{
+   FILE *fp;
+   size_t n;
+
+   if (!cmd || !out || out_len == 0)
+      return false;
+
+   fp = popen(cmd, "r");
+   if (!fp)
+      return false;
+
+   n = fread(out, 1, out_len - 1, fp);
+   out[n] = '\\0';
+   pclose(fp);
+   return true;
+}
+
+/* Scans a `wpctl status` capture for the Sinks: section and finds the id
+ * of the first sink whose status line (or, failing that, its `wpctl
+ * inspect <id>` output) contains any of the given keywords. */
+static bool pi_arcade_find_sink_id_by_keywords(
+      const char *status_text, const char *const *keywords, size_t n_keywords,
+      int *id_out, bool *is_default_out)
+{
+   const char *line = status_text;
+   bool in_sinks = false;
+
+   if (!status_text)
+      return false;
+
+   while (line && *line)
+   {
+      const char *next     = strchr(line, '\\n');
+      size_t line_len      = next ? (size_t)(next - line) : strlen(line);
+      char buf[512];
+      size_t copy_len      = (line_len < sizeof(buf) - 1) ? line_len : sizeof(buf) - 1;
+
+      memcpy(buf, line, copy_len);
+      buf[copy_len] = '\\0';
+
+      if (strstr(buf, "Sinks:"))
+         in_sinks = true;
+      else if (in_sinks && (strstr(buf, "Sources:") || strstr(buf, "Filters:") || strstr(buf, "Streams:")))
+         in_sinks = false;
+      else if (in_sinks)
+      {
+         const char *dotpos = strchr(buf, '.');
+         if (dotpos)
+         {
+            const char *p = buf;
+            while (*p && !isdigit((unsigned char)*p))
+               p++;
+            if (p < dotpos && isdigit((unsigned char)*p))
+            {
+               int id       = atoi(p);
+               bool matched = false;
+               size_t k;
+
+               for (k = 0; k < n_keywords && !matched; k++)
+                  if (strstr(buf, keywords[k]))
+                     matched = true;
+
+               if (!matched)
+               {
+                  char inspect_cmd[128];
+                  char inspect_out[8192];
+
+                  snprintf(inspect_cmd, sizeof(inspect_cmd), "wpctl inspect %d 2>/dev/null", id);
+                  if (pi_arcade_run_capture(inspect_cmd, inspect_out, sizeof(inspect_out)))
+                     for (k = 0; k < n_keywords && !matched; k++)
+                        if (strstr(inspect_out, keywords[k]))
+                           matched = true;
+               }
+
+               if (matched)
+               {
+                  if (id_out)
+                     *id_out = id;
+                  if (is_default_out)
+                     *is_default_out = (strchr(buf, '*') != NULL);
+                  return true;
+               }
+            }
+         }
+      }
+
+      line = next ? next + 1 : NULL;
+   }
+
+   return false;
+}
+
+static const char *const pi_arcade_aux_keywords[]  = { "mailbox", "bcm2835 Headphones", "Headphones" };
+static const char *const pi_arcade_hdmi_keywords[]  = { "hdmi", "HDMI", "vc4-hdmi" };
+
+int pi_arcade_sound_get_device(void)
+{
+   char status[8192];
+   int id;
+   bool is_default;
+
+   if (!pi_arcade_run_capture("wpctl status 2>/dev/null", status, sizeof(status)))
+      return -1;
+
+   if (pi_arcade_find_sink_id_by_keywords(status, pi_arcade_hdmi_keywords, 3, &id, &is_default) && is_default)
+      return 1;
+   if (pi_arcade_find_sink_id_by_keywords(status, pi_arcade_aux_keywords, 3, &id, &is_default) && is_default)
+      return 0;
+
+   return -1;
+}
+
+void pi_arcade_sound_set_device(int dev)
+{
+   char status[8192];
+   int id;
+   char cmd[64];
+
+   if (!pi_arcade_run_capture("wpctl status 2>/dev/null", status, sizeof(status)))
+      return;
+
+   if (dev == 1)
+   {
+      if (pi_arcade_find_sink_id_by_keywords(status, pi_arcade_hdmi_keywords, 3, &id, NULL))
+      {
+         snprintf(cmd, sizeof(cmd), "wpctl set-default %d", id);
+         system(cmd);
+      }
+   }
+   else
+   {
+      if (pi_arcade_find_sink_id_by_keywords(status, pi_arcade_aux_keywords, 3, &id, NULL))
+      {
+         snprintf(cmd, sizeof(cmd), "wpctl set-default %d", id);
+         system(cmd);
+      }
+   }
+}
+
+int pi_arcade_sound_get_volume(void)
+{
+   char out[512];
+   const char *p;
+
+   if (!pi_arcade_run_capture("wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null", out, sizeof(out)))
+      return -1;
+
+   p = strstr(out, "Volume:");
+   if (!p)
+      return -1;
+   p += strlen("Volume:");
+   while (*p == ' ')
+      p++;
+
+   return (int)(atof(p) * 100.0 + 0.5);
+}
+
+int pi_arcade_sound_get_mute(void)
+{
+   char out[512];
+
+   if (!pi_arcade_run_capture("wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null", out, sizeof(out)))
+      return -1;
+
+   return strstr(out, "[MUTED]") ? 1 : 0;
+}
+
+void pi_arcade_sound_adjust_volume(int delta_percent)
+{
+   char cmd[96];
+
+   snprintf(cmd, sizeof(cmd), "wpctl set-volume @DEFAULT_AUDIO_SINK@ %d%%%s",
+         delta_percent < 0 ? -delta_percent : delta_percent,
+         delta_percent < 0 ? "-" : "+");
+   system(cmd);
+}
+
+void pi_arcade_sound_toggle_mute(void)
+{
+   system("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle");
+}
+
+/* -----------------------------------------------------------------------
+ * Content-builders for the two new Quick Menu screens.
+ * ----------------------------------------------------------------------- */
+
+static unsigned menu_displaylist_parse_pi_arcade_sound(file_list_t *list)
+{
+   unsigned count = 0;
+
+   /* pi-arcade-setup: enum_idx must be MSG_UNKNOWN (not MENU_ENUM_LABEL_NO_ITEMS)
+    * here. menu_cbs_init_bind_left/_right_compare_label() has an explicit
+    * `case MENU_ENUM_LABEL_NO_ITEMS:` that binds action_left/right_scroll and
+    * returns 0 whenever cbs->enum_idx matches it - which happens BEFORE
+    * compare_type() (where our MENU_SETTING_ARCADE_SOUND_* switch case lives)
+    * ever runs, silently eating all Left/Right input on these rows. Using
+    * MSG_UNKNOWN makes `cbs->enum_idx != MSG_UNKNOWN` false so compare_label
+    * takes its early `return -1;`, and compare_type runs as intended. */
+   if (menu_entries_append(list,
+            "Output Device", "",
+            MSG_UNKNOWN, MENU_SETTING_ARCADE_SOUND_DEVICE,
+            0, 0, NULL))
+      count++;
+
+   if (menu_entries_append(list,
+            "Volume", "",
+            MSG_UNKNOWN, MENU_SETTING_ARCADE_SOUND_VOLUME,
+            0, 0, NULL))
+      count++;
+
+   if (menu_entries_append(list,
+            "Mute", "",
+            MSG_UNKNOWN, MENU_SETTING_ARCADE_SOUND_MUTE,
+            0, 0, NULL))
+      count++;
+
+   return count;
+}
+
+static unsigned menu_displaylist_parse_pi_arcade_game_audio(file_list_t *list)
+{
+   unsigned count                  = 0;
+   core_option_manager_t *coreopts = NULL;
+
+   if (retroarch_ctl(RARCH_CTL_CORE_OPTIONS_LIST_GET, &coreopts) && coreopts)
+   {
+      size_t idx;
+
+      /* pi-arcade-setup: use MENU_ENUM_LABEL_CORE_OPTION_ENTRY here, matching
+       * how stock RetroArch itself appends MENU_SETTINGS_CORE_OPTION_START-
+       * range entries elsewhere (see the main core-options displaylist
+       * builder). That enum has no case in
+       * menu_cbs_init_bind_left/_right_compare_label()'s switch, so it falls
+       * through to compare_label's `default: return -1;` and lets
+       * compare_type's `type >= MENU_SETTINGS_CORE_OPTION_START` branch
+       * (core_setting_left/right) actually run - unlike MENU_ENUM_LABEL_
+       * NO_ITEMS, which has its own case there and would silently eat
+       * Left/Right input on these rows the same way it did for the Sound
+       * submenu (see menu_displaylist_parse_pi_arcade_sound above). */
+      if (core_option_manager_get_idx(coreopts, "mame_arcade_audio_boost_db", &idx))
+         if (menu_entries_append(list,
+                  "Audio Boost", "",
+                  MENU_ENUM_LABEL_CORE_OPTION_ENTRY,
+                  (unsigned)(MENU_SETTINGS_CORE_OPTION_START + idx),
+                  0, 0, NULL))
+            count++;
+
+      if (core_option_manager_get_idx(coreopts, "mame_arcade_audio_stereo", &idx))
+         if (menu_entries_append(list,
+                  "Stereo/Mono", "",
+                  MENU_ENUM_LABEL_CORE_OPTION_ENTRY,
+                  (unsigned)(MENU_SETTINGS_CORE_OPTION_START + idx),
+                  0, 0, NULL))
+            count++;
+   }
+
+   if (count == 0)
+      if (menu_entries_append(list,
+               "No Game Audio options (not running an arcade/MAME title)", "",
+               MENU_ENUM_LABEL_NO_ITEMS, MENU_SETTINGS_CORE_OPTION_NONE,
+               0, 0, NULL))
+         count++;
+
+   return count;
+}
+
+'''
+
+patch_file("menu/menu_displaylist.c", [
+    ("standard C library includes for the wpctl helpers",
+     "#include <compat/strcasestr.h>\n",
+     "#include <compat/strcasestr.h>\n\n"
+     "#include <stdio.h>\n"
+     "#include <stdlib.h>\n"
+     "#include <string.h>\n"
+     "#include <ctype.h>\n"),
+    ("include pi_arcade_sound.h",
+     '#include "menu_driver.h"\n',
+     '#include "menu_driver.h"\n#include "pi_arcade_sound.h"\n'),
+    ("wpctl helper implementation + content-builders",
+     "static int menu_displaylist_parse_load_content_settings(\n"
+     "      file_list_t *list, settings_t *settings,\n"
+     "      bool horizontal)\n",
+     helper_impl +
+     "static int menu_displaylist_parse_load_content_settings(\n"
+     "      file_list_t *list, settings_t *settings,\n"
+     "      bool horizontal)\n"),
+    ("wire Sound/Game Audio pushes + Display Brightness into Quick Menu",
+     "      if (!settings->bools.kiosk_mode_enable)\n"
+     "      {\n"
+     "         if (settings->bools.quick_menu_show_options)\n"
+     "         {\n"
+     "            /* Empty 'path' string signifies top level\n"
+     "             * core options menu */\n"
+     "            if (menu_entries_append(list,\n"
+     "                     \"\",\n"
+     "                     msg_hash_to_str(MENU_ENUM_LABEL_CORE_OPTIONS),\n"
+     "                     MENU_ENUM_LABEL_CORE_OPTIONS,\n"
+     "                     MENU_SETTING_ACTION_CORE_OPTIONS, 0, 0, NULL))\n"
+     "               count++;\n"
+     "         }\n",
+     "      if (!settings->bools.kiosk_mode_enable)\n"
+     "      {\n"
+     "         if (settings->bools.quick_menu_show_options)\n"
+     "         {\n"
+     "            /* Empty 'path' string signifies top level\n"
+     "             * core options menu */\n"
+     "            if (menu_entries_append(list,\n"
+     "                     \"\",\n"
+     "                     msg_hash_to_str(MENU_ENUM_LABEL_CORE_OPTIONS),\n"
+     "                     MENU_ENUM_LABEL_CORE_OPTIONS,\n"
+     "                     MENU_SETTING_ACTION_CORE_OPTIONS, 0, 0, NULL))\n"
+     "               count++;\n"
+     "\n"
+     "            /* pi-arcade-setup: Game Audio (MAME arcade audio boost /\n"
+     "             * stereo-mono, mirroring the two core options MAME's\n"
+     "             * own libretro fork registers) */\n"
+     "            if (menu_entries_append(list,\n"
+     "                     msg_hash_to_str(MENU_ENUM_LABEL_VALUE_QUICK_MENU_GAME_AUDIO),\n"
+     "                     msg_hash_to_str(MENU_ENUM_LABEL_QUICK_MENU_GAME_AUDIO),\n"
+     "                     MENU_ENUM_LABEL_QUICK_MENU_GAME_AUDIO,\n"
+     "                     MENU_SETTING_ACTION, 0, 0, NULL))\n"
+     "               count++;\n"
+     "\n"
+     "            /* pi-arcade-setup: Sound (system output device/volume/\n"
+     "             * mute via wpctl) */\n"
+     "            if (menu_entries_append(list,\n"
+     "                     msg_hash_to_str(MENU_ENUM_LABEL_VALUE_QUICK_MENU_SOUND),\n"
+     "                     msg_hash_to_str(MENU_ENUM_LABEL_QUICK_MENU_SOUND),\n"
+     "                     MENU_ENUM_LABEL_QUICK_MENU_SOUND,\n"
+     "                     MENU_SETTING_ACTION, 0, 0, NULL))\n"
+     "               count++;\n"
+     "\n"
+     "            /* pi-arcade-setup: Display Brightness - reuses\n"
+     "             * RetroArch's own already-working brightness setting\n"
+     "             * (MENU_ENUM_LABEL_BRIGHTNESS_CONTROL), the same macro\n"
+     "             * RetroArch itself uses to inject \"State Slot\" into\n"
+     "             * this same screen a few lines below */\n"
+     "            if (frontend_driver_can_set_screen_brightness())\n"
+     "               if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,\n"
+     "                        MENU_ENUM_LABEL_BRIGHTNESS_CONTROL, PARSE_ONLY_UINT, true) == 0)\n"
+     "                  count++;\n"
+     "         }\n"),
+    ("wire into menu_displaylist_build_list() switch",
+     "      case DISPLAYLIST_CONTENT_SETTINGS:\n"
+     "         count = menu_displaylist_parse_load_content_settings(list,\n"
+     "               settings, false);\n"
+     "\n"
+     "         if (count == 0)\n"
+     "            if (menu_entries_append(list,\n"
+     "                     msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NO_ITEMS),\n"
+     "                     msg_hash_to_str(MENU_ENUM_LABEL_NO_ITEMS),\n"
+     "                     MENU_ENUM_LABEL_NO_ITEMS,\n"
+     "                     MENU_SETTING_NO_ITEM, 0, 0, NULL))\n"
+     "               count++;\n"
+     "         break;\n"
+     "      case DISPLAYLIST_BROWSE_URL_START:\n",
+     "      case DISPLAYLIST_CONTENT_SETTINGS:\n"
+     "         count = menu_displaylist_parse_load_content_settings(list,\n"
+     "               settings, false);\n"
+     "\n"
+     "         if (count == 0)\n"
+     "            if (menu_entries_append(list,\n"
+     "                     msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NO_ITEMS),\n"
+     "                     msg_hash_to_str(MENU_ENUM_LABEL_NO_ITEMS),\n"
+     "                     MENU_ENUM_LABEL_NO_ITEMS,\n"
+     "                     MENU_SETTING_NO_ITEM, 0, 0, NULL))\n"
+     "               count++;\n"
+     "         break;\n"
+     "      case DISPLAYLIST_PI_ARCADE_SOUND:\n"
+     "         count = menu_displaylist_parse_pi_arcade_sound(list);\n"
+     "         break;\n"
+     "      case DISPLAYLIST_PI_ARCADE_GAME_AUDIO:\n"
+     "         count = menu_displaylist_parse_pi_arcade_game_audio(list);\n"
+     "         break;\n"
+     "      case DISPLAYLIST_BROWSE_URL_START:\n"),
+    ("wire into menu_displaylist_ctl() shared case group",
+     "         case DISPLAYLIST_SUBSYSTEM_SETTINGS_LIST:\n"
+     "#ifdef HAVE_MIST\n"
+     "         case DISPLAYLIST_STEAM_SETTINGS_LIST:\n"
+     "#endif\n"
+     "         case DISPLAYLIST_OPTIONS_OVERRIDES:\n",
+     "         case DISPLAYLIST_SUBSYSTEM_SETTINGS_LIST:\n"
+     "#ifdef HAVE_MIST\n"
+     "         case DISPLAYLIST_STEAM_SETTINGS_LIST:\n"
+     "#endif\n"
+     "         case DISPLAYLIST_PI_ARCADE_SOUND:\n"
+     "         case DISPLAYLIST_PI_ARCADE_GAME_AUDIO:\n"
+     "         case DISPLAYLIST_OPTIONS_OVERRIDES:\n"),
+    ("wire Sound into the standalone/content-less Main Menu (reuses the\n"
+     "     existing MENU_ENUM_LABEL_QUICK_MENU_SOUND OK-dispatch entry, so\n"
+     "     no separate action_ok wiring is needed here)",
+     "               if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(info->list,\n"
+     "                        MENU_ENUM_LABEL_SETTINGS, PARSE_ACTION, false) == 0)\n"
+     "                  count++;\n"
+     "               if (settings->bools.menu_show_information)\n",
+     "               if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(info->list,\n"
+     "                        MENU_ENUM_LABEL_SETTINGS, PARSE_ACTION, false) == 0)\n"
+     "                  count++;\n"
+     "               /* pi-arcade-setup: Sound (system output device/volume/\n"
+     "                * mute via wpctl) - also reachable standalone, not just\n"
+     "                * from a running game's Quick Menu */\n"
+     "               if (menu_entries_append(info->list,\n"
+     "                        msg_hash_to_str(MENU_ENUM_LABEL_VALUE_QUICK_MENU_SOUND),\n"
+     "                        msg_hash_to_str(MENU_ENUM_LABEL_QUICK_MENU_SOUND),\n"
+     "                        MENU_ENUM_LABEL_QUICK_MENU_SOUND,\n"
+     "                        MENU_SETTING_ACTION, 0, 0, NULL))\n"
+     "                  count++;\n"
+     "               if (settings->bools.menu_show_information)\n"),
+])
+
+sys.exit(overall_rc[0])
+PYEOF
+    return $?
+}
+
+# Fixes RetroArch's unix frontend driver's hardcoded
+# "/sys/class/backlight/backlight/..." brightness path (only correct when
+# a device tree explicitly sets `label = "backlight";`, which this
+# hardware's touchscreen panel does not) to auto-detect whatever backlight
+# device sysfs actually exposes instead - the same glob-first-match
+# approach this project's own (now removed) controller-hotkeys.py used for
+# the exact same problem. Falls back to the old hardcoded path if no
+# backlight device is found at all, preserving old behavior in that case.
+_apply_retroarch_brightness_wraparound_patch() {
+    local ra_src_dir="$1"
+    python3 - "$ra_src_dir" <<'PYEOF'
+import sys, pathlib
+
+root = pathlib.Path(sys.argv[1])
+path = root / "menu/menu_setting.c"
+if not path.exists():
+    print("[patch] menu/menu_setting.c: file not found, skipping (RetroArch source may have changed)")
+    sys.exit(3)
+
+text = path.read_text()
+rc = 0
+
+# BUG FOUND LIVE (disclosed per the user's request to note and fix any
+# errors along the way): holding the stick left on the new "Display
+# Brightness" Quick Menu entry drove the value down to the minimum (5%)
+# and then, on the very next step, it jumped straight back up to the
+# maximum (100%) instead of clamping - a visible "loop". Root cause: the
+# generic uint left/right handlers RetroArch itself already uses for
+# every classic-settings uint value (setting_uint_action_left_default /
+# _right_default, in this same file) check *both*
+# SD_FLAG_ENFORCE_MINRANGE/MAXRANGE (clamp at the edge) *and*
+# settings->bools.menu_navigation_wraparound_enable - and if the latter
+# is true (it is, on this cabinet's retroarch.cfg, so that scrolling
+# through menu *lists* wraps top-to-bottom, which is desirable there),
+# hitting the edge of a *value* slider wraps to the opposite end instead
+# of clamping. That's fine for list navigation but wrong for a
+# continuous value like brightness. Since this project doesn't want to
+# turn off list-wraparound globally (that's a separate, desirable UX
+# behavior elsewhere in the menu), the fix adds two small clamp-only
+# left/right handlers used *only* for this one setting, instead of
+# reaching for the shared default handler.
+anchor_old = '''static int setting_bool_action_right_with_refresh(
+      rarch_setting_t *setting, size_t idx, bool wraparound)
+{'''
+anchor_new = '''/* pi-arcade-setup: clamp-only uint left/right handlers, used only for
+ * "Display Brightness" (see phase_retroarch_menu_rotation_patch's
+ * quickmenu-extensions patch) so it doesn't wrap around at 5%/100% even
+ * though menu_navigation_wraparound_enable is true (which is wanted for
+ * ordinary list scrolling, just not for a value slider). Mirrors
+ * setting_uint_action_left_default/_right_default above minus the
+ * wraparound branch. */
+static int pi_arcade_brightness_action_left(
+      rarch_setting_t *setting, size_t idx, bool wraparound)
+{
+   bool  overflowed = false;
+   float step        = 0.0f;
+
+   if (!setting)
+      return -1;
+
+   step = recalc_step_based_on_length_of_action(setting);
+
+   if (step > *setting->value.target.unsigned_integer)
+      overflowed = true;
+   else
+      *setting->value.target.unsigned_integer =
+         *setting->value.target.unsigned_integer - step;
+
+   if (setting->flags & SD_FLAG_ENFORCE_MINRANGE)
+   {
+      float min = setting->min;
+      if (overflowed || *setting->value.target.unsigned_integer < min)
+         *setting->value.target.unsigned_integer = min;
+   }
+
+   return 0;
+}
+
+static int pi_arcade_brightness_action_right(
+      rarch_setting_t *setting, size_t idx, bool wraparound)
+{
+   float step = 0.0f;
+
+   if (!setting)
+      return -1;
+
+   step = recalc_step_based_on_length_of_action(setting);
+
+   *setting->value.target.unsigned_integer =
+      *setting->value.target.unsigned_integer + step;
+
+   if (setting->flags & SD_FLAG_ENFORCE_MAXRANGE)
+   {
+      float max = setting->max;
+      if (*setting->value.target.unsigned_integer > max)
+         *setting->value.target.unsigned_integer = max;
+   }
+
+   return 0;
+}
+
+static int setting_bool_action_right_with_refresh(
+      rarch_setting_t *setting, size_t idx, bool wraparound)
+{'''
+# NOTE: anchor_new deliberately ENDS with the exact same text as
+# anchor_old (my new functions are inserted immediately before the
+# untouched setting_bool_action_right_with_refresh signature), so
+# anchor_old stays a substring of the file forever after patching -
+# checking "anchor_old in text" first (the usual pattern elsewhere in
+# this script) would misfire and re-insert a duplicate definition on
+# every re-run. Use a marker that only exists post-patch instead.
+already_applied_marker = "static int pi_arcade_brightness_action_left("
+if already_applied_marker in text:
+    print("[patch] menu_setting.c clamp-only brightness handlers: already applied")
+elif anchor_old in text:
+    text = text.replace(anchor_old, anchor_new, 1)
+    print("[patch] menu_setting.c clamp-only brightness handlers: applied")
+else:
+    print("[patch] menu_setting.c clamp-only brightness handlers: anchor text not found, skipping (RetroArch source may have changed)")
+    rc = 3
+
+wire_old = '''                (*list)[list_info->index - 1].ui_type = ST_UI_TYPE_UINT_COMBOBOX;
+                (*list)[list_info->index - 1].action_ok = &setting_action_ok_uint_special;
+                (*list)[list_info->index - 1].get_string_representation =
+                   &setting_get_string_representation_percentage;
+                menu_settings_list_current_add_range(list, list_info, 5, 100, 5, true, true);'''
+wire_new = '''                (*list)[list_info->index - 1].ui_type = ST_UI_TYPE_UINT_COMBOBOX;
+                (*list)[list_info->index - 1].action_ok = &setting_action_ok_uint_special;
+                /* pi-arcade-setup: clamp instead of wrap at 5%/100% - see
+                 * pi_arcade_brightness_action_left/_right above. */
+                (*list)[list_info->index - 1].action_left = &pi_arcade_brightness_action_left;
+                (*list)[list_info->index - 1].action_right = &pi_arcade_brightness_action_right;
+                (*list)[list_info->index - 1].get_string_representation =
+                   &setting_get_string_representation_percentage;
+                menu_settings_list_current_add_range(list, list_info, 5, 100, 5, true, true);'''
+if wire_old in text:
+    text = text.replace(wire_old, wire_new, 1)
+    print("[patch] menu_setting.c brightness left/right wiring: applied")
+elif wire_new in text:
+    print("[patch] menu_setting.c brightness left/right wiring: already applied")
+else:
+    print("[patch] menu_setting.c brightness left/right wiring: anchor text not found, skipping (RetroArch source may have changed) - Display Brightness will keep wrapping around at min/max")
+    rc = 3
+
+path.write_text(text)
+sys.exit(rc)
+PYEOF
+    return $?
+}
+
+_apply_retroarch_backlight_path_patch() {
+    local ra_src_dir="$1"
+    python3 - "$ra_src_dir" <<'PYEOF'
+import sys, pathlib
+
+root = pathlib.Path(sys.argv[1])
+path = root / "frontend/drivers/platform_unix.c"
+if not path.exists():
+    print("[patch] frontend/drivers/platform_unix.c: file not found, skipping (RetroArch source may have changed)")
+    sys.exit(3)
+
+text = path.read_text()
+rc = 0
+
+old_inc = "#include <fcntl.h>\n"
+new_inc = "#include <fcntl.h>\n#include <glob.h>\n"
+if new_inc in text:
+    print("[patch] platform_unix.c include: already applied")
+elif old_inc not in text:
+    print("[patch] platform_unix.c include: anchor text not found, skipping (RetroArch source may have changed)")
+    rc = 3
+else:
+    text = text.replace(old_inc, new_inc, 1)
+    print("[patch] platform_unix.c include: applied")
+
+old_fn = '''static void frontend_unix_set_screen_brightness(int value)
+{
+   char *buffer = NULL;
+   char svalue[16] = {0};
+   unsigned int max_brightness = 100;
+
+   /* Device tree should have 'label = "backlight";' if control is desirable */
+   filestream_read_file("/sys/class/backlight/backlight/max_brightness",
+                        (void **)&buffer, NULL);
+   if (buffer)
+   {
+      sscanf(buffer, "%u", &max_brightness);
+      free(buffer);
+   }
+
+   /* Calculate the brightness */
+   value = (value * max_brightness) / 100;
+
+   snprintf(svalue, sizeof(svalue), "%d\\n", value);
+   filestream_write_file("/sys/class/backlight/backlight/brightness",
+                         svalue, strlen(svalue));
+}'''
+new_fn = '''static void frontend_unix_set_screen_brightness(int value)
+{
+   char *buffer = NULL;
+   char svalue[16] = {0};
+   unsigned int max_brightness = 100;
+   static char backlight_path[512] = {0};
+   static bool backlight_path_resolved = false;
+   char max_path[560];
+   char brightness_path[560];
+
+   /* pi-arcade-setup: auto-detect the actual backlight device name (e.g.
+    * "10-0045" on the official 7" touchscreen, or a vendor-specific name
+    * on other panels) instead of assuming a fixed "backlight" device node
+    * exists - that fixed name is only present when the device tree sets
+    * 'label = "backlight";', which most panels (including this project's
+    * target hardware) do not. Falls back to the old fixed name if no
+    * backlight device is found at all, preserving old behavior. Resolved
+    * once and cached (the backlight device doesn't change at runtime). */
+   if (!backlight_path_resolved)
+   {
+      glob_t gl;
+      backlight_path_resolved = true;
+      strlcpy(backlight_path, "/sys/class/backlight/backlight", sizeof(backlight_path));
+      if (glob("/sys/class/backlight/*", 0, NULL, &gl) == 0 && gl.gl_pathc > 0)
+      {
+         strlcpy(backlight_path, gl.gl_pathv[0], sizeof(backlight_path));
+         globfree(&gl);
+      }
+   }
+
+   snprintf(max_path, sizeof(max_path), "%s/max_brightness", backlight_path);
+   snprintf(brightness_path, sizeof(brightness_path), "%s/brightness", backlight_path);
+
+   /* Device tree should have 'label = "backlight";' if control is desirable */
+   filestream_read_file(max_path,
+                        (void **)&buffer, NULL);
+   if (buffer)
+   {
+      sscanf(buffer, "%u", &max_brightness);
+      free(buffer);
+   }
+
+   /* Calculate the brightness */
+   value = (value * max_brightness) / 100;
+
+   snprintf(svalue, sizeof(svalue), "%d\\n", value);
+   filestream_write_file(brightness_path,
+                         svalue, strlen(svalue));
+}'''
+if new_fn in text:
+    print("[patch] platform_unix.c frontend_unix_set_screen_brightness: already applied")
+elif old_fn not in text:
+    print("[patch] platform_unix.c frontend_unix_set_screen_brightness: anchor text not found, skipping (RetroArch source may have changed)")
+    rc = 3
+else:
+    text = text.replace(old_fn, new_fn, 1)
+    print("[patch] platform_unix.c frontend_unix_set_screen_brightness: applied")
+
+# ERROR FOUND LIVE (disclosed per the user's request to note and fix any
+# errors along the way): frontend_ctx_unix's set_screen_brightness struct
+# field is ONLY wired to frontend_unix_set_screen_brightness when built
+# for Lakka (HAVE_LAKKA_SWITCH, or HAVE_LAKKA+HAVE_ODROIDGO2) - on a plain
+# RetroPie/Debian unix build (this project's target, no HAVE_LAKKA), it's
+# unconditionally NULL, so frontend_driver_can_set_screen_brightness()
+# always returns false and BOTH the stock Settings > ... > Brightness
+# Control entry AND this patch's new Quick Menu "Display Brightness" entry
+# silently fail to appear at all - confirmed live: the entry was verified
+# completely absent from the real in-game Quick Menu after the first
+# build of this patch, traced to this exact Lakka-only compile guard.
+# Fixed by wiring the function unconditionally - safe on non-Lakka/non-
+# backlight hardware too, since the auto-detect glob() above simply finds
+# no device and the write silently no-ops in that case, matching every
+# other "not applicable on this hardware" fallback elsewhere in this
+# project.
+old_gate = '''#if defined(HAVE_LAKKA_SWITCH) || (defined(HAVE_LAKKA) && defined(HAVE_ODROIDGO2))
+   frontend_unix_set_screen_brightness,/* set_screen_brightness */
+#else
+   NULL,                         /* set_screen_brightness */
+#endif'''
+new_gate = '''   frontend_unix_set_screen_brightness,/* set_screen_brightness */'''
+# NOTE: new_gate is deliberately checked AFTER old_gate below, not before -
+# new_gate's exact text is also a substring of old_gate itself (the still-
+# guarded #if branch contains this same line), so checking new_gate first
+# would wrongly report "already applied" on a completely unpatched file.
+if old_gate in text:
+    text = text.replace(old_gate, new_gate, 1)
+    print("[patch] platform_unix.c set_screen_brightness struct wiring: applied")
+elif new_gate in text:
+    print("[patch] platform_unix.c set_screen_brightness struct wiring: already applied")
+else:
+    print("[patch] platform_unix.c set_screen_brightness struct wiring: anchor text not found, skipping (RetroArch source may have changed) - Display Brightness Quick Menu entry will not appear")
+    rc = 3
+
+# SECOND ERROR FOUND LIVE, after the struct-wiring fix above: the struct
+# now unconditionally references frontend_unix_set_screen_brightness, but
+# the FUNCTION ITSELF is still compiled out on non-Lakka builds - it lives
+# inside the SAME "#ifdef HAVE_LAKKA" block as frontend_unix_get_lakka_version
+# (one #ifdef/#endif pair wraps both functions). Result: a real compile
+# error ('frontend_unix_set_screen_brightness' undeclared here) on the
+# first rebuild attempt after the struct-wiring fix, confirmed live on the
+# Pi. Fixed by splitting that single guarded block into two: get_lakka_version
+# stays Lakka-only (it shells out to "cat /etc/release", meaningless off
+# Lakka), while set_screen_brightness becomes unconditional, matching the
+# now-unconditional struct reference.
+old_boundary = '''   pclose(command_file);
+}
+
+static void frontend_unix_set_screen_brightness(int value)'''
+new_boundary = '''   pclose(command_file);
+}
+#endif
+
+static void frontend_unix_set_screen_brightness(int value)'''
+if old_boundary in text:
+    text = text.replace(old_boundary, new_boundary, 1)
+    print("[patch] platform_unix.c HAVE_LAKKA guard split (open): applied")
+elif new_boundary in text:
+    print("[patch] platform_unix.c HAVE_LAKKA guard split (open): already applied")
+else:
+    print("[patch] platform_unix.c HAVE_LAKKA guard split (open): anchor text not found, skipping (RetroArch source may have changed)")
+    rc = 3
+
+old_tail = '''
+#endif
+
+static void frontend_unix_get_env(int *argc,'''
+new_tail = '''
+
+static void frontend_unix_get_env(int *argc,'''
+if old_tail in text:
+    text = text.replace(old_tail, new_tail, 1)
+    print("[patch] platform_unix.c HAVE_LAKKA guard split (close): applied")
+elif new_tail in text:
+    print("[patch] platform_unix.c HAVE_LAKKA guard split (close): already applied")
+else:
+    print("[patch] platform_unix.c HAVE_LAKKA guard split (close): anchor text not found, skipping (RetroArch source may have changed) - build will fail with 'frontend_unix_set_screen_brightness undeclared'")
+    rc = 3
+
+path.write_text(text)
+sys.exit(rc)
+PYEOF
+    return $?
 }
 
 # RetroArch ships a large library of controller autoconfig profiles under
@@ -2383,21 +3565,21 @@ phase_video_rotation_setup() {
         fi
         # Makes the left analog stick also work as a digital d-pad for the
         # arcade system specifically - needed for MAME's own in-game UI
-        # (including the custom Arcade Audio Mixer overlay's Left/Right
-        # boost adjustment and menu navigation, when ENABLE_MAME_CUSTOM_
-        # OVERLAY=true) to respond to stick input at all. Confirmed live:
-        # RetroArch's per-controller autoconfig binds a real D-pad/HAT to
-        # digital left/right (e.g. input_left_btn="h0left") but leaves the
-        # analog stick axes bound only to the *analog* RETRO_DEVICE_ANALOG
-        # inputs, not the digital retropad directions - and
+        # (its stock Show/Hide Menu: save states, DIP switches, etc.) to
+        # respond to stick input at all. Confirmed live: RetroArch's
+        # per-controller autoconfig binds a real D-pad/HAT to digital
+        # left/right (e.g. input_left_btn="h0left") but leaves the analog
+        # stick axes bound only to the *analog* RETRO_DEVICE_ANALOG inputs,
+        # not the digital retropad directions - and
         # input_player*_analog_dpad_mode defaults to "0" (None), so without
         # this, moving the stick produces no digital signal at all. MAME's
-        # own ioport-driven UI (IPT_UI_LEFT/RIGHT/UP/DOWN - used by both the
-        # stock in-game menu and the custom overlay) only ever sees digital
-        # retropad directions, so it's otherwise unreachable by the stick,
-        # even though RetroArch's own separate RGUI quick-menu navigates
-        # fine by stick already (it reads raw analog axes directly, an
-        # entirely different, core-independent code path).
+        # own ioport-driven UI (IPT_UI_LEFT/RIGHT/UP/DOWN) only ever sees
+        # digital retropad directions, so it's otherwise unreachable by the
+        # stick, even though RetroArch's own separate Quick Menu (including
+        # its Display Brightness/Sound/Game Audio entries added by
+        # _apply_retroarch_quickmenu_extensions_patch) navigates fine by
+        # stick already (it reads raw analog axes directly, an entirely
+        # different, core-independent code path).
         #
         # Must be the *_FORCED variant ("3" = ANALOG_DPAD_LSTICK_FORCED),
         # not plain "Left Analog" ("1") - confirmed by reading RetroArch's
@@ -3031,7 +4213,6 @@ phase_custom_retropie_system() {
 
     local keep=(showip.rp avsettings.rp wifigate.rp ftpsettings.rp retroarch.rp)
     [ "$ENABLE_BT_SPEAKER" = "true" ] && keep+=(btpair.rp btaudio.rp)
-    [ "$ENABLE_CONTROLLER_HOTKEYS" = "true" ] && keep+=(hotkeyconfig.rp)
     [ "$ENABLE_MUSIC_PLAYER" = "true" ] && keep+=(musicplayer.rp)
     [ "$ENABLE_LED_STRIP" = "true" ] && keep+=(ledconfig.rp)
 
@@ -3108,15 +4289,6 @@ $( [ "$ENABLE_BT_SPEAKER" = "true" ] && cat <<BTPAIR
 		<image>$icon_dir/bluetooth.png</image>
 	</game>
 BTPAIR
-)
-$( [ "$ENABLE_CONTROLLER_HOTKEYS" = "true" ] && cat <<HOTKEY
-	<game>
-		<path>./hotkeyconfig.rp</path>
-		<name>Hotkey Config</name>
-		<desc>Map the controller buttons used for the L3+R3 brightness and volume hotkeys (press each button twice to confirm), then set the combo that opens/closes MAME's in-game menu (hold L3 and/or R3 for 1 second, release, then hold again to confirm).</desc>
-		<image>$icon_dir/configedit.png</image>
-	</game>
-HOTKEY
 )
 $( [ "$ENABLE_MUSIC_PLAYER" = "true" ] && cat <<MUSICPLAYER
 	<game>
@@ -3266,658 +4438,6 @@ polkit.addRule(function(action, subject) {
 EOF
     sudo chmod 644 /etc/polkit-1/rules.d/50-pi-power.rules
     sudo systemctl restart polkit || log_warn "Could not restart polkit; reboot to apply the power-action rule"
-    return 0
-}
-
-phase_controller_hotkeys() {
-    if [ "$ENABLE_CONTROLLER_HOTKEYS" != "true" ]; then
-        log "ENABLE_CONTROLLER_HOTKEYS=false, skipping"
-        return 0
-    fi
-    mkdir -p "$PI_HOME/scripts"
-    tee "$PI_HOME/scripts/controller-hotkeys.py" >/dev/null <<PYEOF
-#!/usr/bin/env python3
-"""
-System-wide controller hotkey daemon for brightness/volume control.
-Generated by pi-arcade-setup (https://github.com/Cr4zySh4rk/pi-arcade-setup).
-
-Reads raw joystick events from /dev/input/js0. Works regardless of what has
-input focus (EmulationStation, RetroArch in-game, RetroPie-Setup tools).
-
-Controls (hold L3 + R3, then press):
-  Square   -> brightness +STEP% (max 100%)
-  X        -> brightness -STEP% (min 5%)
-  Triangle -> volume +STEP% (max 100%)
-  Circle   -> volume -STEP% (min 0%)
-
-Button numbers are loaded from $PI_HOME/.controller-hotkeys-buttons.json if
-present (written by the in-frontend "Hotkey Config" tool / hotkey-remap.py),
-falling back to the defaults below otherwise.
-"""
-import glob
-import json
-import os
-import struct
-import subprocess
-import time
-
-JS_DEVICE = "/dev/input/js0"
-STATE_FILE = "$PI_HOME/.controller-hotkeys-state.json"
-BUTTON_CONFIG_FILE = "$PI_HOME/.controller-hotkeys-buttons.json"
-BACKLIGHT_MAX = 255
-ALSA_CARD = "$ALSA_CARD_INDEX"
-ALSA_CONTROL = "PCM"
-STEP = $HOTKEY_STEP
-BRIGHTNESS_MIN = 5
-BRIGHTNESS_MAX = 100
-VOLUME_MIN = 0
-VOLUME_MAX = 100
-
-DEFAULT_BUTTONS = {
-    "l3": $BTN_L3, "r3": $BTN_R3,
-    "square": $BTN_SQUARE, "x": $BTN_X, "circle": $BTN_CIRCLE, "triangle": $BTN_TRIANGLE,
-}
-
-JS_EVENT_BUTTON = 0x01
-JS_EVENT_INIT = 0x80
-EVENT_FORMAT = "IhBB"
-EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
-
-
-def load_button_mapping():
-    mapping = dict(DEFAULT_BUTTONS)
-    if os.path.exists(BUTTON_CONFIG_FILE):
-        try:
-            with open(BUTTON_CONFIG_FILE) as f:
-                data = json.load(f)
-                for key in DEFAULT_BUTTONS:
-                    if key in data:
-                        mapping[key] = data[key]
-        except Exception:
-            pass
-    return mapping
-
-
-def find_backlight_path():
-    matches = glob.glob("/sys/class/backlight/*/brightness")
-    return matches[0] if matches else None
-
-
-BACKLIGHT_PATH = find_backlight_path()
-
-
-def clamp(value, lo, hi):
-    return max(lo, min(hi, value))
-
-
-def load_state():
-    brightness = 100
-    volume = 78
-    if BACKLIGHT_PATH:
-        try:
-            with open(BACKLIGHT_PATH) as f:
-                raw = int(f.read().strip())
-                brightness = clamp(round(raw / BACKLIGHT_MAX * 100), BRIGHTNESS_MIN, BRIGHTNESS_MAX)
-        except Exception:
-            pass
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE) as f:
-                data = json.load(f)
-                brightness = data.get("brightness", brightness)
-                volume = data.get("volume", volume)
-        except Exception:
-            pass
-    return {"brightness": brightness, "volume": volume}
-
-
-def save_state(state):
-    try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f)
-    except Exception:
-        pass
-
-
-def set_brightness(percent):
-    if not BACKLIGHT_PATH:
-        return
-    raw = round(percent / 100 * BACKLIGHT_MAX)
-    try:
-        with open(BACKLIGHT_PATH, "w") as f:
-            f.write(str(raw))
-    except Exception as e:
-        print(f"[hotkeys] failed to set brightness: {e}")
-
-
-def set_volume(percent):
-    try:
-        subprocess.run(
-            ["amixer", "-c", ALSA_CARD, "sset", ALSA_CONTROL, f"{percent}%", "unmute"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
-        )
-    except Exception as e:
-        print(f"[hotkeys] failed to set volume: {e}")
-
-
-def main():
-    buttons = load_button_mapping()
-    state = load_state()
-    set_brightness(state["brightness"])
-    print(f"[hotkeys] starting, brightness={state['brightness']}% volume={state['volume']}% backlight={BACKLIGHT_PATH}")
-    print(f"[hotkeys] button mapping: L3={buttons['l3']} R3={buttons['r3']} Square={buttons['square']} "
-          f"X={buttons['x']} Circle={buttons['circle']} Triangle={buttons['triangle']}")
-
-    held = {}
-
-    while True:
-        try:
-            with open(JS_DEVICE, "rb") as js:
-                print("[hotkeys] connected to", JS_DEVICE)
-                while True:
-                    data = js.read(EVENT_SIZE)
-                    if not data or len(data) < EVENT_SIZE:
-                        break
-                    _t, value, typ, number = struct.unpack(EVENT_FORMAT, data)
-                    if typ & JS_EVENT_INIT:
-                        typ &= ~JS_EVENT_INIT
-                    if typ != JS_EVENT_BUTTON:
-                        continue
-
-                    held[number] = bool(value)
-                    if not (held.get(buttons["l3"]) and held.get(buttons["r3"])):
-                        continue
-                    if not value:
-                        continue
-
-                    changed = False
-                    if number == buttons["square"]:
-                        state["brightness"] = clamp(state["brightness"] + STEP, BRIGHTNESS_MIN, BRIGHTNESS_MAX)
-                        set_brightness(state["brightness"]); changed = True
-                    elif number == buttons["x"]:
-                        state["brightness"] = clamp(state["brightness"] - STEP, BRIGHTNESS_MIN, BRIGHTNESS_MAX)
-                        set_brightness(state["brightness"]); changed = True
-                    elif number == buttons["triangle"]:
-                        state["volume"] = clamp(state["volume"] + STEP, VOLUME_MIN, VOLUME_MAX)
-                        set_volume(state["volume"]); changed = True
-                    elif number == buttons["circle"]:
-                        state["volume"] = clamp(state["volume"] - STEP, VOLUME_MIN, VOLUME_MAX)
-                        set_volume(state["volume"]); changed = True
-
-                    if changed:
-                        save_state(state)
-                        print(f"[hotkeys] brightness={state['brightness']}% volume={state['volume']}%")
-        except FileNotFoundError:
-            pass
-        except OSError as e:
-            print(f"[hotkeys] joystick read error: {e}")
-
-        held.clear()
-        time.sleep(2)
-
-
-if __name__ == "__main__":
-    main()
-PYEOF
-    chmod +x "$PI_HOME/scripts/controller-hotkeys.py"
-
-    sudo tee /etc/systemd/system/controller-hotkeys.service >/dev/null <<EOF
-[Unit]
-Description=Controller hotkey daemon (L3+R3 brightness/volume)
-After=local-fs.target
-Wants=local-fs.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/python3 -u $PI_HOME/scripts/controller-hotkeys.py
-Restart=always
-RestartSec=2
-User=root
-StandardOutput=append:/var/log/controller-hotkeys.log
-StandardError=append:/var/log/controller-hotkeys.log
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    sudo systemctl daemon-reload
-    sudo systemctl enable --now controller-hotkeys.service
-    return 0
-}
-
-phase_hotkey_remap_tool() {
-    if [ "$ENABLE_CONTROLLER_HOTKEYS" != "true" ]; then
-        return 0
-    fi
-    mkdir -p "$PI_HOME/scripts"
-    tee "$PI_HOME/scripts/hotkey-remap.py" >/dev/null <<PYEOF
-#!/usr/bin/env python3
-"""
-Interactive controller button-mapping tool for the L3+R3 brightness/volume
-hotkey daemon, plus MAME's Show/Hide Menu combo. Run from the RetroPie menu
-("Hotkey Config") or directly:
-    sudo python3 hotkey-remap.py
-Generated by pi-arcade-setup.
-
-The MAME combo step (after the six button roles below) only accepts L3
-and/or R3, held together for 1 second, released, then held again to
-confirm - not an arbitrary button. That's a deliberate restriction, not a
-UX shortcut: MAME's retro port (src/osd/modules/input/input_retro.cpp)
-binds L3/R3 to fixed JOYCODE_1_BUTTON7/BUTTON8 tokens no matter which
-controller is plugged in, but the four face buttons are reassigned to
-different JOYCODE_1_BUTTONn slots per-game depending on that driver's own
-control-panel profile (confirmed by reading multiple different
-button_mapping[] reorderings in that same file) - so a face button (or
-Select/Start) captured here could silently point at the wrong physical
-button on some other game. L3+R3 (this project's own default, chosen for
-the same reason - see the Known limitations entry on MAME's menu hotkey)
-is the only combo guaranteed to mean the same thing on every ROM.
-"""
-import curses, json, os, select, shutil, struct, subprocess, sys, time
-import xml.etree.ElementTree as ET
-
-JS_DEVICE = "/dev/input/js0"
-CONFIG_FILE = "$PI_HOME/.controller-hotkeys-buttons.json"
-
-ROMS_DIR = "$PI_HOME/RetroPie/roms/arcade"
-CFG_DIR = os.path.join(ROMS_DIR, "mame", "cfg")
-DEFAULT_CFG_PATH = os.path.join(CFG_DIR, "default.cfg")
-MAME_HOTKEY_TOKENS = {
-    "l3": "JOYCODE_1_BUTTON7",
-    "r3": "JOYCODE_1_BUTTON8",
-    "l3r3": "JOYCODE_1_BUTTON7 JOYCODE_1_BUTTON8",
-}
-
-JS_EVENT_BUTTON = 0x01
-JS_EVENT_INIT = 0x80
-EVENT_FORMAT = "IhBB"
-EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
-
-ROLES = [
-    ("l3", "L3", "Left stick click"),
-    ("r3", "R3", "Right stick click"),
-    ("square", "SQUARE (Xbox: X)", "Brightness UP"),
-    ("x", "CROSS / X (Xbox: A)", "Brightness DOWN"),
-    ("triangle", "TRIANGLE (Xbox: Y)", "Volume UP"),
-    ("circle", "CIRCLE (Xbox: B)", "Volume DOWN"),
-]
-
-COL_HEADER, COL_LABEL, COL_HINT, COL_GOOD, COL_BAD = 1, 2, 3, 4, 5
-
-
-def load_default_cfg():
-    """Returns (tree, system_elem), creating a fresh skeleton if
-    default.cfg doesn't exist yet or is unreadable."""
-    if os.path.isfile(DEFAULT_CFG_PATH):
-        try:
-            tree = ET.parse(DEFAULT_CFG_PATH)
-            system = tree.getroot().find("system")
-            if system is None:
-                system = ET.SubElement(tree.getroot(), "system")
-                system.set("name", "default")
-            return tree, system
-        except ET.ParseError:
-            pass
-    root = ET.Element("mameconfig")
-    root.set("version", "10")
-    system = ET.SubElement(root, "system")
-    system.set("name", "default")
-    return ET.ElementTree(root), system
-
-
-def write_default_cfg(tree):
-    try:
-        ET.indent(tree, space="    ")
-    except Exception:
-        pass
-    os.makedirs(CFG_DIR, exist_ok=True)
-    try:
-        if os.path.exists(DEFAULT_CFG_PATH):
-            shutil.copy2(DEFAULT_CFG_PATH, DEFAULT_CFG_PATH + ".bak")
-    except OSError:
-        pass
-    body = ET.tostring(tree.getroot(), encoding="unicode")
-    content = (
-        "﻿<?xml version=\\"1.0\\"?>\n"
-        "<!-- This file is autogenerated; comments and unknown tags will be stripped -->\n"
-        + body + "\n"
-    )
-    tmp = DEFAULT_CFG_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(content)
-    os.replace(tmp, DEFAULT_CFG_PATH)
-
-
-def set_mame_menu_combo(combo):
-    """combo is "l3", "r3", "l3r3", or "stock" (removes the override,
-    reverting to MAME's own compiled-in default: Select+X to open,
-    Select+Start to cancel)."""
-    tree, system = load_default_cfg()
-    inp = system.find("input")
-    if combo == "stock":
-        if inp is not None:
-            system.remove(inp)
-        write_default_cfg(tree)
-        return
-    token = MAME_HOTKEY_TOKENS[combo]
-    if inp is None:
-        inp = ET.SubElement(system, "input")
-    else:
-        for child in list(inp):
-            inp.remove(child)
-    for ptype in ("UI_MENU", "UI_CANCEL"):
-        port = ET.SubElement(inp, "port")
-        port.set("type", ptype)
-        seq = ET.SubElement(port, "newseq")
-        seq.set("type", "standard")
-        seq.text = token
-    write_default_cfg(tree)
-
-
-def combo_label(combo):
-    return {"l3": "L3", "r3": "R3", "l3r3": "L3 + R3",
-            "stock": "MAME stock (Select+X / Select+Start)"}.get(combo, combo)
-
-
-def cx(win, text):
-    _, w = win.getmaxyx()
-    return max(0, (w - len(text)) // 2)
-
-
-def safe_addstr(win, y, x, text, attr=0):
-    h, w = win.getmaxyx()
-    if 0 <= y < h:
-        try:
-            win.addstr(y, max(0, x), text[: max(0, w - x - 1)], attr)
-        except curses.error:
-            pass
-
-
-def draw_chrome(win, subtitle):
-    win.erase()
-    h, w = win.getmaxyx()
-    title = " CONTROLLER HOTKEY MAPPING "
-    safe_addstr(win, 1, cx(win, title), title, curses.color_pair(COL_HEADER) | curses.A_BOLD)
-    if subtitle:
-        safe_addstr(win, 3, cx(win, subtitle), subtitle, curses.A_DIM)
-    footer = " ESC  CANCEL "
-    safe_addstr(win, h - 2, cx(win, footer), footer, curses.color_pair(COL_HEADER))
-
-
-def draw_progress(win, step, total):
-    dots = " ".join("●" if i < step else "○" for i in range(total))
-    safe_addstr(win, 5, cx(win, dots), dots, curses.color_pair(COL_LABEL))
-    label = f"STEP {step} OF {total}"
-    safe_addstr(win, 6, cx(win, label), label, curses.A_DIM)
-
-
-def draw_prompt(win, name, desc, status="", status_attr=0):
-    h, _ = win.getmaxyx()
-    mid = h // 2
-    safe_addstr(win, mid - 3, cx(win, "PRESS THE BUTTON FOR"), "PRESS THE BUTTON FOR", curses.A_DIM)
-    safe_addstr(win, mid - 1, cx(win, name), name, curses.color_pair(COL_LABEL) | curses.A_BOLD)
-    safe_addstr(win, mid, cx(win, desc), desc)
-    hint = "(press it twice to confirm)"
-    safe_addstr(win, mid + 2, cx(win, hint), hint, curses.color_pair(COL_HINT) | curses.A_DIM)
-    if status:
-        safe_addstr(win, mid + 4, cx(win, status), status, status_attr | curses.A_BOLD)
-    win.refresh()
-
-
-def wait_for_input(win, js_fd, js_file, any_key_continues=False):
-    win.nodelay(True)
-    while True:
-        r, _, _ = select.select([js_fd, sys.stdin], [], [], 0.05)
-        if sys.stdin in r:
-            ch = win.getch()
-            if ch == 27:
-                return ("cancel", None)
-            if ch != -1 and any_key_continues:
-                return ("continue", None)
-        if js_fd in r:
-            data = js_file.read(EVENT_SIZE)
-            if data and len(data) == EVENT_SIZE:
-                _t, value, typ, number = struct.unpack(EVENT_FORMAT, data)
-                if typ & JS_EVENT_INIT:
-                    continue
-                if typ == JS_EVENT_BUTTON and value == 1:
-                    return ("continue", None) if any_key_continues else ("button", number)
-
-
-def capture_role(win, js_fd, js_file, step, total, name, desc):
-    while True:
-        draw_chrome(win, ""); draw_progress(win, step, total); draw_prompt(win, name, desc)
-        kind, val = wait_for_input(win, js_fd, js_file)
-        if kind == "cancel":
-            return None
-        draw_chrome(win, ""); draw_progress(win, step, total)
-        draw_prompt(win, name, desc, f"GOT BUTTON {val} - PRESS AGAIN TO CONFIRM", curses.color_pair(COL_HINT))
-        kind2, val2 = wait_for_input(win, js_fd, js_file)
-        if kind2 == "cancel":
-            return None
-        if val == val2:
-            draw_chrome(win, ""); draw_progress(win, step, total)
-            draw_prompt(win, name, desc, f"CONFIRMED: BUTTON {val}", curses.color_pair(COL_GOOD))
-            curses.napms(700)
-            return val
-        else:
-            draw_chrome(win, ""); draw_progress(win, step, total)
-            draw_prompt(win, name, desc, "DIDN'T MATCH - TRY AGAIN", curses.color_pair(COL_BAD))
-            curses.napms(900)
-
-
-def draw_mame_screen(win, step, total, line, hint="", attr=0):
-    draw_chrome(win, "")
-    draw_progress(win, step, total)
-    h, _ = win.getmaxyx()
-    mid = h // 2
-    title = "MAME SHOW/HIDE MENU COMBO"
-    safe_addstr(win, mid - 3, cx(win, title), title, curses.A_DIM)
-    safe_addstr(win, mid - 1, cx(win, line), line, attr or (curses.color_pair(COL_LABEL) | curses.A_BOLD))
-    if hint:
-        safe_addstr(win, mid + 1, cx(win, hint), hint, curses.color_pair(COL_HINT) | curses.A_DIM)
-    footer = "Circle/B: keep current combo     ESC: cancel"
-    safe_addstr(win, h - 2, cx(win, footer), footer, curses.color_pair(COL_HEADER))
-    win.refresh()
-
-
-def capture_mame_combo(win, js_fd, js_file, step, total, l3_val, r3_val, circle_val):
-    """Hold-for-1-second, release, hold-again-to-confirm capture for MAME's
-    Show/Hide Menu combo - see the module docstring for why only L3/R3 are
-    accepted. Returns "l3", "r3", "l3r3", "stock" (kept as-is, via
-    Circle/B), or None (whole wizard cancelled via ESC)."""
-    held = set()
-    hold_start = None
-    confirmed_first = None
-    phase = "hold1"
-    win.nodelay(True)
-    while True:
-        r, _, _ = select.select([js_fd, sys.stdin], [], [], 0.05)
-        if sys.stdin in r:
-            ch = win.getch()
-            if ch == 27:
-                return None
-        if js_fd in r:
-            data = js_file.read(EVENT_SIZE)
-            if data and len(data) == EVENT_SIZE:
-                _t, value, typ, number = struct.unpack(EVENT_FORMAT, data)
-                if typ & JS_EVENT_INIT:
-                    pass
-                elif typ == JS_EVENT_BUTTON:
-                    if value == 1 and number == circle_val and phase == "hold1":
-                        return "stock"
-                    if value:
-                        held.add(number)
-                    else:
-                        held.discard(number)
-                    hold_start = None
-
-        if phase == "wait_release":
-            if held:
-                draw_mame_screen(win, step, total, f"GOT {combo_label(confirmed_first)} - RELEASE, THEN HOLD AGAIN")
-                continue
-            phase = "hold2"
-
-        unsupported = held - {l3_val, r3_val}
-        if unsupported:
-            draw_mame_screen(win, step, total, "ONLY L3 / R3 SUPPORTED - RELEASE AND TRY AGAIN", attr=curses.color_pair(COL_BAD))
-            continue
-
-        if not held:
-            hold_start = None
-            prompt = "HOLD YOUR COMBO (L3, R3, OR BOTH) FOR 1 SECOND" if phase == "hold1" else "HOLD THE SAME COMBO AGAIN"
-            draw_mame_screen(win, step, total, prompt, hint="This sets what opens/closes MAME's in-game menu")
-            continue
-
-        combo = "l3r3" if held == {l3_val, r3_val} else ("l3" if l3_val in held else "r3")
-        if hold_start is None:
-            hold_start = time.monotonic()
-        elapsed = time.monotonic() - hold_start
-        if elapsed < 1.0:
-            draw_mame_screen(win, step, total, f"HOLDING {combo_label(combo)} ... {elapsed:.1f}s / 1.0s")
-            continue
-
-        if phase == "hold1":
-            confirmed_first = combo
-            phase = "wait_release"
-            draw_mame_screen(win, step, total, f"HELD {combo_label(combo)} FOR 1s - RELEASE NOW", attr=curses.color_pair(COL_HINT))
-            curses.napms(400)
-        else:
-            if combo == confirmed_first:
-                draw_mame_screen(win, step, total, f"CONFIRMED: {combo_label(combo)}", attr=curses.color_pair(COL_GOOD) | curses.A_BOLD)
-                curses.napms(700)
-                return combo
-            draw_mame_screen(win, step, total, "DIDN'T MATCH - TRY AGAIN", attr=curses.color_pair(COL_BAD))
-            curses.napms(900)
-            held.clear(); hold_start = None; confirmed_first = None; phase = "hold1"
-
-
-def show_message(win, lines, wait_key=True, js_fd=None, js_file=None):
-    win.erase()
-    h, w = win.getmaxyx()
-    top = h // 2 - len(lines) // 2
-    for i, (text, attr) in enumerate(lines):
-        safe_addstr(win, top + i, cx(win, text), text, attr)
-    win.refresh()
-    if wait_key:
-        if js_fd is not None:
-            wait_for_input(win, js_fd, js_file, any_key_continues=True)
-        else:
-            win.nodelay(False)
-            win.getch()
-
-
-def run(stdscr):
-    curses.curs_set(0)
-    curses.start_color()
-    curses.use_default_colors()
-    curses.init_pair(COL_HEADER, curses.COLOR_YELLOW, -1)
-    curses.init_pair(COL_LABEL, curses.COLOR_CYAN, -1)
-    curses.init_pair(COL_HINT, curses.COLOR_YELLOW, -1)
-    curses.init_pair(COL_GOOD, curses.COLOR_GREEN, -1)
-    curses.init_pair(COL_BAD, curses.COLOR_RED, -1)
-
-    try:
-        js_file = open(JS_DEVICE, "rb")
-    except FileNotFoundError:
-        show_message(stdscr, [("NO CONTROLLER FOUND", curses.color_pair(COL_BAD) | curses.A_BOLD),
-                               (f"Could not open {JS_DEVICE}", curses.A_DIM)], wait_key=False)
-        curses.napms(1500)
-        return None
-
-    js_fd = js_file.fileno()
-    draw_chrome(stdscr, "")
-    show_message(stdscr, [
-        ("CONTROLLER HOTKEY MAPPING", curses.color_pair(COL_HEADER) | curses.A_BOLD), ("", 0),
-        ("You'll be asked to press each button twice, one at a time,", 0),
-        ("then hold a combo for MAME's Show/Hide Menu.", 0),
-        ("Press any button to begin, or ESC to cancel.", curses.A_DIM),
-    ], js_fd=js_fd, js_file=js_file)
-
-    try:
-        mapping = {}
-        total = len(ROLES) + 1
-        for i, (key, name, desc) in enumerate(ROLES, start=1):
-            val = capture_role(stdscr, js_fd, js_file, i, total, name, desc)
-            if val is None:
-                show_message(stdscr, [("CANCELLED", curses.color_pair(COL_BAD) | curses.A_BOLD),
-                                       ("No changes were saved.", curses.A_DIM)], wait_key=False)
-                curses.napms(1200)
-                return None
-            mapping[key] = val
-
-        mame_combo = capture_mame_combo(stdscr, js_fd, js_file, total, total,
-                                         mapping["l3"], mapping["r3"], mapping["circle"])
-        if mame_combo is None:
-            show_message(stdscr, [("CANCELLED", curses.color_pair(COL_BAD) | curses.A_BOLD),
-                                   ("No changes were saved.", curses.A_DIM)], wait_key=False)
-            curses.napms(1200)
-            return None
-
-        lines = [("MAPPING COMPLETE", curses.color_pair(COL_GOOD) | curses.A_BOLD), ("", 0)]
-        for key, name, desc in ROLES:
-            lines.append((f"{name:<20} ({desc}):  button {mapping[key]}", 0))
-        lines.append((f"{'MAME Show/Hide Menu':<20} :  {combo_label(mame_combo)}", 0))
-        lines.append(("", 0))
-        lines.append(("Press any button or key to continue...", curses.A_DIM))
-        show_message(stdscr, lines, js_fd=js_fd, js_file=js_file)
-        return (mapping, mame_combo)
-    finally:
-        js_file.close()
-
-
-def main():
-    result = curses.wrapper(run)
-    if not result:
-        return
-    mapping, mame_combo = result
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(mapping, f, indent=2)
-    subprocess.run(["sudo", "systemctl", "restart", "controller-hotkeys.service"], check=False)
-    set_mame_menu_combo(mame_combo)
-    print()
-    print("=" * 50)
-    print(" New hotkey mapping saved and applied:")
-    for key, name, desc in ROLES:
-        print(f"   {name:<20} ({desc}):  button {mapping[key]}")
-    print(f"   {'MAME Show/Hide Menu':<20} :  {combo_label(mame_combo)}")
-    print("=" * 50)
-
-
-if __name__ == "__main__":
-    main()
-PYEOF
-    chmod +x "$PI_HOME/scripts/hotkey-remap.py"
-
-    touch "$PI_HOME/RetroPie/retropiemenu/hotkeyconfig.rp"
-
-    local menu_script="$PI_HOME/RetroPie-Setup/scriptmodules/supplementary/retropiemenu.sh"
-    if [ -f "$menu_script" ] && ! grep -q "hotkeyconfig.rp)" "$menu_script"; then
-        sudo cp "$menu_script" "${menu_script}.bak.$(date +%s)"
-        sudo python3 - "$menu_script" "$PI_HOME" <<'PYEOF'
-import sys
-path, pi_home = sys.argv[1], sys.argv[2]
-text = open(path).read()
-anchor = "filemanager.rp)"
-idx = text.find(anchor)
-if idx == -1:
-    print("[hotkeyconfig] anchor 'filemanager.rp)' not found in retropiemenu.sh; skipping menu wiring")
-    sys.exit(0)
-# Insert a new case immediately after the filemanager.rp) case's closing
-# ";;", preserving indentation (matches the reference build exactly).
-case_end = text.find(";;", idx)
-if case_end == -1:
-    print("[hotkeyconfig] could not find end of filemanager.rp) case; skipping menu wiring")
-    sys.exit(0)
-insert_point = text.find("\n", case_end) + 1
-line_start = text.rfind("\n", 0, idx) + 1
-indent = text[line_start:idx]
-insert_block = f"{indent}hotkeyconfig.rp)\n{indent}    python3 {pi_home}/scripts/hotkey-remap.py\n{indent}    ;;\n"
-new_text = text[:insert_point] + insert_block + text[insert_point:]
-open(path, "w").write(new_text)
-print("[hotkeyconfig] wired into retropiemenu.sh")
-PYEOF
-    fi
-    log "Hotkey Config installed - captures the L3+R3 brightness/volume button roles and, as its last step, MAME's Show/Hide Menu combo (hold L3 and/or R3 for 1s, release, hold again to confirm; Circle/B keeps whatever's already set). See phase_mame_menu_hotkey_default for the unconditional fresh-install default."
     return 0
 }
 
@@ -7688,20 +8208,21 @@ PYEOF
 # (unconditionally bound to JOYCODE_1_BUTTON7/BUTTON8 regardless of
 # controller/profile - see the README's Known limitations entry on MAME's
 # menu hotkey for why L3+R3 specifically). Written into roms/arcade/mame/
-# cfg/default.cfg using the exact same schema/tokens the "Hotkey Config"
-# RetroPie-menu tool (phase_hotkey_remap_tool) uses when you re-capture
-# this combo yourself - this phase only sets the untouched fresh-install
-# default, never overwrites a choice already made from that tool. This
-# combo also opens the custom in-game Arcade Audio Mixer overlay directly
-# when ENABLE_MAME_CUSTOM_OVERLAY=true (the default) - see
-# phase_mame_arcade_overlay_build.
+# cfg/default.cfg - this phase only sets the untouched fresh-install
+# default, never overwrites a choice already made in-game (MAME's own
+# "Input (general)" menu lets you re-capture this combo any time). This
+# combo opens MAME's own stock in-game menu (save states, DIP switches,
+# etc.) - unchanged, still MAME's normal nested menu tree; the Audio Boost
+# and Stereo/Mono controls live as libretro core options instead (see
+# ENABLE_MAME_ARCADE_AUDIO_OPTIONS above), reachable from RetroArch's own
+# Quick Menu (Home button) rather than from this combo.
 #
-# This used to be a whole standalone "MAME Audio Mixer Hotkey" RetroPie-
-# menu tool with its own hotkey-toggle UI; that capability now lives
-# inside "Hotkey Config" (phase_hotkey_remap_tool) instead, so there's
-# exactly one place to configure controller hotkeys. Only the
-# unconditional fresh-install default remains here, plus cleanup of that
-# older tool's leftovers on a re-run against an existing install.
+# This used to also open a custom in-game overlay hijacking this same
+# combo, and before that a whole standalone "MAME Audio Mixer Hotkey"
+# RetroPie-menu tool - both superseded by the RetroArch Quick Menu
+# integration above. Only the unconditional fresh-install L3+R3 default
+# remains here, plus cleanup of that older tool's leftovers on a re-run
+# against an existing install.
 phase_mame_menu_hotkey_default() {
     rm -f "$PI_HOME/scripts/mame-mixer-hotkey.py" "$PI_HOME/RetroPie/retropiemenu/mamemixerhotkey.rp"
 
@@ -7802,7 +8323,7 @@ else:
     print("[mame-menu-hotkey] set MAME internal-menu combo to L3+R3 (avoids the Select+Start clash with this project's quit-to-frontend shortcut)")
 MENUHOTKEYEOF
 
-    log "MAME Show/Hide Menu combo defaulted to L3+R3 in roms/arcade/mame/cfg/default.cfg (avoids the Select+Start clash with this project's quit-to-frontend shortcut). Re-capture it any time from the 'Hotkey Config' RetroPie-menu tool (phase_hotkey_remap_tool) - its last step now sets this same combo. With ENABLE_MAME_CUSTOM_OVERLAY=true (the default), this combo opens the custom in-game Arcade Audio Mixer overlay directly, where boost/stereo-mono are set live, in-game, per ROM - see phase_mame_arcade_overlay_build."
+    log "MAME Show/Hide Menu combo defaulted to L3+R3 in roms/arcade/mame/cfg/default.cfg (avoids the Select+Start clash with this project's quit-to-frontend shortcut). Opens MAME's own stock in-game menu; Audio Boost/Stereo-Mono are now RetroArch Quick Menu (Home button) options instead - see ENABLE_MAME_ARCADE_AUDIO_OPTIONS."
     return 0
 }
 
@@ -7891,8 +8412,6 @@ main() {
         custom_retropie_system
         splash_setup
         polkit_fix
-        controller_hotkeys
-        hotkey_remap_tool
         led_strip_setup
         led_config_tool
         audio_output_setup
