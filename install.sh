@@ -952,14 +952,38 @@ phase_retropie_install() {
     # re-running basic_install cheap/idempotent for already-built packages,
     # so retry a few times with a short backoff before giving up for real.
     local attempt
+    local out
+    out="$(mktemp)"
     for attempt in 1 2 3; do
-        if sudo ./retropie_packages.sh setup basic_install; then
+        if sudo ./retropie_packages.sh setup basic_install 2>&1 | tee "$out"; then
             [ -x /opt/retropie/supplementary/emulationstation/emulationstation ] || command -v emulationstation >/dev/null 2>&1 || log_warn "emulationstation binary not found where expected after basic_install"
+            rm -f "$out"
+            return 0
+        fi
+        # RetroPie-Setup's own splashscreen scriptmodule tries `git checkout rpi`
+        # (falling back to `git checkout master`) as part of configuring the
+        # splashscreen repo. Upstream RetroPie/retropie-splashscreens no longer
+        # has an 'rpi' branch (confirmed live: only master/reorganisation exist),
+        # so the checkout always fails there and falls back to master, which
+        # succeeds and leaves the splashscreen correctly configured - but
+        # RetroPie-Setup still records it as an error, which makes
+        # retropie_packages.sh's own exit status non-zero even though nothing
+        # is actually broken. That failure is deterministic, so blindly
+        # retrying 3 times would just burn ~an hour re-walking the whole
+        # package list for no reason and then die() permanently. Detect this
+        # specific known-benign case and treat it as success instead.
+        local other_errors
+        other_errors="$(grep -E "^Error running " "$out" | grep -vE "^Error running 'git checkout (rpi|master)' - returned 128$" || true)"
+        if grep -q "^Errors:$" "$out" && [ -z "$other_errors" ]; then
+            log_warn "RetroPie basic_install reported only the known-benign splashscreen 'git checkout rpi' branch-fallback error (upstream retropie-splashscreens has no 'rpi' branch anymore); treating as success"
+            [ -x /opt/retropie/supplementary/emulationstation/emulationstation ] || command -v emulationstation >/dev/null 2>&1 || log_warn "emulationstation binary not found where expected after basic_install"
+            rm -f "$out"
             return 0
         fi
         log_warn "RetroPie basic_install failed (attempt $attempt/3)"
         [ "$attempt" -lt 3 ] && sleep 30
     done
+    rm -f "$out"
     die "RetroPie basic_install failed after 3 attempts"
 }
 
