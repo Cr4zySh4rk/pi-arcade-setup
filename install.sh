@@ -1578,6 +1578,21 @@ phase_mame_arcade_overlay_build() {
     _apply_mame_arcade_overlay_patch "$PI_HOME/RetroPie-Setup/tmp/build/lr-mame" \
         || log_warn "MAME arcade audio core-options patch did not fully apply - build may fail, or may succeed but without the extra Audio Boost/Stereo-Mono options, if MAME's source has changed since this script was written"
 
+    # The chown above (to $PI_USER) plus this whole script potentially
+    # running under `sudo bash install.sh` (i.e. as root throughout, not
+    # just for individual sudo calls) sets up exactly the mismatch git's
+    # "dubious ownership" protection (CVE-2022-24765 mitigation) checks for:
+    # a git operation running as root against a directory it does NOT own.
+    # Confirmed live: the "_source_" call below re-runs the sources step
+    # internally, and its `git checkout master` failed outright with
+    # "fatal: detected dubious ownership in repository ... HEAD is now in
+    # branch '' at commit ''" - silently leaving the tree checked out to
+    # nothing, which then made the whole lr-mame build/install step die.
+    # --system scope (not --global) so this applies regardless of which
+    # effective user/$HOME context actually issues the later git call.
+    sudo git config --system --add safe.directory "$PI_HOME/RetroPie-Setup/tmp/build/lr-mame" \
+        || log_warn "Could not add lr-mame source tree as a git safe.directory - the build below may fail with a 'dubious ownership' error"
+
     log "Building MAME with the extra Audio Boost/Stereo-Mono core options - full arcade subtarget build, confirmed ~12 hours wall-clock on a Pi 4 with -j4"
     sudo ./retropie_packages.sh lr-mame _source_ || die "lr-mame build/install failed"
 
