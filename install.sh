@@ -4317,7 +4317,7 @@ PROFEOF
 phase_custom_retropie_system() {
     mkdir -p "$PI_HOME/ES-DE/custom_systems" "$PI_HOME/ES-DE/gamelists/retropie"
 
-    local keep=(showip.rp avsettings.rp wifigate.rp ftpsettings.rp retroarch.rp)
+    local keep=(showip.rp avsettings.rp wifigate.rp ftpsettings.rp retroarch.rp assignports.rp)
     [ "$ENABLE_BT_SPEAKER" = "true" ] && keep+=(btpair.rp btaudio.rp)
     [ "$ENABLE_MUSIC_PLAYER" = "true" ] && keep+=(musicplayer.rp)
     [ "$ENABLE_LED_STRIP" = "true" ] && keep+=(ledconfig.rp)
@@ -4440,6 +4440,12 @@ LEDCFG
 		<name>FTP settings</name>
 		<desc>Turn FTP and/or SFTP file transfer on or off independently.</desc>
 		<image>$icon_dir/filemanager.png</image>
+	</game>
+	<game>
+		<path>./assignports.rp</path>
+		<name>Assign P1/P2 Controller</name>
+		<desc>Pin which physical controller drives Player 1, Player 2, etc. by name, so it stays correct even after a Bluetooth pad reconnects on a different port. Flashes each controller green in the list when it sends input, so you can tell them apart.</desc>
+		<image>$icon_dir/configedit.png</image>
 	</game>
 $( [ "$ENABLE_BEZEL_PROJECT" = "true" ] && cat <<BEZELPROJECT
 	<game>
@@ -5951,6 +5957,47 @@ print("[bt-speaker] patched /etc/bluetooth/main.conf")
 PYEOF
     fi
 
+    # Wireless gamepads (confirmed live: a Sony DualSense) can pair and even
+    # report Connected: yes at the generic ACL level while never completing
+    # a real bond - bluetoothctl shows "Paired: yes, Bonded: no" for them,
+    # and no link key ever gets written under /var/lib/bluetooth. With
+    # input.conf's ClassicBondedOnly at its default (true, since commented
+    # out), bluetoothd's input plugin then silently refuses to bring up the
+    # actual HID profile for it - confirmed live via
+    # "journalctl -u bluetooth": profiles/input/device.c:hidp_add_connection()
+    # Rejected connection from !bonded device. The device stays "connected"
+    # in name only: no /dev/input/jsN ever appears, no hid_playstation
+    # module loads, so it's fully unusable as a gamepad even though pairing
+    # itself reported success. This is exactly RetroPie's own documented
+    # Sixaxis/PS3 workaround (see _bonded_fix_bluetooth in
+    # scriptmodules/supplementary/bluetooth.sh) generalized to any
+    # similarly non-bonding controller - setting this to false let bluetoothd
+    # bring the HID profile up anyway and a working js device (with correct
+    # button/axis events, confirmed live) appeared immediately.
+    if ! sudo grep -q "# pi-arcade-setup" /etc/bluetooth/input.conf 2>/dev/null; then
+        sudo python3 - /etc/bluetooth/input.conf <<'PYEOF'
+import re
+import sys
+path = sys.argv[1]
+text = open(path).read()
+if re.search(r"^\s*ClassicBondedOnly\s*=", text, re.M):
+    text = re.sub(r"^\s*#?\s*ClassicBondedOnly\s*=.*$", "ClassicBondedOnly = false", text, flags=re.M)
+else:
+    anchor = "[General]"
+    idx = text.find(anchor)
+    insert_at = idx + len(anchor) if idx != -1 else 0
+    text = text[:insert_at] + "\nClassicBondedOnly = false" + text[insert_at:]
+text += (
+    "\n# pi-arcade-setup: some wireless gamepads (confirmed: Sony DualSense)\n"
+    "# pair without ever completing a real bond on this Bluetooth stack, and\n"
+    "# the default ClassicBondedOnly=true then silently blocks their HID\n"
+    "# profile - see phase_bt_speaker_setup in install.sh.\n"
+)
+open(path, "w").write(text)
+print("[bt-speaker] patched /etc/bluetooth/input.conf (ClassicBondedOnly=false)")
+PYEOF
+    fi
+
     sudo systemctl restart bluetooth
     sleep 1
     sudo bluetoothctl power on >/dev/null 2>&1 || true
@@ -6707,8 +6754,18 @@ def draw(win, devices, sel, js_connected, status_line, status_attr, scanning):
 
     top = 4
     if not devices:
-        empty = "No devices found yet - put your controller in pairing mode"
-        safe_addstr(win, top + 1, cx(win, empty), empty, curses.A_DIM)
+        empty_lines = [
+            "No devices found yet - put your controller in pairing mode:",
+            "  PS4/PS5: hold PS + Share/Create until the light bar",
+            "           flashes white RAPIDLY (a single PS press only",
+            "           reconnects it to whatever it paired with last)",
+            "  Xbox:    hold the small pairing button until the Xbox",
+            "           logo flashes fast",
+            "  Make sure it isn't currently connected to a phone, PC,",
+            "  or console - it can only talk to one host at a time",
+        ]
+        for i, line in enumerate(empty_lines):
+            safe_addstr(win, top + 1 + i, cx(win, line), line, curses.A_DIM)
     else:
         list_h = max(1, h - top - 6)
         start = 0
@@ -6802,6 +6859,26 @@ def run(stdscr):
     try:
         if not bool(adapter_props.Get(ADAPTER_IFACE, "Powered")):
             adapter_props.Set(ADAPTER_IFACE, "Powered", True)
+        # bt-power-on.service (this project's own boot-time Bluetooth setup)
+        # deliberately leaves the adapter non-pairable outside of this
+        # screen (see its own comment) - but BlueZ ties "Pairable" directly
+        # to the adapter's kernel-level "bondable" mgmt flag, confirmed live
+        # via "btmgmt info": with pairable off, "bondable" was missing from
+        # the adapter's current settings entirely. With bondable off, a
+        # pairing attempt can still nominally "succeed" (bluetoothctl showed
+        # Paired: yes) but bluetoothd never actually commits a link key -
+        # confirmed live: no entry ever appeared under /var/lib/bluetooth,
+        # and the very next disconnect left the device fully unpairable
+        # again, unrecoverable without redoing this whole screen. Every
+        # device paired here needs a real bond to survive a later reconnect
+        # (see the ClassicBondedOnly fix elsewhere in this script for why
+        # that also matters for gamepads specifically), so this screen must
+        # turn Pairable on for as long as it's open - restored to off again
+        # in the finally block below, same "only pairable while this
+        # screen/the Bluetooth Player screen is open" policy already used
+        # for the speaker feature.
+        if not bool(adapter_props.Get(ADAPTER_IFACE, "Pairable")):
+            adapter_props.Set(ADAPTER_IFACE, "Pairable", True)
         adapter_iface.StartDiscovery()
         scanning = True
     except Exception as e:
@@ -6842,6 +6919,10 @@ def run(stdscr):
     finally:
         try:
             adapter_iface.StopDiscovery()
+        except Exception:
+            pass
+        try:
+            adapter_props.Set(ADAPTER_IFACE, "Pairable", False)
         except Exception:
             pass
         if js_file is not None:
@@ -8307,6 +8388,504 @@ PYEOF
     return 0
 }
 
+# Confirmed live (Pi #1, a Sony DualSense over Bluetooth): RetroArch's udev
+# joypad driver assigns Player 1/2/3... to whatever real gamepads it finds,
+# in ascending order of their /dev/input/jsN number - which for a
+# Bluetooth pad is NOT stable across sessions, since it gets a brand new
+# jsN each time it reconnects. On this project's own arcade cabinet (a
+# permanently-wired USB encoder board occupying js0/Player 1) that meant a
+# reconnecting Bluetooth controller could land on Player 2 one time and a
+# different port another time, and in a single-player game like Pacman
+# landing on anything but Player 1 makes it look completely unresponsive.
+# This tool lets you pin each player slot to a controller by NAME once;
+# apply-controller-ports.py then re-resolves that name to whatever raw
+# index it currently occupies fresh before every single launch (see the
+# runcommand-onstart.sh wiring below), so the assignment stays correct
+# across reconnects and reboots without ever needing to reopen this tool.
+phase_controller_ports_tool() {
+    mkdir -p "$PI_HOME/scripts"
+    tee "$PI_HOME/scripts/assign-controller-ports.py" >/dev/null <<PYEOF
+#!/usr/bin/env python3
+"""
+Assign which physical controller drives Player 1 / Player 2 / etc in
+RetroArch. Run from the RetroPie menu ("Assign P1/P2 Controller") or
+directly:
+    python3 assign-controller-ports.py
+
+RetroArch normally hands out player ports to whatever gamepads it finds,
+in whatever order it happens to enumerate them - for a Bluetooth pad that
+order shifts between sessions, since it gets a new /dev/input/jsN each
+time it reconnects. This tool pins each player slot to a controller by
+NAME instead; the mapping is saved to controllerports.cfg and re-resolved
+to whatever raw index that name currently occupies fresh before every
+single game launch (see apply-controller-ports.py / runcommand-onstart.sh),
+so it stays correct across reconnects and reboots without redoing anything
+here.
+
+Fully navigable by controller as well as keyboard: left stick (or D-pad)
+up/down to pick a player slot, left/right to cycle which connected
+controller drives it, X/Cross to save and exit, Circle/B to exit without
+saving - same button roles as the rest of the RetroPie menu. Each
+connected controller flashes green in the list below when it sends any
+input, so you can tell physically identical pads apart.
+"""
+import curses
+import os
+import re
+import select
+import struct
+import sys
+import time
+
+JS_EVENT_BUTTON = 0x01
+JS_EVENT_AXIS = 0x02
+JS_EVENT_INIT = 0x80
+EVENT_FORMAT = "IhBB"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+AXIS_THRESHOLD = 16000
+BTN_CONFIRM = $BTN_X       # X / Cross / A - same role as the rest of the RetroPie menu
+BTN_BACK = $BTN_CIRCLE     # Circle / B - same role as the rest of the RetroPie menu
+
+CONFIG_PATH = "/opt/retropie/configs/all/controllerports.cfg"
+# Sony's kernel driver (and some others) register a real gamepad's motion
+# sensors/touchpad as their own separate joystick-class input devices -
+# confirmed live (hid-playstation, DualSense): "DualSense Wireless
+# Controller Motion Sensors" and "...Touchpad" both get their own jsN node
+# alongside the real one. RetroArch's own udev joypad driver already
+# filters these out when assigning player ports, so this list needs to
+# match that or the port numbers shown here won't line up with reality.
+EXCLUDE_NAME_SUBSTR = ("Motion Sensors", "Touchpad", "Keyboard", "Mouse", "Consumer Control")
+MAX_PLAYERS = 4
+
+COL_HEADER, COL_LABEL, COL_HINT, COL_GOOD, COL_BAD, COL_SEL = 1, 2, 3, 4, 5, 6
+
+
+def cx(win, text):
+    _, w = win.getmaxyx()
+    return max(0, (w - len(text)) // 2)
+
+
+def safe_addstr(win, y, x, text, attr=0):
+    h, w = win.getmaxyx()
+    if 0 <= y < h:
+        try:
+            win.addstr(y, max(0, x), text[: max(0, w - x - 1)], attr)
+        except curses.error:
+            pass
+
+
+def list_gamepads():
+    try:
+        text = open("/proc/bus/input/devices").read()
+    except OSError:
+        return []
+    pads = []
+    for block in text.split("\n\n"):
+        name_m = re.search(r'^N: Name="(.*)"\$', block, re.M)
+        handlers_m = re.search(r'^H: Handlers=(.*)\$', block, re.M)
+        if not name_m or not handlers_m:
+            continue
+        name = name_m.group(1)
+        if any(s in name for s in EXCLUDE_NAME_SUBSTR):
+            continue
+        js_m = re.search(r'\bjs(\d+)\b', handlers_m.group(1))
+        if not js_m:
+            continue
+        pads.append((int(js_m.group(1)), name))
+    pads.sort(key=lambda p: p[0])
+    seen = set()
+    out = []
+    for jsnum, name in pads:
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append((jsnum, name))
+    return out
+
+
+def read_mapping():
+    mapping = {}
+    try:
+        with open(CONFIG_PATH) as f:
+            for line in f:
+                line = line.strip()
+                m = re.match(r'player(\d+)_device\s*=\s*"(.*)"\$', line)
+                if m:
+                    mapping[int(m.group(1))] = m.group(2)
+    except OSError:
+        pass
+    return mapping
+
+
+def write_mapping(slots):
+    lines = [
+        "# pi-arcade-setup: Player-to-controller assignment, written by the",
+        '# "Assign P1/P2 Controller" RetroPie menu tool. Re-applied fresh',
+        "# before every emulator launch (see runcommand-onstart.sh) by",
+        "# resolving each device name back to whatever raw joypad index it",
+        "# currently occupies - not the raw index itself, so it survives",
+        "# reconnects/reboots even though Bluetooth pads get a new index",
+        "# each time they reconnect.",
+    ]
+    for i, name in enumerate(slots):
+        if name:
+            lines.append(f'player{i + 1}_device="{name}"')
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, CONFIG_PATH)
+
+
+def open_joysticks(pads):
+    files = {}
+    for jsnum, _name in pads:
+        try:
+            f = open(f"/dev/input/js{jsnum}", "rb", buffering=0)
+            os.set_blocking(f.fileno(), False)
+            files[jsnum] = f
+        except OSError:
+            pass
+    return files
+
+
+CONFIRM_DEBOUNCE_S = 0.25
+
+
+def poll_action(stdscr, js_files, axis_state, action_debounce, identify):
+    fds = [sys.stdin] + list(js_files.values())
+    try:
+        ready, _, _ = select.select(fds, [], [], 0.15)
+    except (OSError, ValueError):
+        ready = []
+
+    action = None
+    for jsnum, f in js_files.items():
+        if f in ready:
+            try:
+                data = os.read(f.fileno(), EVENT_SIZE)
+            except OSError:
+                continue
+            if data and len(data) == EVENT_SIZE:
+                _t, value, typ, number = struct.unpack(EVENT_FORMAT, data)
+                is_init = bool(typ & JS_EVENT_INIT)
+                typ &= ~JS_EVENT_INIT
+                if is_init:
+                    continue
+                identify[jsnum] = time.monotonic()
+                if typ == JS_EVENT_BUTTON and value == 1:
+                    if number == BTN_CONFIRM:
+                        action = "confirm"
+                    elif number == BTN_BACK:
+                        action = "back"
+                elif typ == JS_EVENT_AXIS and number in (0, 1):
+                    key = (jsnum, number)
+                    past = abs(value) > AXIS_THRESHOLD
+                    was_past = axis_state.get(key, False)
+                    axis_state[key] = past
+                    if past and not was_past:
+                        if number == 0:
+                            action = "right" if value > 0 else "left"
+                        else:
+                            action = "down" if value > 0 else "up"
+
+    if action is None and sys.stdin in ready:
+        ch = stdscr.getch()
+        if ch == curses.KEY_UP:
+            action = "up"
+        elif ch == curses.KEY_DOWN:
+            action = "down"
+        elif ch == curses.KEY_LEFT:
+            action = "left"
+        elif ch == curses.KEY_RIGHT:
+            action = "right"
+        elif ch in (10, 13, ord(" ")):
+            action = "confirm"
+        elif ch in (27, ord("q"), ord("Q")):
+            action = "back"
+
+    if action in ("confirm", "back"):
+        now = time.monotonic()
+        if now - action_debounce.get(action, 0.0) < CONFIRM_DEBOUNCE_S:
+            return None
+        action_debounce[action] = now
+
+    return action
+
+
+def draw(win, pads, slots, sel, identify, status_line, status_attr):
+    win.erase()
+    h, w = win.getmaxyx()
+    title = " ASSIGN P1/P2 CONTROLLER "
+    safe_addstr(win, 1, cx(win, title), title, curses.color_pair(COL_HEADER) | curses.A_BOLD)
+
+    if not pads:
+        empty = "No controllers detected"
+        safe_addstr(win, 3, cx(win, empty), empty, curses.A_DIM)
+    else:
+        top = 3
+        now = time.monotonic()
+        for i, name in enumerate(slots):
+            marker = "▸ " if i == sel else "  "
+            label = f"{marker}Player {i + 1}: {name if name else '(unassigned)'}"
+            attr = (curses.color_pair(COL_SEL) | curses.A_BOLD) if i == sel else curses.color_pair(COL_LABEL)
+            safe_addstr(win, top + i, cx(win, label) if len(label) < w - 4 else 2, label, attr)
+
+        list_top = top + len(slots) + 2
+        hdr = "Connected controllers (flashes green when it sends input):"
+        safe_addstr(win, list_top, cx(win, hdr), hdr, curses.A_DIM)
+        for i, (jsnum, name) in enumerate(pads):
+            recent = (now - identify.get(jsnum, 0.0)) < 0.6
+            attr = (curses.color_pair(COL_GOOD) | curses.A_BOLD) if recent else curses.color_pair(COL_LABEL)
+            line = f"  js{jsnum}: {name}"
+            safe_addstr(win, list_top + 1 + i, cx(win, line), line, attr)
+
+    if status_line:
+        safe_addstr(win, h - 5, cx(win, status_line), status_line, status_attr | curses.A_BOLD)
+
+    footer = "UP/DOWN: player slot   LEFT/RIGHT: change controller   X: save & exit   Circle: cancel"
+    safe_addstr(win, h - 2, cx(win, footer), footer, curses.color_pair(COL_HINT))
+    win.refresh()
+
+
+def run(stdscr):
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(COL_HEADER, curses.COLOR_YELLOW, -1)
+    curses.init_pair(COL_LABEL, curses.COLOR_CYAN, -1)
+    curses.init_pair(COL_HINT, curses.COLOR_YELLOW, -1)
+    curses.init_pair(COL_GOOD, curses.COLOR_GREEN, -1)
+    curses.init_pair(COL_BAD, curses.COLOR_RED, -1)
+    curses.init_pair(COL_SEL, curses.COLOR_GREEN, -1)
+    stdscr.nodelay(True)
+    stdscr.keypad(True)
+
+    pads = list_gamepads()
+    n_slots = max(1, min(MAX_PLAYERS, len(pads))) if pads else 0
+    saved = read_mapping()
+    names_by_index = [name for _jsnum, name in pads]
+    slots = [None] * n_slots
+    used = set()
+    for i in range(n_slots):
+        wanted = saved.get(i + 1)
+        if wanted and wanted in names_by_index and wanted not in used:
+            slots[i] = wanted
+            used.add(wanted)
+    leftovers = [n for n in names_by_index if n not in used]
+    li = 0
+    for i in range(n_slots):
+        if slots[i] is None and li < len(leftovers):
+            slots[i] = leftovers[li]
+            li += 1
+
+    js_files = open_joysticks(pads)
+    axis_state = {}
+    action_debounce = {}
+    identify = {}
+    sel = 0
+    status_line, status_attr = "", 0
+
+    try:
+        while True:
+            draw(stdscr, pads, slots, sel, identify, status_line, status_attr)
+            action = poll_action(stdscr, js_files, axis_state, action_debounce, identify)
+            if action is None:
+                continue
+            if not pads:
+                if action in ("confirm", "back"):
+                    break
+                continue
+            if action == "back":
+                break
+            elif action == "up":
+                sel = (sel - 1) % n_slots
+            elif action == "down":
+                sel = (sel + 1) % n_slots
+            elif action in ("left", "right") and len(names_by_index) > 1:
+                cur = slots[sel]
+                cur_idx = names_by_index.index(cur) if cur in names_by_index else -1
+                step = 1 if action == "right" else -1
+                new_idx = (cur_idx + step) % len(names_by_index)
+                new_name = names_by_index[new_idx]
+                other = next((j for j, n in enumerate(slots) if n == new_name and j != sel), None)
+                old_name = slots[sel]
+                slots[sel] = new_name
+                if other is not None:
+                    slots[other] = old_name
+            elif action == "confirm":
+                write_mapping(slots)
+                status_line, status_attr = "Saved!", curses.color_pair(COL_GOOD)
+                draw(stdscr, pads, slots, sel, identify, status_line, status_attr)
+                time.sleep(0.8)
+                break
+    finally:
+        for f in js_files.values():
+            try:
+                f.close()
+            except Exception:
+                pass
+
+
+def main():
+    curses.wrapper(run)
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+    chmod +x "$PI_HOME/scripts/assign-controller-ports.py"
+
+    tee "$PI_HOME/scripts/apply-controller-ports.py" >/dev/null <<'PYEOF'
+#!/usr/bin/env python3
+"""
+Re-applies the Player-to-controller assignment saved by
+assign-controller-ports.py, fresh, before every single emulator launch
+(invoked from runcommand-onstart.sh - RetroPie/RetroArch's own supported
+global pre-launch hook). Each configured player slot is stored by device
+NAME, not raw index, because a Bluetooth pad gets a brand new
+/dev/input/jsN every time it reconnects - resolving the name back to
+whatever index it currently occupies here, at launch time, is what keeps
+the assignment correct across reconnects and reboots. Never blocks a
+launch: any failure here is caught and swallowed by the caller.
+"""
+import re
+
+CONFIG_PATH = "/opt/retropie/configs/all/controllerports.cfg"
+RETROARCH_CFG = "/opt/retropie/configs/all/retroarch.cfg"
+EXCLUDE_NAME_SUBSTR = ("Motion Sensors", "Touchpad", "Keyboard", "Mouse", "Consumer Control")
+
+
+def list_gamepads():
+    try:
+        text = open("/proc/bus/input/devices").read()
+    except OSError:
+        return []
+    pads = []
+    for block in text.split("\n\n"):
+        name_m = re.search(r'^N: Name="(.*)"$', block, re.M)
+        handlers_m = re.search(r'^H: Handlers=(.*)$', block, re.M)
+        if not name_m or not handlers_m:
+            continue
+        name = name_m.group(1)
+        if any(s in name for s in EXCLUDE_NAME_SUBSTR):
+            continue
+        js_m = re.search(r'\bjs(\d+)\b', handlers_m.group(1))
+        if not js_m:
+            continue
+        pads.append((int(js_m.group(1)), name))
+    pads.sort(key=lambda p: p[0])
+    return pads
+
+
+def read_mapping():
+    mapping = {}
+    try:
+        with open(CONFIG_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                m = re.match(r'player(\d+)_device\s*=\s*"(.*)"$', line)
+                if m:
+                    mapping[m.group(1)] = m.group(2)
+    except OSError:
+        pass
+    return mapping
+
+
+def main():
+    mapping = read_mapping()
+    if not mapping:
+        return
+
+    name_to_index = {}
+    for idx, (_jsnum, name) in enumerate(list_gamepads()):
+        name_to_index.setdefault(name, idx)
+
+    try:
+        text = open(RETROARCH_CFG).read()
+    except OSError:
+        return
+    original = text
+
+    for player_num, device_name in mapping.items():
+        if device_name not in name_to_index:
+            # Not currently connected - leave whatever's already in
+            # retroarch.cfg alone rather than guessing.
+            continue
+        index = name_to_index[device_name]
+        cfg_key = f"input_player{player_num}_joypad_index"
+        pattern = re.compile(rf'^{re.escape(cfg_key)}\s*=\s*".*"$', re.M)
+        replacement = f'{cfg_key} = "{index}"'
+        if pattern.search(text):
+            text = pattern.sub(replacement, text)
+        else:
+            text = text.rstrip("\n") + f"\n{replacement}\n"
+
+    if text != original:
+        open(RETROARCH_CFG, "w").write(text)
+        print(f"[controllerports] retroarch.cfg updated: {mapping}")
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+    chmod +x "$PI_HOME/scripts/apply-controller-ports.py"
+    chown "$PI_USER:$PI_USER" "$PI_HOME/scripts/assign-controller-ports.py" "$PI_HOME/scripts/apply-controller-ports.py"
+
+    # runcommand-onstart.sh is RetroPie's own supported global pre-launch
+    # hook (see user_script() in runcommand.sh) - it runs before every
+    # single emulator launch, as the user launching the game (normally
+    # $PI_USER), which is exactly the permissions apply-controller-ports.py
+    # needs to edit retroarch.cfg (already owned by $PI_USER, confirmed
+    # live). Idempotent: only appends the call once, guarded by a marker
+    # comment, so it coexists with anything else a user adds to this file
+    # by hand.
+    local onstart="$PI_HOME/RetroPie/configs/all/runcommand-onstart.sh"
+    mkdir -p "$(dirname "$onstart")"
+    if ! grep -q "apply-controller-ports.py" "$onstart" 2>/dev/null; then
+        {
+            [ -f "$onstart" ] || echo "#!/bin/bash"
+            echo ""
+            echo "# pi-arcade-setup: re-applies the \"Assign P1/P2 Controller\" mapping"
+            echo "# (if any) before this launch - see phase_controller_ports_tool in"
+            echo "# install.sh. Never allowed to block a launch."
+            echo "python3 $PI_HOME/scripts/apply-controller-ports.py >>/tmp/controllerports.log 2>&1 || true"
+        } | tee -a "$onstart" >/dev/null
+        chmod +x "$onstart"
+        chown "$PI_USER:$PI_USER" "$onstart"
+    fi
+
+    touch "$PI_HOME/RetroPie/retropiemenu/assignports.rp"
+
+    local menu_script="$PI_HOME/RetroPie-Setup/scriptmodules/supplementary/retropiemenu.sh"
+    if [ -f "$menu_script" ] && ! grep -q "assignports.rp)" "$menu_script"; then
+        sudo cp "$menu_script" "${menu_script}.bak.$(date +%s)"
+        sudo python3 - "$menu_script" "$PI_HOME" <<'PYEOF'
+import sys
+path, pi_home = sys.argv[1], sys.argv[2]
+text = open(path).read()
+anchor = "filemanager.rp)"
+idx = text.find(anchor)
+if idx == -1:
+    print("[assignports] anchor 'filemanager.rp)' not found in retropiemenu.sh; skipping menu wiring")
+    sys.exit(0)
+case_end = text.find(";;", idx)
+if case_end == -1:
+    print("[assignports] could not find end of filemanager.rp) case; skipping menu wiring")
+    sys.exit(0)
+insert_point = text.find("\n", case_end) + 1
+line_start = text.rfind("\n", 0, idx) + 1
+indent = text[line_start:idx]
+insert_block = f"{indent}assignports.rp)\n{indent}    python3 {pi_home}/scripts/assign-controller-ports.py\n{indent}    ;;\n"
+new_text = text[:insert_point] + insert_block + text[insert_point:]
+open(path, "w").write(new_text)
+print("[assignports] wired into retropiemenu.sh")
+PYEOF
+    fi
+    return 0
+}
+
 # MAME's own stock combo for its in-game Show/Hide Menu is Select+X to
 # open, Select+Start to cancel - but Select+Start is also this project's
 # own quit-to-frontend shortcut (input_quit_gamepad_combo=4, see
@@ -8528,6 +9107,7 @@ main() {
         audio_settings_tool
         wifi_settings_tool
         ftp_settings_tool
+        controller_ports_tool
         mame_menu_hotkey_default
         bezel_project_install
         finalize
