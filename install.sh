@@ -1562,6 +1562,36 @@ phase_mame_arcade_overlay_build() {
     if [ ! -f /opt/retropie/libretrocores/lr-mame/mamearcade_libretro.so ]; then
         die "mamearcade_libretro.so not found after build - MAME emulation would not be available at all, aborting"
     fi
+
+    # Verify the build actually linked completely, not just that the file
+    # exists. Confirmed live: a prior run of this exact phase (unmodified -
+    # RetroPie's own lr-mame scriptmodule already does "make clean" before
+    # building, so this isn't a stale-incremental-build issue) produced a
+    # mamearcade_libretro.so that *looked* fine - the file was present,
+    # RetroArch loaded the core without complaint, and non-DRC drivers
+    # (e.g. Pac-Man's plain Z80, no dynamic recompiler involved) booted
+    # straight to gameplay - but the linker had silently dropped the
+    # object implementing MAME's ARM64 dynamic-recompiler backend. Any
+    # driver whose CPU cores use MAME's UML/DRC framework (SH-2 as in
+    # Street Fighter III/CPS3, TMS34010 as in Mortal Kombat, MIPS3, etc. -
+    # a large slice of the arcade driver list) hard-crashed the instant
+    # that code path was first hit, with "undefined symbol:
+    # ...make_drcbe_arm64...". RetroArch's own dlopen() is lazy-bound, so
+    # it never surfaces this at core-load time - only when a specific ROM
+    # actually calls into the missing code. Force eager symbol resolution
+    # here (LD_BIND_NOW) so an incomplete link is caught immediately as a
+    # loud build failure instead of shipping a core that silently crashes
+    # on an unpredictable subset of ROMs.
+    if ! LD_BIND_NOW=1 python3 -c "
+import ctypes, sys
+try:
+    ctypes.CDLL('/opt/retropie/libretrocores/lr-mame/mamearcade_libretro.so')
+except OSError as e:
+    print(e, file=sys.stderr)
+    sys.exit(1)
+"; then
+        die "mamearcade_libretro.so was built but failed an eager-symbol-resolution check (undefined symbol at link time) - the build silently produced an incomplete binary that would boot simple ROMs fine but crash on anything using MAME's DRC CPU cores. Re-run this phase (retropie_packages.sh lr-mame _source_ again); if it keeps recurring, see the Known Limitations note in README.md"
+    fi
     return 0
 }
 
