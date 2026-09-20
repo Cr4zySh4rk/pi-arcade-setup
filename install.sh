@@ -953,9 +953,31 @@ phase_retropie_install() {
     # so retry a few times with a short backoff before giving up for real.
     local attempt
     local out
+    local rc
     out="$(mktemp)"
     for attempt in 1 2 3; do
-        if sudo ./retropie_packages.sh setup basic_install 2>&1 | tee "$out"; then
+        # Capture via a plain file redirect, NOT `| tee` - confirmed live this
+        # causes a permanent hang: basic_install starts joy2key_sdl.py (and
+        # potentially other packages' background daemons) as a detached
+        # process that inherits its stdout/stderr fds. Those fds are the
+        # write end of a pipe when piped through tee, and a pipe only signals
+        # EOF once EVERY process holding its write end has exited - a
+        # long-lived daemon that never exits means tee (and thus this whole
+        # pipeline, and the `if` waiting on it) blocks forever even though
+        # retropie_packages.sh itself has long since finished. Confirmed live
+        # on the second reference Pi: the run showed 0% CPU and zero
+        # retropie_packages/make/cc1 children, yet the install.sh shell was
+        # parked in do_wait indefinitely, with joy2key_sdl.py still running
+        # from earlier in the very same basic_install call. A plain `>`
+        # redirect targets a regular file, which has no such "still open
+        # elsewhere" blocking semantics, so this can't happen regardless of
+        # what basic_install backgrounds. Output is `cat` back out below so
+        # it still ends up in this script's own log stream - just after
+        # basic_install finishes rather than streamed live.
+        sudo ./retropie_packages.sh setup basic_install > "$out" 2>&1
+        rc=$?
+        cat "$out"
+        if [ "$rc" -eq 0 ]; then
             [ -x /opt/retropie/supplementary/emulationstation/emulationstation ] || command -v emulationstation >/dev/null 2>&1 || log_warn "emulationstation binary not found where expected after basic_install"
             rm -f "$out"
             return 0
