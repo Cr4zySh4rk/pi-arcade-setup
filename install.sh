@@ -943,9 +943,24 @@ phase_retropie_install() {
     fi
     cd "$PI_HOME/RetroPie-Setup" || die "cannot cd into RetroPie-Setup"
     log "Running RetroPie basic_install - this is long-running (can exceed an hour on a Pi 4)"
-    sudo ./retropie_packages.sh setup basic_install || die "RetroPie basic_install failed"
-    [ -x /opt/retropie/supplementary/emulationstation/emulationstation ] || command -v emulationstation >/dev/null 2>&1 || log_warn "emulationstation binary not found where expected after basic_install"
-    return 0
+    # basic_install walks dozens of packages, each fetching sources/binaries
+    # from GitHub or files.retropie.org.uk; a single transient network blip
+    # partway through (confirmed live: a retroarch-minimal-assets.tar.gz
+    # download failed once, even though the URL was reachable seconds later)
+    # kills the whole multi-hour run otherwise. retropie_packages.sh's own
+    # per-package update-check ("Update is available - updating ...") makes
+    # re-running basic_install cheap/idempotent for already-built packages,
+    # so retry a few times with a short backoff before giving up for real.
+    local attempt
+    for attempt in 1 2 3; do
+        if sudo ./retropie_packages.sh setup basic_install; then
+            [ -x /opt/retropie/supplementary/emulationstation/emulationstation ] || command -v emulationstation >/dev/null 2>&1 || log_warn "emulationstation binary not found where expected after basic_install"
+            return 0
+        fi
+        log_warn "RetroPie basic_install failed (attempt $attempt/3)"
+        [ "$attempt" -lt 3 ] && sleep 30
+    done
+    die "RetroPie basic_install failed after 3 attempts"
 }
 
 # See the APPLY_GCC14_CFLAGS_PATCH comment above for the full story. A tiny,
