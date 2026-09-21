@@ -9139,6 +9139,31 @@ phase_bezel_project_install() {
 }
 
 phase_finalize() {
+    # Defensive ownership normalization. Confirmed live on a second
+    # reference Pi, across the several separate install_run*.log attempts
+    # its own install history shows: $PI_HOME/ES-DE (and, on the same Pi,
+    # $PI_HOME/scripts, $PI_HOME/.frontend, $PI_HOME/switch-frontend.sh,
+    # $PI_HOME/.bt-nowplaying-status.json) ended up root-owned even though
+    # the commands that created them in install.sh itself are plain,
+    # unprivileged calls (mkdir/tee, no sudo) - meaning at least part of
+    # that particular run had root EUID throughout, the same class of
+    # mismatch already handled for the MAME source tree's git ownership
+    # elsewhere in this script (see the "dubious ownership" comment). The
+    # practical effect here was worse than a build failure though: ES-DE
+    # runs as $PI_USER (not root) once the frontend is up, so a
+    # root-owned $PI_HOME/ES-DE/settings meant it could never write
+    # es_settings.xml at all - confirmed live as the cause of a report
+    # that a selected theme (and, by the same mechanism, any other ES-DE
+    # setting) silently failed to persist across a restart or reboot,
+    # with no error visible anywhere in the UI. Rather than chase every
+    # individual phase that might be affected by the same root-EUID
+    # mismatch, whatever its cause, this sweeps the whole of $PI_HOME back
+    # to $PI_USER ownership once at the very end - safe unconditionally,
+    # since nothing this project creates is meant to stay root-owned
+    # inside a single-user kiosk account's own home directory.
+    sudo chown -R "$PI_USER":"$PI_USER" "$PI_HOME" \
+        || log_warn "Could not normalize ownership of $PI_HOME to $PI_USER - if any RetroPie-menu tool's settings silently fail to persist, check for root-owned files/directories under $PI_HOME"
+
     log ""
     log "========================================================"
     log " pi-arcade-setup complete."
