@@ -231,17 +231,32 @@ PANEL_NATIVE_WIDTH="${PANEL_NATIVE_WIDTH:-800}"
 PANEL_NATIVE_HEIGHT="${PANEL_NATIVE_HEIGHT:-1280}"
 SPLASH_TRANSFORM_TYPE="${SPLASH_TRANSFORM_TYPE:-90}"    # VLC --transform-type, only used if ENABLE_DSI_DISPLAY
 # Custom splash video. Defaults to the bundled reference-build splash
-# (splash/retro-splash.mp4 in this repo). NOTE: VLC's --video-filter=transform
-# is only reliably applied to *images* on this stack - for h264 video it
-# gets hardware-decoded to a DRM_PRIME buffer that the transform filter
-# can't process, and VLC silently drops the whole filter chain (confirmed
-# via `vlc -vv`: "Unsupported pixel size 0 (chroma DPV0)" -> "removing all
-# filters"). So bundled/custom splash videos must have their rotation baked
-# into the file itself (e.g. `ffmpeg -i in.mp4 -vf transpose=2 out.mp4` for
-# a 90 degree counter-clockwise / 270 clockwise correction, the rotation
-# needed for the reference build's landscape source clip on this portrait
-# panel) rather than relying on SPLASH_TRANSFORM_TYPE.
-SPLASH_VIDEO_URL="${SPLASH_VIDEO_URL:-https://raw.githubusercontent.com/Cr4zySh4rk/pi-arcade-setup/main/splash/retro-splash.mp4}"
+# (splash/retro-splash.mp4 in this repo) - but ONLY when ENABLE_DSI_DISPLAY
+# is true. NOTE: VLC's --video-filter=transform is only reliably applied to
+# *images* on this stack - for h264 video it gets hardware-decoded to a
+# DRM_PRIME buffer that the transform filter can't process, and VLC
+# silently drops the whole filter chain (confirmed via `vlc -vv`:
+# "Unsupported pixel size 0 (chroma DPV0)" -> "removing all filters"). So
+# bundled/custom splash videos must have their rotation baked into the file
+# itself (e.g. `ffmpeg -i in.mp4 -vf transpose=2 out.mp4` for a 90 degree
+# counter-clockwise / 270 clockwise correction) rather than relying on
+# SPLASH_TRANSFORM_TYPE - and that baked-in rotation is specifically for
+# the DSI reference panel's portrait mount. Installing this same file
+# unconditionally on a normal landscape HDMI setup would show the splash
+# sideways even though the actual game/menu content is correctly
+# unrotated there (confirmed live: a fresh HDMI install had ENABLE_DSI_DISPLAY
+# correctly false and video_rotation correctly 0 everywhere else, but this
+# default would still have installed the DSI-rotated video regardless,
+# since phase_splash_setup's video-install step wasn't gated on
+# ENABLE_DSI_DISPLAY at all). Left unset on a non-DSI setup, RetroPie's own
+# stock splash (a generic, correctly-oriented-for-landscape RetroPie logo)
+# stays in place instead - set SPLASH_VIDEO_URL explicitly to override that
+# with your own correctly-oriented video for HDMI.
+if [ "$ENABLE_DSI_DISPLAY" = "true" ]; then
+    SPLASH_VIDEO_URL="${SPLASH_VIDEO_URL:-https://raw.githubusercontent.com/Cr4zySh4rk/pi-arcade-setup/main/splash/retro-splash.mp4}"
+else
+    SPLASH_VIDEO_URL="${SPLASH_VIDEO_URL:-}"
+fi
 DO_RPI_FIRMWARE_UPDATE="${DO_RPI_FIRMWARE_UPDATE:-false}" # runs `rpi-update`; opt-in, only if panel is blank on old firmware
 
 # --- MAME per-game rotation: NOT a per-ROM problem after all -----------------
@@ -4512,6 +4527,21 @@ phase_splash_setup() {
         sudo tee /opt/retropie/configs/all/splashscreen.cfg >/dev/null <<EOF
 RANDOMIZE="disabled" CMD_OPTS="--video-filter=transform --transform-type=$SPLASH_TRANSFORM_TYPE"
 EOF
+    elif [ "$ENABLE_DSI_DISPLAY" != "true" ] && [ -z "$SPLASH_VIDEO_URL" ]; then
+        # No DSI-specific rotation and no custom video configured - make
+        # sure a *previous* run (or a manually-set SPLASH_VIDEO_URL that's
+        # since been cleared) hasn't left splashscreen.cfg/splashscreen.list
+        # pointing at the DSI-rotated bundled video, which would show
+        # sideways on this normal landscape display. "retropie" randomly
+        # picks from RetroPie-Setup's own bundled, correctly-oriented splash
+        # art/video instead. Confirmed this exact stale-state live: an
+        # earlier version of this phase installed the DSI-rotated video
+        # unconditionally regardless of ENABLE_DSI_DISPLAY.
+        sudo tee /opt/retropie/configs/all/splashscreen.cfg >/dev/null <<'EOF'
+RANDOMIZE="retropie"
+EOF
+        sudo rm -f /etc/splashscreen.list
+        sudo rm -f "$PI_HOME/RetroPie/splashscreens/custom-retro-splash.mp4"
     fi
     if [ -n "$SPLASH_VIDEO_URL" ]; then
         mkdir -p "$PI_HOME/RetroPie/splashscreens"
@@ -4525,6 +4555,42 @@ EOF
         fi
     fi
     sudo systemctl is-enabled asplashscreen.service >/dev/null 2>&1 || log_warn "asplashscreen.service not enabled; splash screen may not run at boot"
+
+    # RetroPie-Setup's own /etc/profile.d/05-splash.sh (not this project's -
+    # it ships with the splashscreen scriptmodule) runs on every login shell
+    # on tty1 to stop the splash video and clean up its pid file, BEFORE
+    # /etc/profile.d/10-retropie.sh's own autostart trigger gets a chance to
+    # run - so if 05-splash.sh ever hangs, the frontend never launches at
+    # all. Confirmed live on a second reference Pi: a fresh post-install
+    # reboot left it sitting indefinitely at the script's own final `rm
+    # $PID_FILE` line (0% CPU, no error, the splash video process itself
+    # already gone) - the exact symptom was a permanently blank HDMI
+    # display, since ES-DE/EmulationStation was never even started. The
+    # underlying cause wasn't pinned down further (a plain tmpfs unlink
+    # should never itself block), but killing the stuck process manually
+    # let the boot chain continue immediately and ES-DE started right up -
+    # so rather than chase an intermittent, environment-specific hang in a
+    # script this project doesn't own, this wraps its two potentially-
+    # blocking commands in a hard timeout, so a repeat of whatever caused
+    # this can never again block the whole boot indefinitely. Idempotent:
+    # only patches the stock file once, guarded by a marker comment.
+    if [ -f /etc/profile.d/05-splash.sh ] && ! grep -q "# pi-arcade-setup" /etc/profile.d/05-splash.sh; then
+        sudo cp /etc/profile.d/05-splash.sh /etc/profile.d/05-splash.sh.orig
+        sudo tee /etc/profile.d/05-splash.sh >/dev/null <<'EOF'
+# pi-arcade-setup: wrapped the stop/cleanup below in `timeout` - see
+# phase_splash_setup in install.sh for why. Original backed up alongside
+# this file as 05-splash.sh.orig.
+PID_FILE=/dev/shm/rp-splashscreen.pid
+if [ "`tty`" = "/dev/tty1" ] && [ -z "$DISPLAY" ] && [ -f "$PID_FILE" ]; then
+    PID=`cat $PID_FILE`
+    if timeout 5 ps -p $PID >/dev/null; then
+        timeout 5 kill -9 $PID >/dev/null 2>&1
+    fi
+    timeout 5 rm -f $PID_FILE
+fi
+EOF
+        log "Wrapped /etc/profile.d/05-splash.sh's stop/cleanup commands in a timeout so a hang there can no longer block the frontend from ever starting at boot"
+    fi
     return 0
 }
 
@@ -5066,7 +5132,7 @@ CONFIRM_DEBOUNCE_S = 0.25
 
 
 def poll_action(stdscr, js_file, axis_state, action_debounce, timeout=0.08):
-    """Blocks up to `timeout` seconds for keyboard or joystick input, and
+    """Blocks up to \`timeout\` seconds for keyboard or joystick input, and
     returns one of "up"/"down"/"left"/"right"/"confirm"/"back"/None.
     axis_state tracks whether each stick axis is currently past the
     threshold, so a held stick fires once per push rather than repeating
@@ -5311,6 +5377,13 @@ phase_music_player_setup() {
     # system's <command>, regardless of whether the case entry itself says
     # sudo), so a user-local `pip install` here would be invisible to it at
     # runtime even though it works fine when tested directly as the Pi user.
+    # pip itself isn't always present on a fresh Raspberry Pi OS Lite image
+    # - confirmed live on a second reference Pi ("No module named pip"),
+    # unlike the original reference Pi where some earlier apt install had
+    # already pulled it in as a dependency. Install it explicitly first
+    # rather than assuming it's there.
+    sudo apt-get install -y python3-pip \
+        || { log_warn "python3-pip install failed; skipping Music Player setup"; return 0; }
     sudo python3 -m pip install python-vlc mutagen --break-system-packages --root-user-action=ignore \
         || { log_warn "python-vlc/mutagen install failed; skipping Music Player setup"; return 0; }
 
@@ -5424,7 +5497,7 @@ def save_config(cfg):
 
 def _wpctl_env():
     """wpctl talks to the calling user's own PipeWire session over
-    $XDG_RUNTIME_DIR - but this tool actually runs as root when launched
+    \$XDG_RUNTIME_DIR - but this tool actually runs as root when launched
     from the RetroPie menu (see the pip-install comment above), which has
     no PipeWire session of its own. Point it at the Pi user's session
     (found via who owns their home directory, not a hardcoded uid) instead
@@ -5538,9 +5611,9 @@ CONFIRM_DEBOUNCE_S = 0.25
 
 
 def poll_action(stdscr, js_file, axis_state, action_debounce, timeout=0.1):
-    """Blocks up to `timeout` seconds for keyboard or joystick input, and
+    """Blocks up to \`timeout\` seconds for keyboard or joystick input, and
     returns one of "up"/"down"/"left"/"right"/"confirm"/"back"/None.
-    `action_debounce` is a dict (persisted by the caller across calls) used
+    \`action_debounce\` is a dict (persisted by the caller across calls) used
     to suppress bounced repeats of "confirm"/"back"."""
     fds = [sys.stdin]
     if js_file is not None:
@@ -6038,7 +6111,7 @@ CONF
 Headless Bluetooth pairing agent for pi-arcade-setup, run as a systemd
 service (bt-agent.service). Auto-accepts every pairing request with no PIN
 prompt on either side ("Just Works"/"NoInputNoOutput" capability) - the
-same policy `bt-agent` from bluez-tools was supposed to provide, but that
+same policy \`bt-agent\` from bluez-tools was supposed to provide, but that
 binary turned out to be unreliable on this BlueZ/D-Bus version: it printed
 "Agent registered" at startup and then hung - its GLib main loop never
 actually pumped, so it never answered a single RequestConfirmation call
@@ -7084,9 +7157,9 @@ def send_command(cmd):
 
 def _wpctl_env():
     """wpctl talks to the calling user's own PipeWire session over
-    $XDG_RUNTIME_DIR - but this tool actually runs as root when launched
+    \$XDG_RUNTIME_DIR - but this tool actually runs as root when launched
     from the RetroPie menu (retropiemenu.sh's dispatch inherits that from
-    the custom system's `sudo openvt` wrapper), which has no PipeWire
+    the custom system's \`sudo openvt\` wrapper), which has no PipeWire
     session of its own. Point it at the Pi user's session (found via who
     owns their home directory, not a hardcoded uid) instead of whatever -
     if anything - root's own XDG_RUNTIME_DIR resolves to."""
@@ -7329,7 +7402,7 @@ def run(stdscr):
 
     # Only advertise the Pi to new phones while this screen is open (see
     # set_discoverable's docstring) - always turned back off in the
-    # `finally` block below, however this loop exits. Same idea for the
+    # \`finally\` block below, however this loop exits. Same idea for the
     # active-flag file: it tells the background daemon to actively hold/
     # reconnect a phone's audio link only while this screen is up.
     set_discoverable(True)
@@ -7425,7 +7498,7 @@ menu ("Audio settings") or directly:
     python3 audio-settings.py
 Lets you switch the default PipeWire/WirePlumber output between the aux
 (3.5mm) jack and any HDMI output, and adjust master volume/mute - a
-controller-navigable front end for `wpctl`.
+controller-navigable front end for \`wpctl\`.
 
 Fully navigable by controller as well as keyboard: left stick (or D-pad) to
 move/adjust, X/Cross to confirm, Circle/B to exit - same button roles as
@@ -7478,9 +7551,9 @@ def safe_addstr(win, y, x, text, attr=0):
 
 def _wpctl_env():
     """wpctl talks to the calling user's own PipeWire session over
-    $XDG_RUNTIME_DIR - but this tool actually runs as root when launched
+    \$XDG_RUNTIME_DIR - but this tool actually runs as root when launched
     from the RetroPie menu (retropiemenu.sh's dispatch inherits that from
-    the custom system's `sudo openvt` wrapper), which has no PipeWire
+    the custom system's \`sudo openvt\` wrapper), which has no PipeWire
     session of its own. Point it at the Pi user's session (found via who
     owns their home directory, not a hardcoded uid) instead of whatever -
     if anything - root's own XDG_RUNTIME_DIR resolves to."""
@@ -7791,7 +7864,7 @@ WiFi settings gate for pi-arcade-setup. Run from the RetroPie menu
     python3 wifi-settings.py
 WiFi setup (entering an SSID/password) needs a real keyboard, so this asks
 first rather than silently dropping the controller-only user into a screen
-they can't use. Answering "Yes" launches `nmtui` (NetworkManager's text UI)
+they can't use. Answering "Yes" launches \`nmtui\` (NetworkManager's text UI)
 for the actual configuration.
 
 Confirming here works with the controller (X/Cross toggles the highlighted
