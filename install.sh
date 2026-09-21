@@ -3974,11 +3974,41 @@ phase_esde_config() {
     mkdir -p "$PI_HOME/ES-DE/settings"
     if [ ! -f "$PI_HOME/ES-DE/settings/es_settings.xml" ]; then
         log "Launching ES-DE once to generate default es_settings.xml"
+
+        # Wait for a display connector before this launch - confirmed live
+        # (second reference Pi) that without this, ES-DE can fail to
+        # acquire a working DRM/KMS output in time and never writes
+        # es_settings.xml at all, which then means every customization
+        # this phase applies below (ShowQuitMenu=true - the toggle that
+        # actually makes the Reboot/Power Off/Restart EmulationStation
+        # submenu visible at all, plus Theme/ThemeAspectRatio/ROMDirectory)
+        # silently never happens, with nothing else in this script ever
+        # retrying it - the log_warn fallback below treats "apply on first
+        # real launch" as an acceptable outcome, but ES-DE's own un-
+        # customized defaults don't match what this project actually
+        # wants. Same wait_for_display logic as phase_autostart_setup's
+        # generated autostart.sh, duplicated here since this runs at
+        # install time rather than boot time.
+        for i in $(seq 1 20); do
+            grep -q "^connected" /sys/class/drm/card*-*/status 2>/dev/null && break
+            sleep 0.5
+        done
+
         local esde_run_rot_args=()
         [ "$ENABLE_DSI_DISPLAY" = "true" ] && esde_run_rot_args=(--screenrotate "$ESDE_SCREENROTATE")
         XDG_RUNTIME_DIR="/run/user/$(id -u "$PI_USER")" /opt/es-de/bin/es-de "${esde_run_rot_args[@]}" >/dev/null 2>&1 &
         local espid=$!
-        sleep 8
+
+        # Poll for the settings file instead of an unconditional fixed
+        # sleep - ES-DE writes it fairly early in startup (well before
+        # slower steps like full gamelist/theme parsing), so this returns
+        # as soon as it's actually ready instead of always waiting the
+        # full worst-case duration, while still allowing up to 30s total
+        # for a slower SD card/first boot.
+        for i in $(seq 1 30); do
+            [ -f "$PI_HOME/ES-DE/settings/es_settings.xml" ] && break
+            sleep 1
+        done
         sudo pkill -f es-de 2>/dev/null || kill "$espid" 2>/dev/null || true
         sleep 2
     fi
