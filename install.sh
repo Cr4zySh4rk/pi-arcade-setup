@@ -4022,6 +4022,12 @@ phase_esde_config() {
         if grep -q 'name="ShowQuitMenu"' "$PI_HOME/ES-DE/settings/es_settings.xml"; then
             sed -i 's|<bool name="ShowQuitMenu" value="[^"]*" />|<bool name="ShowQuitMenu" value="true" />|' "$PI_HOME/ES-DE/settings/es_settings.xml"
         fi
+        # Required for ES-DE/scripts/game-start/* to actually run (see
+        # phase_controller_ports_tool) - off by default, and with it off
+        # ES-DE silently skips every event script with no warning anywhere.
+        if grep -q 'name="CustomEventScripts"' "$PI_HOME/ES-DE/settings/es_settings.xml"; then
+            sed -i 's|<bool name="CustomEventScripts" value="[^"]*" />|<bool name="CustomEventScripts" value="true" />|' "$PI_HOME/ES-DE/settings/es_settings.xml"
+        fi
     else
         log_warn "es_settings.xml was not generated (ES-DE may need a real display/DRM device to run) - default settings will apply on first real launch."
     fi
@@ -6928,7 +6934,7 @@ def draw(win, devices, sel, js_connected, status_line, status_attr, scanning):
     win.refresh()
 
 
-def pair_device(bus, path):
+def pair_device(bus, adapter_iface, path):
     device = bus.get_object(BLUEZ_SERVICE, path)
     device_iface = dbus.Interface(device, DEVICE_IFACE)
     props = dbus.Interface(device, PROPS_IFACE)
@@ -6938,17 +6944,32 @@ def pair_device(bus, path):
         props.Set(DEVICE_IFACE, "Trusted", True)
         device_iface.Connect(timeout=15000)
         return True, "Paired and connected!"
-    except dbus.exceptions.DBusException as e:
-        msg = str(e)
-        if "AlreadyExists" in msg or "Already Exists" in msg:
-            try:
-                device_iface.Connect(timeout=15000)
-                return True, "Connected!"
-            except Exception as e2:
-                return False, f"Connect failed: {e2}"
-        return False, f"Pairing failed: {msg.split(':')[-1].strip()}"
     except Exception as e:
-        return False, f"Pairing failed: {e}"
+        # A device BlueZ already considers "Paired" (so the block above
+        # skipped straight to Connect()) can still fail to ever reconnect
+        # with exactly this kind of error - confirmed live (a Sony
+        # DualSense) and matching multiple independent reports for other
+        # controllers/HID devices, including bluez/bluez#319 upstream,
+        # one of them specifically about a PS4 pad: bluetoothd logs
+        # "auth failed with status 0x05 (Authentication Failed)" followed
+        # by "br-connection-create-socket", because the stored link key no
+        # longer matches what the device itself now expects. Retrying
+        # Pair()/Connect() against that same stale record just repeats the
+        # identical failure - the fix multiple reports confirm actually
+        # works is removing the device entirely first, forcing a
+        # completely fresh SSP handshake next time it's in pairing mode,
+        # rather than reusing the broken one.
+        try:
+            try:
+                adapter_iface.RemoveDevice(path)
+            except Exception:
+                pass
+            device_iface.Pair(timeout=15000)
+            props.Set(DEVICE_IFACE, "Trusted", True)
+            device_iface.Connect(timeout=15000)
+            return True, "Re-paired and connected!"
+        except Exception as e2:
+            return False, f"Pairing failed: {str(e2).split(':')[-1].strip()}"
 
 
 def run(stdscr):
@@ -7040,7 +7061,7 @@ def run(stdscr):
                 target = devices[sel]
                 status_line, status_attr = f"Pairing with {target['name']}...", curses.color_pair(COL_HINT)
                 draw(stdscr, devices, sel, js_file is not None, status_line, status_attr, scanning)
-                ok, msg = pair_device(bus, target["path"])
+                ok, msg = pair_device(bus, adapter_iface, target["path"])
                 status_line = msg
                 status_attr = curses.color_pair(COL_GOOD) if ok else curses.color_pair(COL_BAD)
                 devices = list_devices(bus, adapter_path)
@@ -8527,9 +8548,11 @@ PYEOF
 # landing on anything but Player 1 makes it look completely unresponsive.
 # This tool lets you pin each player slot to a controller by NAME once;
 # apply-controller-ports.py then re-resolves that name to whatever raw
-# index it currently occupies fresh before every single launch (see the
-# runcommand-onstart.sh wiring below), so the assignment stays correct
-# across reconnects and reboots without ever needing to reopen this tool.
+# index it currently occupies fresh before every single launch (via the
+# ES-DE game-start event script wired below - see the comment on
+# esde_scripts_dir for why runcommand-onstart.sh alone doesn't work here),
+# so the assignment stays correct across reconnects and reboots without
+# ever needing to reopen this tool.
 phase_controller_ports_tool() {
     mkdir -p "$PI_HOME/scripts"
     tee "$PI_HOME/scripts/assign-controller-ports.py" >/dev/null <<PYEOF
@@ -8546,9 +8569,9 @@ order shifts between sessions, since it gets a new /dev/input/jsN each
 time it reconnects. This tool pins each player slot to a controller by
 NAME instead; the mapping is saved to controllerports.cfg and re-resolved
 to whatever raw index that name currently occupies fresh before every
-single game launch (see apply-controller-ports.py / runcommand-onstart.sh),
-so it stays correct across reconnects and reboots without redoing anything
-here.
+single game launch (see apply-controller-ports.py, run via ES-DE's
+game-start event script), so it stays correct across reconnects and
+reboots without redoing anything here.
 
 Fully navigable by controller as well as keyboard: left stick (or D-pad)
 up/down to pick a player slot, left/right to cycle which connected
@@ -8649,8 +8672,8 @@ def write_mapping(slots):
     lines = [
         "# pi-arcade-setup: Player-to-controller assignment, written by the",
         '# "Assign P1/P2 Controller" RetroPie menu tool. Re-applied fresh',
-        "# before every emulator launch (see runcommand-onstart.sh) by",
-        "# resolving each device name back to whatever raw joypad index it",
+        "# before every emulator launch (via ES-DE's game-start event",
+        "# script) by resolving each device name back to whatever raw joypad index it",
         "# currently occupies - not the raw index itself, so it survives",
         "# reconnects/reboots even though Bluetooth pads get a new index",
         "# each time they reconnect.",
@@ -8868,14 +8891,19 @@ PYEOF
 """
 Re-applies the Player-to-controller assignment saved by
 assign-controller-ports.py, fresh, before every single emulator launch
-(invoked from runcommand-onstart.sh - RetroPie/RetroArch's own supported
-global pre-launch hook). Each configured player slot is stored by device
+(invoked from ES-DE/scripts/game-start/apply-controller-ports.sh - ES-DE's
+own native pre-launch event-script hook, enabled via the "CustomEventScripts"
+setting; RetroPie's classic runcommand-onstart.sh is also wired up as a
+fallback for the classic-EmulationStation frontend, but ES-DE bypasses
+runcommand.sh entirely so that hook alone would never fire here). Each
+configured player slot is stored by device
 NAME, not raw index, because a Bluetooth pad gets a brand new
 /dev/input/jsN every time it reconnects - resolving the name back to
 whatever index it currently occupies here, at launch time, is what keeps
 the assignment correct across reconnects and reboots. Never blocks a
 launch: any failure here is caught and swallowed by the caller.
 """
+import os
 import re
 
 CONFIG_PATH = "/opt/retropie/configs/all/controllerports.cfg"
@@ -8921,10 +8949,18 @@ def read_mapping():
     return mapping
 
 
+MAX_PLAYERS = 4
+
+
 def main():
-    mapping = read_mapping()
-    if not mapping:
+    # Bail out untouched (leave RetroArch's own default autoconfig alone)
+    # if the assign tool has never been used on this install at all - the
+    # full-slot reset below is only correct once the user has opted into
+    # pinning at least one player slot; it must not force every port to
+    # "no device" on a fresh install that never created this file.
+    if not os.path.exists(CONFIG_PATH):
         return
+    mapping = read_mapping()
 
     name_to_index = {}
     for idx, (_jsnum, name) in enumerate(list_gamepads()):
@@ -8936,12 +8972,38 @@ def main():
         return
     original = text
 
-    for player_num, device_name in mapping.items():
-        if device_name not in name_to_index:
-            # Not currently connected - leave whatever's already in
-            # retroarch.cfg alone rather than guessing.
-            continue
-        index = name_to_index[device_name]
+    # Deliberately out of MAX_USERS' range (16 on this RetroArch build) so
+    # a player whose configured device isn't currently connected reads as
+    # "no device present" rather than leaving whatever raw index was
+    # written the last time it WAS connected. Confirmed live this is a
+    # real bug, not just a theoretical one: leaving a disconnected
+    # player's stale index in place can collide with a different player's
+    # freshly-resolved index once the device landscape changes - e.g. the
+    # cabinet's permanently-wired controller reassigned from P2 to P1
+    # after the Bluetooth pad that used to occupy P1 disconnects, while
+    # P2's now-stale entry for that same (gone) Bluetooth pad still points
+    # at whatever raw index it last resolved to. If that stale index
+    # happens to match the newly-resolved P1 index, both players end up
+    # pointed at the same raw joypad - which produces exactly the "the
+    # assign menu correctly shows P1, but it doesn't act like P1 in-game"
+    # symptom, since input_player1_joypad_index alone is not the only
+    # thing determining what P1 actually reads at that point.
+    UNASSIGNED_INDEX = "99"
+
+    # Walk every player slot the assign tool can ever write (1..MAX_PLAYERS),
+    # not just the ones present in controllerports.cfg. write_mapping() only
+    # writes a line for slots that currently have a device assigned, so a
+    # slot cleared by the user (or never assigned in the first place) is
+    # simply absent from the file - if this loop only iterated over
+    # mapping.items(), that absent slot's joypad_index would never get
+    # touched at all and would keep whatever value was left over from
+    # whatever WAS assigned there last, including a stale index that can
+    # collide with another player's freshly-resolved one. Confirmed live:
+    # clearing Player 2's assignment left it silently still pointing at
+    # Player 1's controller.
+    for player_num in range(1, MAX_PLAYERS + 1):
+        device_name = mapping.get(str(player_num))
+        index = name_to_index.get(device_name, UNASSIGNED_INDEX) if device_name else UNASSIGNED_INDEX
         cfg_key = f"input_player{player_num}_joypad_index"
         pattern = re.compile(rf'^{re.escape(cfg_key)}\s*=\s*".*"$', re.M)
         replacement = f'{cfg_key} = "{index}"'
@@ -8962,13 +9024,11 @@ PYEOF
     chown "$PI_USER:$PI_USER" "$PI_HOME/scripts/assign-controller-ports.py" "$PI_HOME/scripts/apply-controller-ports.py"
 
     # runcommand-onstart.sh is RetroPie's own supported global pre-launch
-    # hook (see user_script() in runcommand.sh) - it runs before every
-    # single emulator launch, as the user launching the game (normally
-    # $PI_USER), which is exactly the permissions apply-controller-ports.py
-    # needs to edit retroarch.cfg (already owned by $PI_USER, confirmed
-    # live). Idempotent: only appends the call once, guarded by a marker
-    # comment, so it coexists with anything else a user adds to this file
-    # by hand.
+    # hook (see user_script() in runcommand.sh) - kept as a harmless
+    # fallback for anyone who switches the frontend to classic
+    # EmulationStation (which does route through runcommand.sh). Idempotent:
+    # only appends the call once, guarded by a marker comment, so it
+    # coexists with anything else a user adds to this file by hand.
     local onstart="$PI_HOME/RetroPie/configs/all/runcommand-onstart.sh"
     mkdir -p "$(dirname "$onstart")"
     if ! grep -q "apply-controller-ports.py" "$onstart" 2>/dev/null; then
@@ -8983,6 +9043,31 @@ PYEOF
         chmod +x "$onstart"
         chown "$PI_USER:$PI_USER" "$onstart"
     fi
+
+    # ES-DE (this project's actual frontend) does NOT launch emulators
+    # through RetroPie's runcommand.sh at all - its stock es_systems.xml
+    # calls %EMULATOR_RETROARCH% directly (confirmed via `strings` on the
+    # es-de binary and live testing), so runcommand-onstart.sh above never
+    # actually fires in practice and apply-controller-ports.py was
+    # silently never being re-applied before real launches. ES-DE has its
+    # own native pre-launch hook instead: any executable script placed in
+    # ES-DE/scripts/game-start/ runs automatically before every game
+    # launch, but only if "CustomEventScripts" is enabled in
+    # es_settings.xml (also flipped on in phase_esde_config). This is the
+    # mechanism that actually fires for this project's setup; the
+    # runcommand-onstart.sh wiring above is kept only for the classic-ES
+    # fallback case.
+    local esde_scripts_dir="$PI_HOME/ES-DE/scripts/game-start"
+    mkdir -p "$esde_scripts_dir"
+    tee "$esde_scripts_dir/apply-controller-ports.sh" >/dev/null <<EOF
+#!/bin/bash
+# pi-arcade-setup: re-applies the "Assign P1/P2 Controller" mapping (if
+# any) before this launch - see phase_controller_ports_tool in install.sh.
+# Never allowed to block a launch.
+python3 $PI_HOME/scripts/apply-controller-ports.py >>/tmp/controllerports.log 2>&1 || true
+EOF
+    chmod +x "$esde_scripts_dir/apply-controller-ports.sh"
+    chown -R "$PI_USER:$PI_USER" "$PI_HOME/ES-DE/scripts"
 
     touch "$PI_HOME/RetroPie/retropiemenu/assignports.rp"
 
