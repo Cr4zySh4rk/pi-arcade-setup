@@ -544,6 +544,15 @@ ENABLE_BEZEL_PROJECT="${ENABLE_BEZEL_PROJECT:-true}"
 ENABLE_BT_SPEAKER="${ENABLE_BT_SPEAKER:-true}"
 BT_SPEAKER_NAME="${BT_SPEAKER_NAME:-RetroPieArcade}"
 
+# Hotplug a USB drive and this project offers to load ROMs from it (or set
+# it up as one): plug in a FAT32 drive with a RetroPie roms/ folder and it
+# offers to load those ROMs into ES-DE as an extra source; plug in a FAT32
+# drive without one and it offers to lay down the same folder structure
+# this installer uses; plug in anything not FAT32 and it offers to format
+# it (whole-disk wipe, one full-size FAT32 partition) before doing the
+# same. See phase_usb_rom_autoloader.
+ENABLE_USB_ROM_LOADER="${ENABLE_USB_ROM_LOADER:-true}"
+
 AUTO_REBOOT_AT_END="${AUTO_REBOOT_AT_END:-true}"
 
 # --------------------------------------------------------------------------
@@ -639,6 +648,7 @@ MUSIC_DIR=$MUSIC_DIR
 ENABLE_BEZEL_PROJECT=$ENABLE_BEZEL_PROJECT
 ENABLE_BT_SPEAKER=$ENABLE_BT_SPEAKER
 BT_SPEAKER_NAME=$BT_SPEAKER_NAME
+ENABLE_USB_ROM_LOADER=$ENABLE_USB_ROM_LOADER
 AUTO_REBOOT_AT_END=$AUTO_REBOOT_AT_END
 EOF
 }
@@ -9253,6 +9263,681 @@ phase_bezel_project_install() {
     return 0
 }
 
+# Hotplug a USB drive and this offers to load ROMs from it into ES-DE, set
+# one up as a ROM drive, or format a non-FAT32 drive for that purpose -
+# see the udev rule and usb-rom-loader.py itself (below) for the exact
+# decision tree. Runs entirely event-driven via udev + a curses dialog
+# opened on VT2 (openvt, same pattern as every other RetroPie-menu tool in
+# this project) - no polling daemon needed.
+phase_usb_rom_autoloader() {
+    if [ "$ENABLE_USB_ROM_LOADER" != "true" ]; then
+        log "ENABLE_USB_ROM_LOADER=false, skipping"
+        return 0
+    fi
+
+    mkdir -p "$PI_HOME/scripts"
+    tee "$PI_HOME/scripts/usb-rom-loader.py" >/dev/null <<PYEOF
+#!/usr/bin/env python3
+"""
+pi-arcade-setup USB ROM auto-loader. Invoked by a udev rule
+(/etc/udev/rules.d/99-usb-rom-loader.rules) on every USB block device
+add/remove event, itself running inside its own VT (via openvt) so it can
+show a controller/keyboard-navigable dialog without disturbing ES-DE on
+VT1.
+
+    add <devnode>    - a USB partition, or a whole unpartitioned disk,
+                        just appeared. Checks whether it's FAT32, then
+                        whether it already has a RetroPie roms/ folder
+                        structure, and prompts accordingly:
+                          FAT32 + roms/ present     -> "Load ROMs from USB?"
+                          FAT32 + no roms/           -> "Copy ROM folder
+                                                          structure?"
+                          not FAT32                  -> "Format as FAT32?"
+                                                          (wipes the WHOLE
+                                                          disk - every
+                                                          existing
+                                                          partition - down
+                                                          to one full-size
+                                                          FAT32 partition),
+                                                          then falls into
+                                                          the "copy
+                                                          structure?" prompt
+                        Confirming "load ROMs" symlinks each matching
+                        system folder on the drive into this Pi's own
+                        roms tree and restarts ES-DE so they show up.
+    remove <devnode> - a previously-loaded USB partition just disappeared.
+                        Removes whatever symlinks were created for it and
+                        restarts ES-DE, so removed ROMs actually vanish
+                        from the gamelist instead of leaving dead entries.
+
+Every destructive step (formatting, above all) requires an explicit
+confirm through the dialog. Every step is best-effort and logs to
+/tmp/usbromloader.log instead of raising - this must never be able to
+take down udev, ES-DE, or the rest of the system.
+"""
+import curses
+import fcntl
+import json
+import os
+import re
+import select
+import struct
+import subprocess
+import sys
+import time
+
+JS_EVENT_BUTTON = 0x01
+JS_EVENT_AXIS = 0x02
+JS_EVENT_INIT = 0x80
+EVENT_FORMAT = "IhBB"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+AXIS_THRESHOLD = 16000
+BTN_CONFIRM = $BTN_X       # X / Cross / A - same role as the rest of the RetroPie menu
+BTN_BACK = $BTN_CIRCLE     # Circle / B - same role as the rest of the RetroPie menu
+
+PI_HOME = "$PI_HOME"
+PI_USER = "$PI_USER"
+ROMS_DIR = f"{PI_HOME}/RetroPie/roms"
+STATE_PATH = "/opt/retropie/configs/all/usbromloader_state.json"
+LOG_PATH = "/tmp/usbromloader.log"
+MEDIA_ROOT = "/media"
+
+
+def log(msg):
+    try:
+        with open(LOG_PATH, "a") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    except OSError:
+        pass
+
+
+def run(cmd, **kwargs):
+    log(f"$ {' '.join(cmd)}")
+    return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+
+
+# --------------------------------------------------------------------
+# Device/filesystem helpers
+# --------------------------------------------------------------------
+
+def parent_disk(devnode):
+    m = re.match(r'^(/dev/(?:sd[a-z]+|hd[a-z]+|vd[a-z]+))\d+\$', devnode)
+    if m:
+        return m.group(1)
+    m = re.match(r'^(/dev/(?:mmcblk\d+|nvme\d+n\d+))p\d+\$', devnode)
+    if m:
+        return m.group(1)
+    return devnode
+
+
+def first_partition_devnode(disk):
+    m = re.match(r'^/dev/(?:mmcblk\d+|nvme\d+n\d+)\$', disk)
+    return f"{disk}p1" if m else f"{disk}1"
+
+
+def disk_partitions(disk):
+    """All currently-known partition devnodes for a disk, via lsblk."""
+    out = run(["lsblk", "-nrpo", "NAME", disk]).stdout.split()
+    return [p for p in out if p != disk]
+
+
+def root_disk():
+    """Parent disk backing / - never allowed as a format target."""
+    src = run(["findmnt", "-no", "SOURCE", "/"]).stdout.strip()
+    return parent_disk(src) if src else None
+
+
+def blkid_value(devnode, tag):
+    r = run(["blkid", "-o", "value", "-s", tag, devnode])
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def is_fat32(devnode):
+    fstype = blkid_value(devnode, "TYPE")
+    if fstype != "vfat":
+        return False
+    version = blkid_value(devnode, "VERSION")
+    if version:
+        return version == "FAT32"
+    # Some blkid builds don't populate VERSION on every probe - fall back
+    # to \`file -sL\`, which inspects the boot sector directly and reports
+    # "FAT (32 bit)" / "FAT (16 bit)" regardless.
+    r = run(["file", "-sL", devnode])
+    return "FAT (32 bit)" in r.stdout
+
+
+def has_retropie_structure(mountpoint):
+    for name in ("roms", "ROMS", "Roms"):
+        p = os.path.join(mountpoint, name)
+        if os.path.isdir(p):
+            try:
+                if any(d.is_dir() for d in os.scandir(p)):
+                    return p
+            except OSError:
+                pass
+    return None
+
+
+def local_systems():
+    try:
+        return sorted(d for d in os.listdir(ROMS_DIR) if os.path.isdir(os.path.join(ROMS_DIR, d)))
+    except OSError:
+        return []
+
+
+def mount_partition(devnode):
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', os.path.basename(devnode)) or "usbrom"
+    mountpoint = f"{MEDIA_ROOT}/usbrom-{safe}"
+    os.makedirs(mountpoint, exist_ok=True)
+    if os.path.ismount(mountpoint):
+        return mountpoint
+    r = run([
+        "mount", "-t", "vfat", "-o",
+        f"uid={PI_USER},gid={PI_USER},umask=000,shortname=mixed,utf8",
+        devnode, mountpoint,
+    ])
+    if r.returncode != 0:
+        log(f"mount failed: {r.stderr}")
+        return None
+    return mountpoint
+
+
+def unmount(mountpoint):
+    if mountpoint and os.path.ismount(mountpoint):
+        run(["umount", mountpoint])
+    try:
+        os.rmdir(mountpoint)
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------
+# Destructive formatting. Per the project owner's explicit spec: always
+# wipe the WHOLE disk - every existing partition, whatever the current
+# layout - down to exactly one partition spanning the full drive,
+# formatted FAT32. Never touches the disk backing /.
+# --------------------------------------------------------------------
+
+def format_disk_fat32(disk):
+    if root_disk() == disk:
+        log(f"REFUSING to format {disk} - it backs the root filesystem")
+        return None
+    for part in disk_partitions(disk):
+        run(["umount", "-f", part])
+    run(["wipefs", "-af", disk])
+    r = run(["parted", "-s", disk, "mklabel", "msdos", "mkpart", "primary", "fat32", "1MiB", "100%"])
+    if r.returncode != 0:
+        log(f"parted failed: {r.stderr}")
+        return None
+    run(["partprobe", disk])
+    run(["udevadm", "settle", "--timeout=10"])
+    part = first_partition_devnode(disk)
+    for _ in range(20):
+        if os.path.exists(part):
+            break
+        time.sleep(0.5)
+    else:
+        log(f"new partition {part} never appeared after formatting {disk}")
+        return None
+    r = run(["mkfs.vfat", "-F", "32", "-n", "RETROROMS", part])
+    if r.returncode != 0:
+        log(f"mkfs.vfat failed: {r.stderr}")
+        return None
+    run(["udevadm", "settle", "--timeout=10"])
+    return part
+
+
+def copy_rom_structure(mountpoint):
+    created = []
+    for sysname in local_systems():
+        target = os.path.join(mountpoint, "roms", sysname)
+        if not os.path.isdir(target):
+            os.makedirs(target, exist_ok=True)
+            created.append(sysname)
+    return created
+
+
+# --------------------------------------------------------------------
+# ES-DE integration: symlink each matching system folder on the USB drive
+# into this Pi's own roms tree (rather than reconfiguring ES-DE's single
+# ROMDirectory) so ES-DE's normal recursive scan - which already follows
+# symlinks - just picks the extra games up as part of the system folder it
+# already knows about. State is tracked by devnode (not filesystem UUID)
+# since a "remove" udev event only ever gives us the devnode, and that's
+# stable across a single plug/unplug cycle, which is all this needs.
+# --------------------------------------------------------------------
+
+def load_state():
+    try:
+        with open(STATE_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, STATE_PATH)
+    try:
+        os.chmod(STATE_PATH, 0o664)
+    except OSError:
+        pass
+
+
+def create_symlinks(devnode, mountpoint, roms_root):
+    tag = re.sub(r'[^A-Za-z0-9_-]', '', os.path.basename(devnode)) or "usb"
+    links = []
+    for sysname in sorted(os.listdir(roms_root)):
+        src = os.path.join(roms_root, sysname)
+        if not os.path.isdir(src):
+            continue
+        local_sys_dir = os.path.join(ROMS_DIR, sysname)
+        if not os.path.isdir(local_sys_dir):
+            log(f"skipping USB system '{sysname}' - no matching local system folder, ES-DE wouldn't know about it")
+            continue
+        link = os.path.join(local_sys_dir, f"_usbrom_{tag}")
+        try:
+            if os.path.islink(link) or os.path.exists(link):
+                os.remove(link)
+            os.symlink(src, link)
+            links.append(link)
+        except OSError as e:
+            log(f"symlink failed for {sysname}: {e}")
+    state = load_state()
+    state[devnode] = {"mountpoint": mountpoint, "symlinks": links}
+    save_state(state)
+    return links
+
+
+def remove_symlinks(devnode):
+    state = load_state()
+    entry = state.pop(devnode, None)
+    save_state(state)
+    if not entry:
+        return []
+    removed = []
+    for link in entry.get("symlinks", []):
+        try:
+            if os.path.islink(link):
+                os.remove(link)
+                removed.append(link)
+        except OSError:
+            pass
+    mountpoint = entry.get("mountpoint")
+    if mountpoint:
+        unmount(mountpoint)
+    return removed
+
+
+def restart_esde():
+    # Killing es-de outright can make its own autostart.sh loop treat the
+    # exit as a deliberate quit and stop relaunching (confirmed live on
+    # this project's own reference Pi - ES-DE logs "ES-DE cleanly shutting
+    # down" on SIGTERM same as a real quit, and the loop can't tell the
+    # difference). Rather than depend on that log-line heuristic working
+    # the same way on every ES-DE build, explicitly re-launch the
+    # autostart loop ourselves afterward if it's no longer running -
+    # matching exactly how this was recovered live during this project's
+    # own testing.
+    run(["pkill", "-f", "es-de"])
+    time.sleep(2)
+    r = run(["pgrep", "-f", "autostart.sh"])
+    if r.returncode != 0:
+        subprocess.Popen(
+            ["setsid", "bash", f"{PI_HOME}/RetroPie/configs/all/autostart.sh"],
+            stdin=open("/dev/tty1"), stdout=open("/dev/tty1", "w"), stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        log("autostart.sh had stopped - relaunched it directly")
+
+
+# --------------------------------------------------------------------
+# Dialog UI - same controller-or-keyboard input handling as
+# assign-controller-ports.py (BTN_CONFIRM/BTN_BACK from this project's own
+# RetroPie-menu button mapping), simplified to a left/right Yes/No choice
+# (or a single OK dismiss for informational dialogs). Only the primary
+# stick/D-pad axis is read for left/right, same as every other menu tool
+# here - good enough for a two-option dialog.
+# --------------------------------------------------------------------
+
+def list_gamepads():
+    try:
+        text = open("/proc/bus/input/devices").read()
+    except OSError:
+        return []
+    pads = []
+    for block in text.split("\n\n"):
+        name_m = re.search(r'^N: Name="(.*)"\$', block, re.M)
+        handlers_m = re.search(r'^H: Handlers=(.*)\$', block, re.M)
+        if not name_m or not handlers_m:
+            continue
+        if any(s in name_m.group(1) for s in ("Motion Sensors", "Touchpad", "Keyboard", "Mouse", "Consumer Control")):
+            continue
+        js_m = re.search(r'\bjs(\d+)\b', handlers_m.group(1))
+        if js_m:
+            pads.append(int(js_m.group(1)))
+    return pads
+
+
+def open_joysticks():
+    files = []
+    for jsnum in list_gamepads():
+        try:
+            f = open(f"/dev/input/js{jsnum}", "rb", buffering=0)
+            os.set_blocking(f.fileno(), False)
+            files.append(f)
+        except OSError:
+            pass
+    return files
+
+
+def poll_action(stdscr, js_files, axis_state):
+    fds = [sys.stdin] + js_files
+    try:
+        ready, _, _ = select.select(fds, [], [], 0.15)
+    except (OSError, ValueError):
+        ready = []
+    action = None
+    for f in js_files:
+        if f in ready:
+            try:
+                data = os.read(f.fileno(), EVENT_SIZE)
+            except OSError:
+                continue
+            if data and len(data) == EVENT_SIZE:
+                _t, value, typ, number = struct.unpack(EVENT_FORMAT, data)
+                if typ & JS_EVENT_INIT:
+                    continue
+                if typ == JS_EVENT_BUTTON and value == 1:
+                    if number == BTN_CONFIRM:
+                        action = "confirm"
+                    elif number == BTN_BACK:
+                        action = "back"
+                elif typ == JS_EVENT_AXIS and number == 0:
+                    past = abs(value) > AXIS_THRESHOLD
+                    was_past = axis_state.get(f, False)
+                    axis_state[f] = past
+                    if past and not was_past:
+                        action = "right" if value > 0 else "left"
+    if action is None and sys.stdin in ready:
+        ch = stdscr.getch()
+        if ch == curses.KEY_LEFT:
+            action = "left"
+        elif ch == curses.KEY_RIGHT:
+            action = "right"
+        elif ch in (10, 13, ord(" ")):
+            action = "confirm"
+        elif ch in (27, ord("q"), ord("Q")):
+            action = "back"
+    return action
+
+
+def wrap_text(text, width):
+    lines = []
+    for para in text.split("\n"):
+        if not para:
+            lines.append("")
+            continue
+        words = para.split(" ")
+        cur = ""
+        for w in words:
+            if len(cur) + len(w) + 1 > width:
+                lines.append(cur)
+                cur = w
+            else:
+                cur = f"{cur} {w}".strip()
+        lines.append(cur)
+    return lines
+
+
+def show_dialog(title, message, yesno=True):
+    result = {"value": False}
+
+    def _run(stdscr):
+        curses.curs_set(0)
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_YELLOW, -1)
+        curses.init_pair(2, curses.COLOR_CYAN, -1)
+        curses.init_pair(3, curses.COLOR_GREEN, -1)
+        stdscr.nodelay(True)
+        stdscr.keypad(True)
+        js_files = open_joysticks()
+        axis_state = {}
+        sel_yes = True
+        while True:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            body_w = min(w - 8, 76)
+            lines = wrap_text(message, body_w)
+            top = max(1, (h - len(lines) - 6) // 2)
+            tx = max(0, (w - len(title)) // 2)
+            try:
+                stdscr.addstr(top, tx, title, curses.color_pair(1) | curses.A_BOLD)
+            except curses.error:
+                pass
+            for i, line in enumerate(lines):
+                lx = max(0, (w - len(line)) // 2)
+                try:
+                    stdscr.addstr(top + 2 + i, lx, line, curses.color_pair(2))
+                except curses.error:
+                    pass
+            btn_y = top + 3 + len(lines)
+            if yesno:
+                yes_label, no_label = "[ YES ]", "[ NO ]"
+                gap = 4
+                total = len(yes_label) + len(no_label) + gap
+                bx = max(0, (w - total) // 2)
+                try:
+                    stdscr.addstr(btn_y, bx, yes_label, (curses.color_pair(3) | curses.A_BOLD | curses.A_REVERSE) if sel_yes else curses.color_pair(3))
+                    stdscr.addstr(btn_y, bx + len(yes_label) + gap, no_label, (curses.color_pair(1) | curses.A_BOLD | curses.A_REVERSE) if not sel_yes else curses.color_pair(1))
+                except curses.error:
+                    pass
+                hint = "LEFT/RIGHT: choose   X: confirm   Circle: cancel (No)"
+            else:
+                ok_label = "[ OK ]"
+                bx = max(0, (w - len(ok_label)) // 2)
+                try:
+                    stdscr.addstr(btn_y, bx, ok_label, curses.color_pair(3) | curses.A_BOLD | curses.A_REVERSE)
+                except curses.error:
+                    pass
+                hint = "X or Circle: dismiss"
+            try:
+                stdscr.addstr(h - 2, max(0, (w - len(hint)) // 2), hint, curses.A_DIM)
+            except curses.error:
+                pass
+            stdscr.refresh()
+
+            action = poll_action(stdscr, js_files, axis_state)
+            if action in ("left", "right"):
+                sel_yes = not sel_yes
+            elif action == "confirm":
+                result["value"] = sel_yes if yesno else True
+                break
+            elif action == "back":
+                result["value"] = False
+                break
+        for f in js_files:
+            try:
+                f.close()
+            except OSError:
+                pass
+
+    curses.wrapper(_run)
+    return result["value"]
+
+
+# --------------------------------------------------------------------
+# Main flow
+# --------------------------------------------------------------------
+
+def acquire_lock(disk):
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', os.path.basename(disk)) or "disk"
+    lock_path = f"/tmp/usbromloader-{safe}.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def handle_add(devnode):
+    for _ in range(10):
+        if os.path.exists(devnode):
+            break
+        time.sleep(0.5)
+    if not os.path.exists(devnode):
+        log(f"{devnode} never appeared, giving up")
+        return
+
+    disk = parent_disk(devnode)
+    lock_fd = acquire_lock(disk)
+    if lock_fd is None:
+        log(f"{disk} already being handled by another instance, skipping")
+        return
+
+    try:
+        if devnode == disk:
+            # A whole disk event fires before the kernel has necessarily
+            # finished enumerating its partitions - give it a few seconds
+            # to settle before concluding there really are none, so a
+            # normal partitioned drive doesn't race into the "format?"
+            # prompt meant only for a genuinely unpartitioned one.
+            partitioned = False
+            for _ in range(4):
+                if disk_partitions(disk):
+                    partitioned = True
+                    break
+                time.sleep(1)
+            if partitioned:
+                return  # the partition-level "add" events handle it instead
+            target = None
+            fat32 = False
+        else:
+            target = devnode
+            fat32 = is_fat32(target)
+
+        if not fat32:
+            size_gb = 0.0
+            try:
+                sz = int(open(f"/sys/class/block/{os.path.basename(disk)}/size").read().strip())
+                size_gb = sz * 512 / (1000 ** 3)
+            except OSError:
+                pass
+            msg = (
+                f"This USB drive ({size_gb:.1f} GB, {disk}) is not FAT32.\n\n"
+                "Format it as FAT32 to use as a game drive?\n\n"
+                "WARNING: THIS WILL ERASE EVERYTHING ON THE DRIVE "
+                "(all partitions, all data).\n\n"
+                "Are you sure?"
+            )
+            if not show_dialog("FORMAT USB DRIVE?", msg):
+                return
+            new_part = format_disk_fat32(disk)
+            if not new_part:
+                show_dialog("FORMAT FAILED", "Could not format the drive - see /tmp/usbromloader.log", yesno=False)
+                return
+            target = new_part
+            time.sleep(1)
+
+        mountpoint = mount_partition(target)
+        if not mountpoint:
+            show_dialog("USB ERROR", f"Could not mount {target} - see /tmp/usbromloader.log", yesno=False)
+            return
+
+        roms_root = has_retropie_structure(mountpoint)
+        if roms_root:
+            if show_dialog("USB DRIVE DETECTED", "RetroPie ROM folder found on this USB drive.\n\nLoad ROMs from USB?"):
+                links = create_symlinks(target, mountpoint, roms_root)
+                restart_esde()
+                log(f"loaded {len(links)} system folder(s) from {target}")
+            else:
+                unmount(mountpoint)
+        else:
+            if show_dialog("USB DRIVE DETECTED", "No RetroPie ROM folder structure found on this USB drive.\n\nCopy the RetroPie ROM folder structure to this drive?"):
+                created = copy_rom_structure(mountpoint)
+                show_dialog(
+                    "DONE",
+                    f"Created {len(created)} system folder(s) under roms/ on this drive.\n\n"
+                    "Add your ROMs to the matching folders, then remove and "
+                    "reinsert this drive to load them.",
+                    yesno=False,
+                )
+            else:
+                unmount(mountpoint)
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        except OSError:
+            pass
+
+
+def handle_remove(devnode):
+    disk = parent_disk(devnode)
+    lock_fd = acquire_lock(disk)
+    try:
+        removed = remove_symlinks(devnode)
+        if removed:
+            restart_esde()
+            log(f"removed {len(removed)} symlink(s) for {devnode}")
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+            except OSError:
+                pass
+
+
+def main():
+    if len(sys.argv) != 3 or sys.argv[1] not in ("add", "remove"):
+        print(f"usage: {sys.argv[0]} <add|remove> <devnode>", file=sys.stderr)
+        sys.exit(1)
+    mode, devnode = sys.argv[1], sys.argv[2]
+    log(f"=== {mode} {devnode} ===")
+    try:
+        if mode == "add":
+            handle_add(devnode)
+        else:
+            handle_remove(devnode)
+    except Exception as e:
+        log(f"unhandled exception: {e!r}")
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+    chmod +x "$PI_HOME/scripts/usb-rom-loader.py"
+    chown "$PI_USER:$PI_USER" "$PI_HOME/scripts/usb-rom-loader.py"
+
+    # udev hands off to a detached systemd-run unit (rather than running
+    # openvt directly in the udev worker) because udev RUN+= processes are
+    # expected to exit almost immediately - it kills anything still
+    # running after a few seconds, which would cut an interactive dialog
+    # off mid-prompt. --no-block starts the unit and returns control to
+    # udev right away. ID_BUS=="usb" is what keeps this from ever firing
+    # on the Pi's own SD card/eMMC.
+    sudo mkdir -p /etc/udev/rules.d
+    sudo tee /etc/udev/rules.d/99-usb-rom-loader.rules >/dev/null <<EOF
+# pi-arcade-setup: USB ROM auto-loader. See phase_usb_rom_autoloader in
+# install.sh and $PI_HOME/scripts/usb-rom-loader.py.
+ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", ENV{ID_BUS}=="usb", RUN+="/usr/bin/systemd-run --no-block /usr/bin/openvt -c 2 -s -w -f -- /usr/bin/env TERM=linux /usr/bin/python3 $PI_HOME/scripts/usb-rom-loader.py add %E{DEVNAME}"
+ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", ENV{ID_BUS}=="usb", RUN+="/usr/bin/systemd-run --no-block /usr/bin/openvt -c 2 -s -w -f -- /usr/bin/env TERM=linux /usr/bin/python3 $PI_HOME/scripts/usb-rom-loader.py add %E{DEVNAME}"
+ACTION=="remove", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", ENV{ID_BUS}=="usb", RUN+="/usr/bin/systemd-run --no-block /usr/bin/python3 $PI_HOME/scripts/usb-rom-loader.py remove %E{DEVNAME}"
+EOF
+    sudo chmod 644 /etc/udev/rules.d/99-usb-rom-loader.rules
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger || true
+
+    log "USB ROM auto-loader installed - insert a USB drive to be prompted (see the README for the exact decision tree)."
+    return 0
+}
+
 phase_finalize() {
     # Defensive ownership normalization. Confirmed live on a second
     # reference Pi, across the several separate install_run*.log attempts
@@ -9348,6 +10033,7 @@ main() {
         controller_ports_tool
         mame_menu_hotkey_default
         bezel_project_install
+        usb_rom_autoloader
         finalize
     )
 
