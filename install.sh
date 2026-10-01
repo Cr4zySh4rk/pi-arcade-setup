@@ -9657,7 +9657,30 @@ def save_state(state):
         pass
 
 
+# Entries that are USB-side ES-DE/EmulationStation bookkeeping, not actual
+# games - never worth symlinking into the local system folder even though
+# they can legitimately show up inside a roms/<system> folder someone
+# built with a frontend of their own.
+_SKIP_ENTRY_NAMES = {"gamelist.xml", "media", "downloaded_media", ".DS_Store"}
+
+
 def create_symlinks(devnode, mountpoint, roms_root):
+    # Symlinking the whole USB system folder as ONE entry (as an earlier
+    # version of this did) makes ES-DE show it as its own separate,
+    # oddly-named folder in the gamelist (e.g. "_usbrom_sdc1") sitting
+    # alongside the real games instead of blending in with them - reported
+    # live, and confirmed to be exactly this: ES-DE's gamelist view shows
+    # any subfolder under a system's ROM directory as a distinct, clickable
+    # folder node named after that subfolder. Symlinking each GAME entry
+    # individually instead - directly into the local system folder, under
+    # its own original filename - means there's no extra folder for ES-DE
+    # to show at all: every USB game just appears as if it had always been
+    # sitting in that system's local roms folder, mixed in with the rest.
+    # A per-game-folder system (e.g. a multi-disc game organized as its own
+    # subfolder) still symlinks as a single folder entry at this level,
+    # same as it would for a real local game organized the same way - that
+    # is correct, pre-existing ES-DE behavior for that case, not something
+    # this project's own USB-loader "device" grouping is adding on top.
     tag = re.sub(r'[^A-Za-z0-9_-]', '', os.path.basename(devnode)) or "usb"
     links = []
     try:
@@ -9669,28 +9692,52 @@ def create_symlinks(devnode, mountpoint, roms_root):
         if not mount_still_present(mountpoint):
             log(f"{mountpoint} was unmounted mid-symlink (drive pulled) - stopping after {len(links)} link(s)")
             break
-        src = os.path.join(roms_root, sysname)
+        src_sys_dir = os.path.join(roms_root, sysname)
         try:
-            if not os.path.isdir(src):
+            if not os.path.isdir(src_sys_dir):
                 continue
         except OSError as e:
-            log(f"{src} disappeared (drive pulled) while checking it: {e!r} - skipping")
+            log(f"{src_sys_dir} disappeared (drive pulled) while checking it: {e!r} - skipping")
             continue
         local_sys_dir = os.path.join(ROMS_DIR, sysname)
         if not os.path.isdir(local_sys_dir):
             log(f"skipping USB system '{sysname}' - no matching local system folder, ES-DE wouldn't know about it")
             continue
-        link = os.path.join(local_sys_dir, f"_usbrom_{tag}")
         try:
-            if os.path.islink(link) or os.path.exists(link):
-                os.remove(link)
-            os.symlink(src, link)
-            links.append(link)
+            entries = sorted(os.listdir(src_sys_dir))
         except OSError as e:
-            log(f"symlink failed for {sysname}: {e}")
-    # Persist whatever we actually managed to create, even if the loop above
-    # broke early because the drive was pulled mid-way - a partial link set
-    # still needs to be tracked so remove_symlinks() can clean it up properly
+            log(f"{src_sys_dir} disappeared (drive pulled) while listing it: {e!r} - skipping")
+            continue
+        for entry in entries:
+            if not mount_still_present(mountpoint):
+                log(f"{mountpoint} was unmounted mid-symlink (drive pulled) - stopping after {len(links)} link(s)")
+                return _finish_create_symlinks(devnode, mountpoint, links)
+            if entry in _SKIP_ENTRY_NAMES or entry.startswith("."):
+                continue
+            src = os.path.join(src_sys_dir, entry)
+            dest = os.path.join(local_sys_dir, entry)
+            if os.path.islink(dest) or os.path.exists(dest):
+                # A real local ROM (or an earlier USB load) already uses
+                # this exact filename - never clobber it. Fall back to a
+                # tagged name so the USB copy still loads under a distinct
+                # name instead of silently vanishing behind the collision.
+                base, ext = os.path.splitext(entry)
+                dest = os.path.join(local_sys_dir, f"{base}_usb{tag}{ext}")
+                if os.path.islink(dest) or os.path.exists(dest):
+                    log(f"skipping '{entry}' in {sysname} - name collision even after tagging, giving up on this one")
+                    continue
+            try:
+                os.symlink(src, dest)
+                links.append(dest)
+            except OSError as e:
+                log(f"symlink failed for {sysname}/{entry}: {e}")
+    return _finish_create_symlinks(devnode, mountpoint, links)
+
+
+def _finish_create_symlinks(devnode, mountpoint, links):
+    # Persist whatever was actually created, even if the loop above broke
+    # early because the drive was pulled mid-way - a partial link set still
+    # needs to be tracked so remove_symlinks() can clean it up properly
     # once the "remove" udev event comes through.
     state = load_state()
     state[devnode] = {"mountpoint": mountpoint, "symlinks": links}
