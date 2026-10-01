@@ -9316,7 +9316,6 @@ confirm through the dialog. Every step is best-effort and logs to
 take down udev, ES-DE, or the rest of the system.
 """
 import curses
-import fcntl
 import json
 import os
 import re
@@ -9344,9 +9343,39 @@ MEDIA_ROOT = "/media"
 
 
 def log(msg):
+    # Self-healing against a real, confirmed-live kernel trap: this process
+    # always runs as root (via udev -> systemd-run), but if LOG_PATH ever
+    # gets created/left behind by a NON-root process instead (e.g. a stray
+    # manual 'touch' while debugging over SSH, with no sudo), every
+    # subsequent root append silently fails forever after - /tmp is a
+    # world-writable sticky directory, and fs.protected_regular (default
+    # "2" on this kernel) blocks opening an existing regular file for
+    # writing there unless the opening process either owns the file or
+    # owns the directory, a restriction that is NOT bypassed by root/
+    # CAP_DAC_OVERRIDE by design. Confirmed live: this is exactly what
+    # happened during development - a single non-root 'touch
+    # /tmp/usbromloader.log' left the log permanently blank across many
+    # real runs afterward, with no error visible anywhere, since the
+    # exception was swallowed right here. Root can always freely delete
+    # and recreate any file in /tmp regardless of who owns it (also
+    # confirmed live), so on exactly this failure, remove the poisoned
+    # file and recreate it fresh before giving up - this can only ever
+    # trigger from a one-time ownership mismatch, never from a normal
+    # disk-full/read-only-fs failure, which would fail identically on the
+    # retry and just fall through to the final silent 'except' below.
     try:
         with open(LOG_PATH, "a") as f:
             f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+        return
+    except OSError:
+        pass
+    try:
+        os.remove(LOG_PATH)
+    except OSError:
+        pass
+    try:
+        with open(LOG_PATH, "a") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] (recreated log file - it was previously owned by a different user and unwritable here) {msg}\n")
     except OSError:
         pass
 
@@ -9381,10 +9410,57 @@ def disk_partitions(disk):
     return [p for p in out if p != disk]
 
 
+HANDLED_TTL = 20  # seconds
+
+
+def already_handled_recently(disk):
+    """True (and does nothing further) if some other instance for this same
+    disk already reached this point within the last HANDLED_TTL seconds;
+    otherwise marks it as handled now and returns False. See the call site
+    for why this is needed even with the wrapper's own per-disk lock."""
+    marker = f"/tmp/usbromloader-{os.path.basename(disk)}.handled"
+    try:
+        if time.time() - os.path.getmtime(marker) < HANDLED_TTL:
+            return True
+    except OSError:
+        pass
+    try:
+        open(marker, "w").close()
+    except OSError:
+        pass
+    return False
+
+
 def root_disk():
     """Parent disk backing / - never allowed as a format target."""
     src = run(["findmnt", "-no", "SOURCE", "/"]).stdout.strip()
     return parent_disk(src) if src else None
+
+
+def device_present(devnode):
+    """True if a block device node still exists. Used throughout the add
+    flow to bail out cleanly the moment a drive is pulled mid-operation -
+    format, mount, copy, symlink, whatever stage it's at - rather than
+    pressing on into a command that would just hang or fail with a raw
+    traceback. This is on top of, not instead of, kill_stale_add_
+    handlers() SIGKILL-ing this whole process from the "remove" side: that
+    covers the case where the kernel notices the removal and this process
+    is killed before it ever gets back here to check for itself, but a
+    cheap check at each step still catches the common case (removed
+    between dialog steps, not mid-syscall) and produces a clean log line
+    either way."""
+    return os.path.exists(devnode)
+
+
+def mount_still_present(mountpoint):
+    """True if mountpoint is still an active mount. A drive pulled out
+    from under a mount doesn't necessarily make ismount() false right
+    away, but it's the cheapest available signal and is checked at every
+    step anyway - any deeper I/O error from a genuinely dead mount is
+    caught separately where it can actually occur (see the try/except
+    blocks in copy_rom_structure/create_symlinks and around the mount-
+    onward tail of _handle_add)."""
+    return bool(mountpoint) and os.path.ismount(mountpoint)
 
 
 def blkid_value(devnode, tag):
@@ -9426,6 +9502,9 @@ def local_systems():
 
 
 def mount_partition(devnode):
+    if not device_present(devnode):
+        log(f"{devnode} is gone before it could be mounted - drive was pulled, aborting")
+        return None
     safe = re.sub(r'[^A-Za-z0-9_-]', '', os.path.basename(devnode)) or "usbrom"
     mountpoint = f"{MEDIA_ROOT}/usbrom-{safe}"
     os.makedirs(mountpoint, exist_ok=True)
@@ -9462,12 +9541,27 @@ def format_disk_fat32(disk):
     if root_disk() == disk:
         log(f"REFUSING to format {disk} - it backs the root filesystem")
         return None
+    if not device_present(disk):
+        log(f"{disk} is gone before formatting even started - drive was pulled, aborting")
+        return None
     for part in disk_partitions(disk):
         run(["umount", "-f", part])
+    if not device_present(disk):
+        log(f"{disk} disappeared while unmounting its existing partitions - drive was pulled, aborting")
+        return None
     run(["wipefs", "-af", disk])
+    if not device_present(disk):
+        log(f"{disk} disappeared during wipefs - drive was pulled, aborting")
+        return None
     r = run(["parted", "-s", disk, "mklabel", "msdos", "mkpart", "primary", "fat32", "1MiB", "100%"])
     if r.returncode != 0:
-        log(f"parted failed: {r.stderr}")
+        if not device_present(disk):
+            log(f"parted failed because {disk} was pulled mid-format, aborting")
+        else:
+            log(f"parted failed: {r.stderr}")
+        return None
+    if not device_present(disk):
+        log(f"{disk} disappeared right after parted - drive was pulled, aborting")
         return None
     run(["partprobe", disk])
     run(["udevadm", "settle", "--timeout=10"])
@@ -9475,13 +9569,22 @@ def format_disk_fat32(disk):
     for _ in range(20):
         if os.path.exists(part):
             break
+        if not device_present(disk):
+            log(f"{disk} disappeared while waiting for its new partition to appear - drive was pulled, aborting")
+            return None
         time.sleep(0.5)
     else:
         log(f"new partition {part} never appeared after formatting {disk}")
         return None
     r = run(["mkfs.vfat", "-F", "32", "-n", "RETROROMS", part])
     if r.returncode != 0:
-        log(f"mkfs.vfat failed: {r.stderr}")
+        if not device_present(part):
+            log(f"mkfs.vfat failed because {part} was pulled mid-format, aborting")
+        else:
+            log(f"mkfs.vfat failed: {r.stderr}")
+        return None
+    if not device_present(part):
+        log(f"{part} disappeared right after mkfs.vfat - drive was pulled, aborting")
         return None
     run(["udevadm", "settle", "--timeout=10"])
     return part
@@ -9490,10 +9593,33 @@ def format_disk_fat32(disk):
 def copy_rom_structure(mountpoint):
     created = []
     for sysname in local_systems():
+        if not mount_still_present(mountpoint):
+            log(f"{mountpoint} was unmounted mid-copy (drive pulled) - stopping after {len(created)} folder(s)")
+            break
         target = os.path.join(mountpoint, "roms", sysname)
-        if not os.path.isdir(target):
-            os.makedirs(target, exist_ok=True)
-            created.append(sysname)
+        try:
+            if not os.path.isdir(target):
+                os.makedirs(target, exist_ok=True)
+                created.append(sysname)
+        except OSError as e:
+            log(f"{mountpoint} disappeared while creating '{sysname}' (drive pulled): {e!r} - stopping after {len(created)} folder(s)")
+            break
+    # A plain mkdir on a FAT32 USB stick is not guaranteed to actually be on
+    # the physical media the moment this function returns - the kernel is
+    # free to leave it sitting in the page cache for a while, and this
+    # project's own normal flow immediately tells the user it's safe to
+    # pull the drive right after this. Confirmed live: without this, the
+    # new roms/<system> folders could vanish entirely - the drive showing
+    # right back at "no RetroPie ROM folder structure found" on the very
+    # next insertion - because nothing had actually forced them to disk
+    # before the physical unplug. 'sync' with no arguments flushes every
+    # mounted filesystem's pending writes, not just this one, but that's a
+    # small, one-time cost against actual data loss, and the caller (in
+    # _handle_add) explicitly unmounts right after this returns anyway -
+    # which forces its own flush too - so this is belt-and-suspenders
+    # against a pull that races even that unmount.
+    if created:
+        run(["sync"])
     return created
 
 
@@ -9516,7 +9642,12 @@ def load_state():
 
 
 def save_state(state):
-    tmp = STATE_PATH + ".tmp"
+    # Unique per-process, not a fixed ".tmp" suffix - two of this drive's
+    # partitions can fire "remove" events within the same instant, and two
+    # concurrent writers racing on the exact same tmp filename can have one
+    # process's os.replace() move the file out from under the other's,
+    # which raised exactly a FileNotFoundError here, confirmed live.
+    tmp = f"{STATE_PATH}.tmp.{os.getpid()}"
     with open(tmp, "w") as f:
         json.dump(state, f, indent=2)
     os.replace(tmp, STATE_PATH)
@@ -9529,9 +9660,21 @@ def save_state(state):
 def create_symlinks(devnode, mountpoint, roms_root):
     tag = re.sub(r'[^A-Za-z0-9_-]', '', os.path.basename(devnode)) or "usb"
     links = []
-    for sysname in sorted(os.listdir(roms_root)):
+    try:
+        sysnames = sorted(os.listdir(roms_root))
+    except OSError as e:
+        log(f"{roms_root} disappeared before symlinking could even start (drive pulled): {e!r}")
+        sysnames = []
+    for sysname in sysnames:
+        if not mount_still_present(mountpoint):
+            log(f"{mountpoint} was unmounted mid-symlink (drive pulled) - stopping after {len(links)} link(s)")
+            break
         src = os.path.join(roms_root, sysname)
-        if not os.path.isdir(src):
+        try:
+            if not os.path.isdir(src):
+                continue
+        except OSError as e:
+            log(f"{src} disappeared (drive pulled) while checking it: {e!r} - skipping")
             continue
         local_sys_dir = os.path.join(ROMS_DIR, sysname)
         if not os.path.isdir(local_sys_dir):
@@ -9545,6 +9688,10 @@ def create_symlinks(devnode, mountpoint, roms_root):
             links.append(link)
         except OSError as e:
             log(f"symlink failed for {sysname}: {e}")
+    # Persist whatever we actually managed to create, even if the loop above
+    # broke early because the drive was pulled mid-way - a partial link set
+    # still needs to be tracked so remove_symlinks() can clean it up properly
+    # once the "remove" udev event comes through.
     state = load_state()
     state[devnode] = {"mountpoint": mountpoint, "symlinks": links}
     save_state(state)
@@ -9554,9 +9701,13 @@ def create_symlinks(devnode, mountpoint, roms_root):
 def remove_symlinks(devnode):
     state = load_state()
     entry = state.pop(devnode, None)
-    save_state(state)
     if not entry:
+        # Nothing tracked for this devnode (it was never loaded, or has no
+        # symlinks) - skip the write entirely rather than persisting a
+        # state dict that's already stale by the time a concurrent sibling
+        # partition's own remove event gets to read it back.
         return []
+    save_state(state)
     removed = []
     for link in entry.get("symlinks", []):
         try:
@@ -9650,15 +9801,40 @@ def poll_action(stdscr, js_files, axis_state):
                 _t, value, typ, number = struct.unpack(EVENT_FORMAT, data)
                 if typ & JS_EVENT_INIT:
                     continue
+                # Logged unconditionally, every real (non-INIT) event, no
+                # matter whether it ends up recognized as an action below -
+                # this is the only way to tell, after the fact, whether a
+                # controller press/movement actually reached this process
+                # at all, and if so what raw (type, number, value) it
+                # showed up as - critical for confirming BTN_CONFIRM/
+                # BTN_BACK and the AXIS_THRESHOLD/axis-0 assumption below
+                # actually match a given cabinet's real hardware, rather
+                # than guessing from a dead dialog with no visible feedback.
+                log(f"dialog: raw event type={typ:#x} number={number} value={value}")
                 if typ == JS_EVENT_BUTTON and value == 1:
                     if number == BTN_CONFIRM:
                         action = "confirm"
                     elif number == BTN_BACK:
                         action = "back"
-                elif typ == JS_EVENT_AXIS and number == 0:
+                elif typ == JS_EVENT_AXIS and number in (0, 6):
+                    # Axis 0 is the left analog stick's X axis on a standard
+                    # gamepad - the axis every other menu tool in this
+                    # project already reads for left/right. But a 4-way
+                    # arcade joystick wired through a generic USB encoder
+                    # that identifies itself as an Xbox 360 pad commonly
+                    # reports its digital left/right on axis 6 instead (the
+                    # kernel's xpad/jsdev convention numbers the D-pad hat
+                    # right after the two analog sticks and two triggers,
+                    # confirmed live on this project's own reference
+                    # hardware via a raw event capture) - reading both,
+                    # keyed separately per (file, axis number) below so an
+                    # idle analog stick can't mask real D-pad presses or
+                    # vice versa, covers either wiring without needing to
+                    # know in advance which one a given cabinet actually is.
+                    axis_key = (f, number)
                     past = abs(value) > AXIS_THRESHOLD
-                    was_past = axis_state.get(f, False)
-                    axis_state[f] = past
+                    was_past = axis_state.get(axis_key, False)
+                    axis_state[axis_key] = past
                     if past and not was_past:
                         action = "right" if value > 0 else "left"
     if action is None and sys.stdin in ready:
@@ -9692,7 +9868,7 @@ def wrap_text(text, width):
     return lines
 
 
-def show_dialog(title, message, yesno=True):
+def _dialog_ui(title, message, yesno=True):
     result = {"value": False}
 
     def _run(stdscr):
@@ -9705,6 +9881,12 @@ def show_dialog(title, message, yesno=True):
         stdscr.nodelay(True)
         stdscr.keypad(True)
         js_files = open_joysticks()
+        # Logged unconditionally (not just on failure) - this is the one
+        # piece of runtime state that decides whether the dialog can ever
+        # be navigated with a controller at all, and it can't be inspected
+        # after the fact any other way (there's no separate "did the
+        # joystick open" signal visible on screen).
+        log(f"dialog: found and opened {len(js_files)} joystick(s): {[f.name for f in js_files]}")
         axis_state = {}
         sel_yes = True
         while True:
@@ -9769,23 +9951,120 @@ def show_dialog(title, message, yesno=True):
     return result["value"]
 
 
+# ES-DE (SDL2/KMSDRM) never releases the display for a VT switch requested
+# by a process outside its own "launch an external command" code path -
+# confirmed live: even this project's already-working RetroPie-menu tools
+# (e.g. assign-controller-ports.py) show nothing at all on the physical
+# screen when the exact same \`openvt -c N -s -w -f\` invocation that
+# normally shows them is run independently (over SSH) instead of via
+# ES-DE's own menu. Those tools only ever become visible because ES-DE, as
+# PART of launching any external command (menu tool or real emulator
+# alike), fully exits first - the same "ES-DE quits, runs the thing,
+# autostart.sh relaunches ES-DE after" cycle used for every actual game.
+# There is no way for a udev-triggered event ES-DE has no knowledge of to
+# get that same voluntary hand-off, so this reproduces it manually: stop
+# ES-DE outright, wait for it to actually be gone, THEN attach to the
+# now-uncontested console for the dialog - only after that does anything
+# actually render. _esde_stopped/ensure_esde_stopped() make this a
+# once-per-run action even across several dialogs in the same flow (e.g.
+# the format confirmation followed by the copy-structure prompt), and
+# handle_add() is responsible for calling restart_esde() exactly once at
+# the end, however it returns, so ES-DE always comes back.
+_esde_stopped = False
+_current_disk = "unknown"
+
+
+def ensure_esde_stopped():
+    global _esde_stopped
+    if _esde_stopped:
+        return
+    run(["pkill", "-f", "es-de"])
+    for _ in range(20):
+        if run(["pgrep", "-f", "es-de"]).returncode != 0:
+            break
+        time.sleep(0.25)
+    _esde_stopped = True
+
+
+def show_dialog(title, message, yesno=True):
+    # A RetroArch session (an actual game running) holds the display just
+    # as exclusively as ES-DE does, but killing someone's game to show a
+    # USB-drive dialog would be a much worse interruption than just
+    # declining to interrupt it - skip showing anything at all while one
+    # is running; the user can handle the drive after quitting to the
+    # frontend.
+    if run(["pgrep", "-f", "retroarch"]).returncode == 0:
+        log("a game is currently running - not interrupting it to show a USB dialog")
+        return False
+
+    ensure_esde_stopped()
+
+    # Re-exec this same script as a dedicated child attached to VT1 (free
+    # now that ES-DE is gone) via openvt, rather than trying to attach the
+    # CURRENT process (which has no controlling terminal at all, having
+    # been launched from udev/systemd-run) to a tty in place. Passing the
+    # dialog contents through temp files, not argv/stdin, keeps the
+    # child's actual stdin/stdout free for openvt to wire up to the real
+    # console device, which is what curses needs.
+    pid = os.getpid()
+    in_path = f"/tmp/usbromdialog_{pid}.json"
+    out_path = f"/tmp/usbromdialog_{pid}.out"
+    try:
+        with open(in_path, "w") as f:
+            json.dump({"title": title, "message": message, "yesno": yesno}, f)
+        # _current_disk is tacked on as a trailing arg purely so it's
+        # visible in this child's own command line - kill_stale_add_
+        # handlers() greps for it there to find and kill this dialog (and
+        # the openvt wrapping it) if the drive gets pulled before anyone
+        # answers.
+        run([
+            "openvt", "-c", "1", "-s", "-w", "-f", "--",
+            "/usr/bin/env", "TERM=linux",
+            sys.executable, os.path.abspath(__file__), "--render-dialog", in_path, out_path, _current_disk,
+        ])
+        try:
+            with open(out_path) as f:
+                return f.read().strip() == "yes"
+        except OSError:
+            log("dialog child produced no answer file - treating as No")
+            return False
+    finally:
+        for p in (in_path, out_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
 # --------------------------------------------------------------------
 # Main flow
 # --------------------------------------------------------------------
 
-def acquire_lock(disk):
-    safe = re.sub(r'[^A-Za-z0-9_-]', '', os.path.basename(disk)) or "disk"
-    lock_path = f"/tmp/usbromloader-{safe}.lock"
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        os.close(fd)
-        return None
-    return fd
-
-
 def handle_add(devnode):
+    # ensure_esde_stopped() only ever runs once real work starts (inside
+    # show_dialog()), but that "once" is tracked per-process via the
+    # _esde_stopped global - this wrapper is what guarantees ES-DE actually
+    # comes back afterward, exactly once, no matter which of _handle_add's
+    # several early-return paths was taken.
+    global _esde_stopped
+    _esde_stopped = False
+    try:
+        _handle_add(devnode)
+    finally:
+        if _esde_stopped:
+            restart_esde()
+
+
+def _handle_add(devnode):
+    # Per-disk deduplication across the several near-simultaneous udev "add"
+    # events a single physical drive fires (one for the whole disk, one per
+    # partition) happens one level up, in usb-rom-loader-wrapper.sh, via a
+    # flock that's held for this whole process's lifetime (wrapping openvt
+    # itself, not just this script) - taking it again here, on the same
+    # lockfile, would just see it already held by our own parent and always
+    # refuse to proceed. Confirmed live: that's exactly what an earlier
+    # version of this script did, and every single invocation silently
+    # no-opped as a result.
     for _ in range(10):
         if os.path.exists(devnode):
             break
@@ -9795,106 +10074,220 @@ def handle_add(devnode):
         return
 
     disk = parent_disk(devnode)
-    lock_fd = acquire_lock(disk)
-    if lock_fd is None:
-        log(f"{disk} already being handled by another instance, skipping")
+    global _current_disk
+    _current_disk = disk
+    if devnode == disk:
+        # A whole disk event fires before the kernel has necessarily
+        # finished enumerating its partitions - give it a few seconds
+        # to settle before concluding there really are none, so a
+        # normal partitioned drive doesn't race into the "format?"
+        # prompt meant only for a genuinely unpartitioned one.
+        partitioned = False
+        for _ in range(4):
+            if disk_partitions(disk):
+                partitioned = True
+                break
+            time.sleep(1)
+        if partitioned:
+            return  # the partition-level "add" events handle it instead
+        target = None
+        fat32 = False
+    else:
+        target = devnode
+        fat32 = is_fat32(target)
+
+    # The wrapper's flock queues a losing partition event rather than
+    # dropping it outright (see the comment on the flock call there), so a
+    # partition event that was queued behind, say, the disk-level check
+    # above can still end up here shortly after another partition event for
+    # the SAME physical drive already ran this exact code and is mid-dialog
+    # or just finished. already_handled_recently() is what stops that
+    # queued duplicate from mounting the drive again or popping a second,
+    # redundant prompt for what's really one insertion.
+    if already_handled_recently(disk):
+        log(f"{disk} was already handled moments ago, skipping duplicate")
+        return
+
+    if not fat32:
+        size_gb = 0.0
+        try:
+            sz = int(open(f"/sys/class/block/{os.path.basename(disk)}/size").read().strip())
+            size_gb = sz * 512 / (1000 ** 3)
+        except OSError:
+            pass
+        msg = (
+            f"This USB drive ({size_gb:.1f} GB, {disk}) is not FAT32.\n\n"
+            "Format it as FAT32 to use as a game drive?\n\n"
+            "WARNING: THIS WILL ERASE EVERYTHING ON THE DRIVE "
+            "(all partitions, all data).\n\n"
+            "Are you sure?"
+        )
+        # show_dialog() blocks on however long the user takes to answer -
+        # could be seconds, could be the drive getting pulled while the
+        # prompt just sits there unanswered. kill_stale_add_handlers()
+        # SIGKILLs this whole process from the "remove" side in that case,
+        # but the explicit device_present() check right after every dialog
+        # answer is a cheap second line of defense for the narrow window
+        # where the removal and the answer land at almost the same instant.
+        if not show_dialog("FORMAT USB DRIVE?", msg):
+            return
+        if not device_present(disk):
+            log(f"{disk} was pulled while the format prompt was up (or right after) - aborting, nothing to format")
+            return
+        new_part = format_disk_fat32(disk)
+        if not new_part:
+            if device_present(disk):
+                show_dialog("FORMAT FAILED", "Could not format the drive - see /tmp/usbromloader.log", yesno=False)
+            else:
+                log(f"{disk} was pulled during formatting - skipping the failure dialog, there's no drive left to show it about")
+            return
+        target = new_part
+        time.sleep(1)
+
+    if not device_present(target):
+        log(f"{target} is gone right before mounting - drive was pulled, aborting")
+        return
+    mountpoint = mount_partition(target)
+    if not mountpoint:
+        if device_present(target):
+            show_dialog("USB ERROR", f"Could not mount {target} - see /tmp/usbromloader.log", yesno=False)
+        else:
+            log(f"{target} was pulled during the mount attempt - skipping the failure dialog")
         return
 
     try:
-        if devnode == disk:
-            # A whole disk event fires before the kernel has necessarily
-            # finished enumerating its partitions - give it a few seconds
-            # to settle before concluding there really are none, so a
-            # normal partitioned drive doesn't race into the "format?"
-            # prompt meant only for a genuinely unpartitioned one.
-            partitioned = False
-            for _ in range(4):
-                if disk_partitions(disk):
-                    partitioned = True
-                    break
-                time.sleep(1)
-            if partitioned:
-                return  # the partition-level "add" events handle it instead
-            target = None
-            fat32 = False
-        else:
-            target = devnode
-            fat32 = is_fat32(target)
-
-        if not fat32:
-            size_gb = 0.0
-            try:
-                sz = int(open(f"/sys/class/block/{os.path.basename(disk)}/size").read().strip())
-                size_gb = sz * 512 / (1000 ** 3)
-            except OSError:
-                pass
-            msg = (
-                f"This USB drive ({size_gb:.1f} GB, {disk}) is not FAT32.\n\n"
-                "Format it as FAT32 to use as a game drive?\n\n"
-                "WARNING: THIS WILL ERASE EVERYTHING ON THE DRIVE "
-                "(all partitions, all data).\n\n"
-                "Are you sure?"
-            )
-            if not show_dialog("FORMAT USB DRIVE?", msg):
-                return
-            new_part = format_disk_fat32(disk)
-            if not new_part:
-                show_dialog("FORMAT FAILED", "Could not format the drive - see /tmp/usbromloader.log", yesno=False)
-                return
-            target = new_part
-            time.sleep(1)
-
-        mountpoint = mount_partition(target)
-        if not mountpoint:
-            show_dialog("USB ERROR", f"Could not mount {target} - see /tmp/usbromloader.log", yesno=False)
+        if not mount_still_present(mountpoint):
+            log(f"{mountpoint} disappeared immediately after mounting (drive pulled) - aborting")
             return
-
         roms_root = has_retropie_structure(mountpoint)
         if roms_root:
-            if show_dialog("USB DRIVE DETECTED", "RetroPie ROM folder found on this USB drive.\n\nLoad ROMs from USB?"):
+            answered_yes = show_dialog("USB DRIVE DETECTED", "RetroPie ROM folder found on this USB drive.\n\nLoad ROMs from USB?")
+            if not mount_still_present(mountpoint):
+                log(f"{mountpoint} was pulled while/after the load-ROMs prompt - aborting, nothing left to load from")
+                return
+            if answered_yes:
                 links = create_symlinks(target, mountpoint, roms_root)
-                restart_esde()
                 log(f"loaded {len(links)} system folder(s) from {target}")
             else:
                 unmount(mountpoint)
         else:
-            if show_dialog("USB DRIVE DETECTED", "No RetroPie ROM folder structure found on this USB drive.\n\nCopy the RetroPie ROM folder structure to this drive?"):
+            answered_yes = show_dialog("USB DRIVE DETECTED", "No RetroPie ROM folder structure found on this USB drive.\n\nCopy the RetroPie ROM folder structure to this drive?")
+            if not mount_still_present(mountpoint):
+                log(f"{mountpoint} was pulled while/after the copy-structure prompt - aborting, nothing left to copy to")
+                return
+            if answered_yes:
                 created = copy_rom_structure(mountpoint)
-                show_dialog(
-                    "DONE",
-                    f"Created {len(created)} system folder(s) under roms/ on this drive.\n\n"
-                    "Add your ROMs to the matching folders, then remove and "
-                    "reinsert this drive to load them.",
-                    yesno=False,
-                )
+                if mount_still_present(mountpoint):
+                    # Unmount BEFORE telling the user it's done, not after -
+                    # this is the one thing standing between "copy
+                    # structure" actually working and the drive just
+                    # showing the exact same "no ROM folder structure
+                    # found" prompt again next time it's plugged in.
+                    # copy_rom_structure() already calls 'sync', but that
+                    # only asks the kernel to flush soon, not immediately,
+                    # and leaving the drive mounted afterward invites the
+                    # user to do exactly what the completion message tells
+                    # them to - physically pull it - the moment they read
+                    # it, with no guarantee the writes actually landed on
+                    # the physical media yet. unmount() forces its own
+                    # flush as part of a clean unmount, so by the time this
+                    # dialog is even on screen, it's already genuinely safe
+                    # to remove, not just nominally so.
+                    unmount(mountpoint)
+                    show_dialog(
+                        "DONE",
+                        f"Created {len(created)} system folder(s) under roms/ on this drive.\n\n"
+                        "Add your ROMs to the matching folders, then remove and "
+                        "reinsert this drive to load them.",
+                        yesno=False,
+                    )
+                else:
+                    log(f"{mountpoint} was pulled mid-copy - skipping the completion dialog, {len(created)} folder(s) made it before that")
             else:
                 unmount(mountpoint)
-    finally:
+    except OSError as e:
+        # Last-resort net: any I/O error from here on almost certainly
+        # means the drive vanished mid-syscall (a symlink/stat/etc. against
+        # a mount that just went dead under it) in a spot none of the
+        # explicit checks above happened to catch. Log it plainly and get
+        # out cleanly rather than letting it become an unhandled traceback
+        # that main()'s outer except would swallow silently anyway - the
+        # point of catching it here instead is the clearer log message.
+        log(f"I/O error while working with {target} (most likely the drive was pulled mid-operation): {e!r}")
+
+
+def kill_stale_add_handlers(disk):
+    """A drive can be physically pulled while its own "add" dialog is still
+    open and unanswered - that handler process (and the openvt + dialog
+    child it's waiting on) then never exits on its own, since nothing ever
+    answers the prompt it's blocked on. Confirmed live: left unkilled, this
+    zombified process keeps fighting over the console with any later
+    insertion - including of the very same physical drive, which almost
+    always comes back under a *different* devnode (sdb -> sdc, say), so the
+    new insertion's own per-disk lock doesn't even know to wait for it.
+
+    The pattern matches the disk against EVERY process in this script's
+    family - the original "add <devnode>" handler, the openvt process (its
+    own argv embeds the full command it's about to exec, disk tag
+    included), and the actual "--render-dialog" child - since a SIGKILL
+    can't be caught to let any of them clean up after each other. Only
+    restarts ES-DE / resets the console when something was actually killed,
+    so an unrelated drive's legitimate, currently-open dialog for a
+    *different* disk is never disturbed by this.
+    """
+    result = run(["pkill", "-9", "-f", f"usb-rom-loader.py.*{re.escape(disk)}"])
+    if result.returncode != 0:
+        return
+    log(f"killed a stale, unanswered dialog for {disk} (the drive was removed before it was answered)")
+    time.sleep(0.5)
+    # VT1 itself is never deallocated here (unlike the old VT2-scratch-
+    # console design this replaced) - it's the same console autostart.sh
+    # and ES-DE live on permanently, not a disposable one this script
+    # temporarily borrows, so it must stay allocated regardless.
+    run(["chvt", "1"])
+    for suffix in ("lock", "handled"):
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
+            os.remove(f"/tmp/usbromloader-{os.path.basename(disk)}.{suffix}")
         except OSError:
             pass
+    # The process we just killed may well have already stopped ES-DE
+    # (ensure_esde_stopped()) before getting stuck - SIGKILL skips its own
+    # \`finally: restart_esde()\` entirely, so it's on us to bring ES-DE back.
+    restart_esde()
 
 
 def handle_remove(devnode):
-    disk = parent_disk(devnode)
-    lock_fd = acquire_lock(disk)
-    try:
-        removed = remove_symlinks(devnode)
-        if removed:
-            restart_esde()
-            log(f"removed {len(removed)} symlink(s) for {devnode}")
-    finally:
-        if lock_fd is not None:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                os.close(lock_fd)
-            except OSError:
-                pass
+    kill_stale_add_handlers(parent_disk(devnode))
+    removed = remove_symlinks(devnode)
+    if removed:
+        restart_esde()
+        log(f"removed {len(removed)} symlink(s) for {devnode}")
 
 
 def main():
+    # This mode is how show_dialog() actually gets a dialog onto the
+    # physical screen: it re-execs this same script, via openvt, as a
+    # dedicated child now attached to VT1. Kept as a separate argv mode
+    # (rather than a function called in-process) because the whole reason
+    # for the re-exec is to hand curses a real controlling terminal that
+    # openvt just wired up - the parent process (running under
+    # systemd-run, no tty at all) can't retroactively acquire one.
+    if len(sys.argv) == 5 and sys.argv[1] == "--render-dialog":
+        _, _, in_path, out_path, disk_tag = sys.argv
+        try:
+            with open(in_path) as f:
+                spec = json.load(f)
+        except (OSError, ValueError) as e:
+            log(f"--render-dialog: could not read {in_path}: {e!r}")
+            sys.exit(1)
+        answer = _dialog_ui(spec.get("title", ""), spec.get("message", ""), spec.get("yesno", True))
+        try:
+            with open(out_path, "w") as f:
+                f.write("yes" if answer else "no")
+        except OSError as e:
+            log(f"--render-dialog: could not write {out_path}: {e!r}")
+        return
+
     if len(sys.argv) != 3 or sys.argv[1] not in ("add", "remove"):
         print(f"usage: {sys.argv[0]} <add|remove> <devnode>", file=sys.stderr)
         sys.exit(1)
@@ -9915,9 +10308,76 @@ PYEOF
     chmod +x "$PI_HOME/scripts/usb-rom-loader.py"
     chown "$PI_USER:$PI_USER" "$PI_HOME/scripts/usb-rom-loader.py"
 
+    # A physical drive fires several near-simultaneous udev "add" events -
+    # one for the whole disk, one for each partition on it - and the
+    # in-script per-disk flock in usb-rom-loader.py only dedupes AFTER
+    # openvt has already switched to and initialized curses on VT2.
+    # Confirmed live this actually breaks things, not just theoretically:
+    # a losing event's own openvt invocation can still contend for/switch
+    # VT2 out from under the winning one mid-dialog, crashing curses with
+    # "nocbreak() returned ERR" - so nothing visibly happens at all. This
+    # wrapper acquires the same per-disk lock BEFORE ever launching openvt
+    # instead, so a losing event never touches VT2 in the first place.
+    tee "$PI_HOME/scripts/usb-rom-loader-wrapper.sh" >/dev/null <<'WRAPEOF'
+#!/bin/bash
+# pi-arcade-setup: see the comment on this file in phase_usb_rom_autoloader
+# in install.sh for why this exists instead of udev calling openvt
+# directly.
+mode="$1"
+devnode="$2"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Same disk-from-partition naming convention as parent_disk() in
+# usb-rom-loader.py, kept in sync deliberately - this has to work without
+# querying the device at all, since it also runs for "remove", by which
+# point the device is already gone and can't be looked up via lsblk/blkid.
+if [[ "$devnode" =~ ^(/dev/(mmcblk[0-9]+|nvme[0-9]+n[0-9]+))p[0-9]+$ ]]; then
+    disk="${BASH_REMATCH[1]}"
+elif [[ "$devnode" =~ ^(/dev/(sd|hd|vd)[a-z]+)[0-9]+$ ]]; then
+    disk="${BASH_REMATCH[1]}"
+else
+    disk="$devnode"
+fi
+safe="$(basename "$disk" | tr -cd 'A-Za-z0-9_-')"
+lockfile="/tmp/usbromloader-${safe:-disk}.lock"
+
+if [ "$mode" = "remove" ]; then
+    # No dialog, no VT involved - nothing here needs serializing against
+    # other partitions of the same disk being removed at the same time.
+    exec /usr/bin/python3 "$script_dir/usb-rom-loader.py" remove "$devnode"
+else
+    # A bounded WAIT here, not a non-blocking failure, is deliberate and
+    # was a real live bug otherwise: the whole-disk "add" event is supposed
+    # to do a quick "are there partitions? then it's not my job" check and
+    # step aside for the per-partition events to do the real work - but
+    # with a non-blocking lock, those partition events had already tried
+    # and permanently given up (`flock -n` fails immediately, no retry)
+    # by the time the disk-level check released the lock a moment later,
+    # so NOTHING ever actually ran. Waiting up to 10s - comfortably more
+    # than the disk-level check ever takes - lets a queued partition event
+    # pick the lock up right after. usb-rom-loader.py's own "already
+    # handled recently" marker (see HANDLED_TTL) is what then stops that
+    # same queued event from popping a second, redundant dialog in the
+    # rarer case where it was queued behind an instance that went on to
+    # actually show one.
+    # No openvt wrapping here anymore - show_dialog() inside
+    # usb-rom-loader.py now does its own openvt call, lazily, only once
+    # ES-DE has actually been killed and only for the exact moment a
+    # dialog needs to render (see the big comment above show_dialog() in
+    # install.sh's phase_usb_rom_autoloader). Wrapping the whole "add"
+    # invocation in openvt here too was redundant with that and, worse,
+    # meant a device that turned out not to need any dialog at all (e.g.
+    # already-loaded ROMs, nothing to ask) still silently switched the
+    # console away and back for no reason.
+    exec flock -w 10 "$lockfile" /usr/bin/python3 "$script_dir/usb-rom-loader.py" add "$devnode"
+fi
+WRAPEOF
+    chmod +x "$PI_HOME/scripts/usb-rom-loader-wrapper.sh"
+    chown "$PI_USER:$PI_USER" "$PI_HOME/scripts/usb-rom-loader-wrapper.sh"
+
     # udev hands off to a detached systemd-run unit (rather than running
-    # openvt directly in the udev worker) because udev RUN+= processes are
-    # expected to exit almost immediately - it kills anything still
+    # the wrapper directly in the udev worker) because udev RUN+= processes
+    # are expected to exit almost immediately - it kills anything still
     # running after a few seconds, which would cut an interactive dialog
     # off mid-prompt. --no-block starts the unit and returns control to
     # udev right away. ID_BUS=="usb" is what keeps this from ever firing
@@ -9925,10 +10385,11 @@ PYEOF
     sudo mkdir -p /etc/udev/rules.d
     sudo tee /etc/udev/rules.d/99-usb-rom-loader.rules >/dev/null <<EOF
 # pi-arcade-setup: USB ROM auto-loader. See phase_usb_rom_autoloader in
-# install.sh and $PI_HOME/scripts/usb-rom-loader.py.
-ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", ENV{ID_BUS}=="usb", RUN+="/usr/bin/systemd-run --no-block /usr/bin/openvt -c 2 -s -w -f -- /usr/bin/env TERM=linux /usr/bin/python3 $PI_HOME/scripts/usb-rom-loader.py add %E{DEVNAME}"
-ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", ENV{ID_BUS}=="usb", RUN+="/usr/bin/systemd-run --no-block /usr/bin/openvt -c 2 -s -w -f -- /usr/bin/env TERM=linux /usr/bin/python3 $PI_HOME/scripts/usb-rom-loader.py add %E{DEVNAME}"
-ACTION=="remove", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", ENV{ID_BUS}=="usb", RUN+="/usr/bin/systemd-run --no-block /usr/bin/python3 $PI_HOME/scripts/usb-rom-loader.py remove %E{DEVNAME}"
+# install.sh, $PI_HOME/scripts/usb-rom-loader-wrapper.sh, and
+# $PI_HOME/scripts/usb-rom-loader.py.
+ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", ENV{ID_BUS}=="usb", RUN+="/usr/bin/systemd-run --no-block $PI_HOME/scripts/usb-rom-loader-wrapper.sh add %E{DEVNAME}"
+ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", ENV{ID_BUS}=="usb", RUN+="/usr/bin/systemd-run --no-block $PI_HOME/scripts/usb-rom-loader-wrapper.sh add %E{DEVNAME}"
+ACTION=="remove", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", ENV{ID_BUS}=="usb", RUN+="/usr/bin/systemd-run --no-block $PI_HOME/scripts/usb-rom-loader-wrapper.sh remove %E{DEVNAME}"
 EOF
     sudo chmod 644 /etc/udev/rules.d/99-usb-rom-loader.rules
     sudo udevadm control --reload-rules
