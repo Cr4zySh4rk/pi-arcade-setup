@@ -4403,7 +4403,7 @@ PROFEOF
 phase_custom_retropie_system() {
     mkdir -p "$PI_HOME/ES-DE/custom_systems" "$PI_HOME/ES-DE/gamelists/retropie"
 
-    local keep=(showip.rp avsettings.rp wifigate.rp ftpsettings.rp retroarch.rp assignports.rp transfergames.rp)
+    local keep=(showip.rp avsettings.rp wifigate.rp ftpsettings.rp retroarch.rp assignports.rp transfergames.rp managegames.rp)
     [ "$ENABLE_BT_SPEAKER" = "true" ] && keep+=(btpair.rp btaudio.rp)
     [ "$ENABLE_MUSIC_PLAYER" = "true" ] && keep+=(musicplayer.rp)
     [ "$ENABLE_LED_STRIP" = "true" ] && keep+=(ledconfig.rp)
@@ -4537,6 +4537,12 @@ LEDCFG
 		<path>./transfergames.rp</path>
 		<name>Transfer games</name>
 		<desc>Copy games between a USB drive and this Pi - individual games, whole systems, or everything. Always a copy, never a move, and checks the destination has enough free space first.</desc>
+		<image>$icon_dir/filemanager.png</image>
+	</game>
+	<game>
+		<path>./managegames.rp</path>
+		<name>Manage Games</name>
+		<desc>Delete games you no longer want from the Pi's onboard storage, or from a connected USB drive that has the RetroPie ROM folder structure. Pick individual games, whole systems, or everything. Deletion is permanent and always asks twice.</desc>
 		<image>$icon_dir/filemanager.png</image>
 	</game>
 $( [ "$ENABLE_BEZEL_PROJECT" = "true" ] && cat <<BEZELPROJECT
@@ -9709,6 +9715,18 @@ def create_symlinks(devnode, mountpoint, roms_root):
         if not os.path.isdir(local_sys_dir):
             log(f"skipping USB system '{sysname}' - no matching local system folder, ES-DE wouldn't know about it")
             continue
+        # Drop dangling links into /media left behind by an earlier load of a
+        # drive that was pulled without its remove event being handled.
+        local_lower = {}
+        try:
+            for ln in os.listdir(local_sys_dir):
+                lp = os.path.join(local_sys_dir, ln)
+                if os.path.islink(lp) and not os.path.exists(lp) and os.readlink(lp).startswith(MEDIA_ROOT + "/"):
+                    os.remove(lp)
+                    continue
+                local_lower[ln.lower()] = ln
+        except OSError:
+            pass
         try:
             entries = sorted(os.listdir(src_sys_dir))
         except OSError as e:
@@ -9722,19 +9740,28 @@ def create_symlinks(devnode, mountpoint, roms_root):
                 continue
             src = os.path.join(src_sys_dir, entry)
             dest = os.path.join(local_sys_dir, entry)
-            if os.path.islink(dest) or os.path.exists(dest):
-                # A real local ROM (or an earlier USB load) already uses
-                # this exact filename - never clobber it. Fall back to a
-                # tagged name so the USB copy still loads under a distinct
-                # name instead of silently vanishing behind the collision.
-                base, ext = os.path.splitext(entry)
-                dest = os.path.join(local_sys_dir, f"{base}_usb{tag}{ext}")
-                if os.path.islink(dest) or os.path.exists(dest):
-                    log(f"skipping '{entry}' in {sysname} - name collision even after tagging, giving up on this one")
+            # The Pi's own copy always wins. If this game (same filename, any
+            # letter case) already exists locally as a real file/folder, the
+            # USB copy is NOT linked in at all - linking it under a second,
+            # tagged name is what made the same game show up twice in ES-DE.
+            # Only a link we made ourselves earlier (it points into /media) is
+            # replaced, so reloading the same drive stays idempotent.
+            cur = local_lower.get(entry.lower())
+            if cur is not None:
+                cur_path = os.path.join(local_sys_dir, cur)
+                if os.path.islink(cur_path) and os.readlink(cur_path).startswith(MEDIA_ROOT + "/"):
+                    try:
+                        os.remove(cur_path)
+                    except OSError:
+                        continue
+                    dest = cur_path
+                else:
+                    log(f"skipping '{entry}' in {sysname} - the Pi already has its own copy, which is preferred")
                     continue
             try:
                 os.symlink(src, dest)
                 links.append(dest)
+                local_lower[entry.lower()] = os.path.basename(dest)
             except OSError as e:
                 log(f"symlink failed for {sysname}/{entry}: {e}")
     return _finish_create_symlinks(devnode, mountpoint, links)
@@ -10320,6 +10347,18 @@ def kill_stale_add_handlers(disk):
 def handle_remove(devnode):
     kill_stale_add_handlers(parent_disk(devnode))
     removed = remove_symlinks(devnode)
+    # A drive pulled without a symlink load (e.g. after Copy structure, or a
+    # declined prompt) leaves its mount behind as a dead entry; with the
+    # device letter changing on every replug these pile up (sdb1, sdc1, ...).
+    # Always detach this devnode's own mount point on removal.
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', os.path.basename(devnode)) or "usbrom"
+    stale_mp = f"{MEDIA_ROOT}/usbrom-{safe}"
+    if os.path.ismount(stale_mp):
+        run(["umount", "-l", stale_mp])
+        try:
+            os.rmdir(stale_mp)
+        except OSError:
+            pass
     if removed:
         restart_esde()
         log(f"removed {len(removed)} symlink(s) for {devnode}")
@@ -10671,6 +10710,83 @@ def list_games(system_dir):
     return out
 
 
+INDEX_EXTS = (".cue", ".gdi", ".m3u", ".ccd", ".mds", ".toc")
+
+
+def _index_refs(path):
+    """Filenames (relative to the index file's folder) that a disc-index file
+    needs: .cue FILE lines, .gdi track lines, .m3u disc lists, and the fixed
+    companions of .ccd (.img/.sub) and .mds (.mdf). .chd/.iso/.zip/.7z are
+    self-contained single files and have no companions."""
+    base, ext = os.path.splitext(path)
+    ext = ext.lower()
+    d = os.path.dirname(path)
+    refs = []
+    if ext == ".ccd":
+        refs = [os.path.basename(base) + e for e in (".img", ".sub")]
+    elif ext == ".mds":
+        refs = [os.path.basename(base) + ".mdf"]
+    else:
+        try:
+            with open(path, "r", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if ext == ".cue":
+                        m = re.match(r'(?i)FILE\s+"([^"]+)"', line) or re.match(r'(?i)FILE\s+(\S+)', line)
+                        if m:
+                            refs.append(m.group(1))
+                    elif ext == ".gdi":
+                        m = re.match(r'^\d+\s+\d+\s+\d+\s+\d+\s+"([^"]+)"', line) or re.match(r'^\d+\s+\d+\s+\d+\s+\d+\s+(\S+)', line)
+                        if m:
+                            refs.append(m.group(1))
+                    elif ext == ".m3u":
+                        refs.append(line)
+        except OSError:
+            pass
+    return [r.replace("\\", "/") for r in refs if r and not r.startswith("/")]
+
+
+def game_groups(system_dir):
+    """Games as the user thinks of them: one row per game, however many files
+    it is stored in. Returns [(primary_name, [top-level member names])].
+    A .cue/.gdi/.m3u/.ccd/.mds pulls in every file it references (a .cue's
+    .bin tracks, a .gdi's tracks, every disc of an .m3u, recursively) so
+    those are copied and deleted together with it and never listed as
+    separate bogus games. A game that is its own folder is already one entry."""
+    names = list_games(system_dir)
+    present = {n.lower(): n for n in names}
+    members = {}
+    absorbed = set()
+
+    def top_of(rel):
+        first = rel.split("/")[0]
+        return present.get(first.lower())
+
+    def collect(name, seen):
+        out = {name}
+        path = os.path.join(system_dir, name)
+        if os.path.isfile(path) and name.lower().endswith(INDEX_EXTS):
+            for ref in _index_refs(path):
+                top = top_of(ref)
+                if top and top not in seen:
+                    seen.add(top)
+                    out |= collect(top, seen)
+        return out
+
+    for n in names:
+        if n.lower().endswith(INDEX_EXTS):
+            members[n] = collect(n, {n})
+            absorbed |= members[n] - {n}
+    groups = []
+    for n in names:
+        if n in absorbed:
+            continue
+        groups.append((n, sorted(members.get(n, {n}), key=str.lower)))
+    return groups
+
+
 def walk_files(path):
     """Yield (abs_path, relative_to_parent) for every regular file under path."""
     if os.path.isfile(path):
@@ -10710,7 +10826,11 @@ def build_plan(jobs, dest_root, dest_is_fat):
             except OSError:
                 continue
             dst = os.path.join(dest_root, system, rel)
-            if os.path.exists(dst):
+            # A symlink at the destination is not a real copy - typically a game
+            # the USB auto-loader linked in from the drive. It is replaced by the
+            # real file (the link itself, never the file it points at). Only a
+            # real, existing file blocks the copy.
+            if os.path.lexists(dst) and not os.path.islink(dst):
                 skipped_exist += 1
                 continue
             if dest_is_fat and size > FAT_MAX_FILE:
@@ -10785,6 +10905,8 @@ class Input:
         self.stdscr = stdscr
         self.js = []
         self.held = {}
+        self.last_js = {}
+        self.last_fire = {}
         for n in self._pads():
             try:
                 f = open(f"/dev/input/js{n}", "rb", buffering=0)
@@ -10864,14 +10986,33 @@ class Input:
                     self.held[key] = (d, now + REPEAT_RATE)
                     action = d
                     break
+        now = time.time()
+        if action:
+            self.last_js[action] = now
         if action is None and sys.stdin in ready:
             ch = self.stdscr.getch()
-            action = {
+            kb = {
                 curses.KEY_UP: "up", curses.KEY_DOWN: "down",
                 curses.KEY_LEFT: "left", curses.KEY_RIGHT: "right",
                 10: "confirm", 13: "confirm", ord(" "): "confirm",
                 27: "back", ord("q"): "back", ord("Q"): "back",
             }.get(ch)
+            # Launched from the RetroPie menu, RetroPie's joy2key daemon is
+            # running and turns every joystick press into a KEYBOARD key press
+            # on this same console - so one physical press arrives twice, once
+            # straight from the joystick above and again as a key. Confirmed
+            # live: that double-fire made every select go through twice (opening
+            # a menu AND picking its first item) and back skip a level. A key
+            # that echoes a joystick action seen moments ago is that duplicate.
+            if kb and now - max(self.last_js.values(), default=0) < 0.35:
+                kb = None
+            action = kb
+        # Same contact-bounce debounce the other menu tools use.
+        if action in ("confirm", "back"):
+            if now - self.last_fire.get(action, 0) < 0.25:
+                action = None
+            else:
+                self.last_fire[action] = now
         return action
 
 
@@ -10980,8 +11121,8 @@ def menu(scr, inp, title, rows, multi=False, subtitle="", footer=None):
                 sel.symmetric_difference_update({cur})
 
 
-def confirm_dialog(scr, inp, title, text, yes="Copy", no="Cancel", good=True):
-    choice = True
+def confirm_dialog(scr, inp, title, text, yes="Copy", no="Cancel", good=True, default=True):
+    choice = default
     while True:
         scr.erase()
         h, w = scr.getmaxyx()
@@ -11003,6 +11144,32 @@ def confirm_dialog(scr, inp, title, text, yes="Copy", no="Cancel", good=True):
             return choice
         elif a == "back":
             return False
+
+
+def remove_duplicate_links(dest_root, systems, copied_sources):
+    """After copying a game onto the Pi, drop any USB-auto-loader symlink (under
+    ANY name) that still points at the drive copy of it, so the game is not listed
+    twice - the real local copy is the one that stays."""
+    srcs = {os.path.normpath(s) for s in copied_sources}
+    for system in systems:
+        d = os.path.join(dest_root, system)
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for n in names:
+            p = os.path.join(d, n)
+            if not os.path.islink(p):
+                continue
+            try:
+                target = os.path.normpath(os.readlink(p))
+            except OSError:
+                continue
+            if target in srcs:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
 
 def progress_copy(scr, inp, to_copy, total, dest_root, systems, chown_user):
@@ -11059,51 +11226,69 @@ def progress_copy(scr, inp, to_copy, total, dest_root, systems, chown_user):
     run(["sync"])
     if chown_user:
         chown_tree_dirs(dest_root, systems, chown_user)
+        remove_duplicate_links(dest_root, systems, [x[0] for x in to_copy])
     return status, done["files"], done["bytes"], errors
 
 
 # ---------------------------------------------------------------- flow
 
-def gather_jobs(scr, inp, src_root, scope):
-    systems = [s for s in real_dirs(src_root) if list_games(os.path.join(src_root, s))]
+def gather_jobs(scr, inp, src_root, scope, action="COPY"):
+    """Returns (system, system_dir, member_name) for every FILE/FOLDER that makes up
+    the chosen games. Multi-file games are expanded to all of their members here,
+    so everything downstream (copy, delete) treats them as one unit."""
+    cache = {}
+
+    def groups(s):
+        if s not in cache:
+            cache[s] = game_groups(os.path.join(src_root, s))
+        return cache[s]
+
+    systems = [s for s in real_dirs(src_root) if groups(s)]
     if not systems:
         message(scr, inp, "NOTHING TO COPY", f"No games found under {src_root}.", good=False)
         return None
-    counts = [len(list_games(os.path.join(src_root, s))) for s in systems]
+    counts = [len(groups(s)) for s in systems]
+
+    def expand(s, selected_primaries=None):
+        out = []
+        for primary, members in groups(s):
+            if selected_primaries is None or primary in selected_primaries:
+                out.extend((s, os.path.join(src_root, s), m) for m in members)
+        return out
+
     if scope == "all":
-        return [(s, os.path.join(src_root, s), g) for s in systems for g in list_games(os.path.join(src_root, s))]
+        return [j for s in systems for j in expand(s)]
     labels = [f"{s}  ({c} game{'s' if c != 1 else ''})" for s, c in zip(systems, counts)]
     if scope == "system":
-        sel, ok = menu(scr, inp, "SELECT SYSTEMS TO COPY", labels, multi=True)
+        sel, ok = menu(scr, inp, f"SELECT SYSTEMS TO {action}", labels, multi=True)
         if not ok or not sel:
             return None
-        return [(systems[i], os.path.join(src_root, systems[i]), g) for i in sorted(sel) for g in list_games(os.path.join(src_root, systems[i]))]
-    # individual games
-    chosen = {}   # system -> set(game)
+        return [j for i in sorted(sel) for j in expand(systems[i])]
+    chosen = {}   # system -> set(primary game name)
     while True:
         rows = [f"{s}  ({len(chosen.get(s, ()))} selected / {c})" for s, c in zip(systems, counts)]
-        rows.append(">> REVIEW AND COPY <<")
+        rows.append(f">> REVIEW AND {action} <<")
         idx = menu(scr, inp, "PICK A SYSTEM, THEN ITS GAMES", rows, subtitle="Circle on this list = cancel")
         if idx is None:
             return None
         if idx == len(systems):
-            jobs = [(s, os.path.join(src_root, s), g) for s in systems for g in sorted(chosen.get(s, ()))]
+            jobs = [j for s in systems for j in expand(s, chosen.get(s, set()))]
             if jobs:
                 return jobs
             message(scr, inp, "NOTHING SELECTED", "Pick at least one game first.", good=False)
             continue
         s = systems[idx]
-        games = list_games(os.path.join(src_root, s))
+        gl = groups(s)
         labels2 = []
-        for g in games:
-            sz = entry_size(os.path.join(src_root, s, g))
-            labels2.append(f"{g}  [{human(sz)}]")
+        for primary, members in gl:
+            sz = sum(entry_size(os.path.join(src_root, s, m)) for m in members)
+            extra = f" +{len(members) - 1} file(s)" if len(members) > 1 else ""
+            labels2.append(f"{primary}{extra}  [{human(sz)}]")
         sel, _ = menu(scr, inp, f"{s.upper()} - SELECT GAMES", labels2, multi=True)
-        # Circle (back) keeps whatever was toggled, same as DONE
-        chosen[s] = {games[i] for i in sel}
+        chosen[s] = {gl[i][0] for i in sel}
 
 
-def flow(scr):
+def setup_screen(scr):
     curses.curs_set(0)
     curses.start_color()
     curses.use_default_colors()
@@ -11115,97 +11300,130 @@ def flow(scr):
     curses.init_pair(COL_HINT, curses.COLOR_MAGENTA, -1)
     scr.nodelay(True)
     scr.keypad(True)
-    inp = Input(scr)
-    mounted_here = None
+    return Input(scr)
+
+
+def probe_drives():
+    """Every secondary (non-system) drive, mounted, with whether it is set up
+    with the RetroPie roms/<system> folder structure. 'ready' means a roms
+    folder containing at least one system folder."""
+    drives = find_drives()
+    for d in drives:
+        mp, we = mount_drive(d)
+        d["mp"], d["we"] = mp, we
+        d["roms"] = usb_roms_dir(mp) if mp else None
+        d["ready"] = bool(d["roms"]) and bool(real_dirs(d["roms"]))
+    return drives
+
+
+def release_drives(drives):
+    for d in drives:
+        if d.get("we") and d.get("mp") and os.path.ismount(d["mp"]):
+            unmount_drive(d["mp"])
+        d["we"] = False
+
+
+def drive_label(d):
+    state = "ROM folders found" if d["ready"] else "no ROM folder structure"
+    if not d.get("mp"):
+        state = "could not mount"
+    return f"{d['dev']}  {d['label'] or '(no label)'}  {d['size']}  {d['fstype']}  [{state}]"
+
+
+def flow(scr):
+    inp = setup_screen(scr)
+    drives = []
     try:
         while True:
-            drives = find_drives()
+            release_drives(drives)
+            drives = probe_drives()
             if not drives:
-                message(scr, inp, "NO USB DRIVE", "No USB drive with a filesystem was found. Plug one in and open this tool again.", good=False)
+                message(scr, inp, "NO USB DRIVE", "No secondary storage device was found. Plug a USB drive in and open this tool again.", good=False)
                 return
             if len(drives) == 1:
                 drive = drives[0]
             else:
-                rows = [f"{d['dev']}  {d['label'] or '(no label)'}  {d['size']}  {d['fstype']}" for d in drives]
-                i = menu(scr, inp, "WHICH USB DRIVE?", rows)
+                i = menu(scr, inp, "WHICH USB DRIVE?", [drive_label(x) for x in drives])
                 if i is None:
                     return
                 drive = drives[i]
+            if not drive.get("mp"):
+                message(scr, inp, "MOUNT FAILED", f"Could not mount {drive['dev']} - see {LOG_PATH}", good=False)
+                continue
+            mp = drive["mp"]
 
             d = menu(scr, inp, "TRANSFER GAMES  (always a copy - nothing is ever moved or deleted)",
-                     ["USB drive  ->  this Pi", "This Pi  ->  USB drive"], subtitle=f"Drive: {drive['label'] or drive['dev']} ({drive['size']}, {drive['fstype']})")
+                     ["USB drive  ->  this Pi", "This Pi  ->  USB drive"],
+                     subtitle=f"Drive: {drive['label'] or drive['dev']} ({drive['size']}, {drive['fstype']})  [{'ROM folders found' if drive['ready'] else 'no ROM folder structure'}]")
             if d is None:
                 return
+            if d == 0 and not drive["ready"]:
+                message(scr, inp, "DRIVE NOT SET UP",
+                        "This drive does not have the RetroPie ROM folder structure (a roms folder with a folder per system), so there is nothing to copy from. Plug it in with the USB auto-loader active to set it up, or copy games onto it first.",
+                        good=False)
+                continue
+            if d == 1 and not drive["ready"]:
+                if not confirm_dialog(scr, inp, "SET UP THIS DRIVE?",
+                                      "This drive has no RetroPie ROM folder structure. Create a roms folder on it and copy into that? Nothing already on the drive is touched.",
+                                      yes="Set up and continue", no="Cancel"):
+                    continue
             s = menu(scr, inp, "WHAT TO COPY?", ["Individual games", "Entire systems (pick which)", "Everything - all games, all systems"])
             if s is None:
                 continue
             scope = ("individual", "system", "all")[s]
 
-            mp, we_mounted = mount_drive(drive)
-            if not mp:
-                message(scr, inp, "MOUNT FAILED", f"Could not mount {drive['dev']} - see {LOG_PATH}", good=False)
+            usb_roms = drive["roms"] or usb_roms_dir(mp, create=(d == 1))
+            if d == 0:
+                src_root, dest_root = usb_roms, PI_ROMS
+            else:
+                src_root, dest_root = PI_ROMS, usb_roms
+
+            jobs = gather_jobs(scr, inp, src_root, scope)
+            if not jobs:
                 continue
-            if we_mounted:
-                mounted_here = mp
-            try:
-                usb_roms = usb_roms_dir(mp, create=(d == 1))
-                if d == 0:
-                    if not usb_roms:
-                        message(scr, inp, "NO ROMS FOLDER", "This drive has no roms folder to copy from.", good=False)
-                        continue
-                    src_root, dest_root = usb_roms, PI_ROMS
-                else:
-                    src_root, dest_root = PI_ROMS, usb_roms
+            dest_is_fat = fs_type_of(nearest_existing(dest_root)) in ("vfat", "msdos", "fat", "exfat")
+            to_copy, skipped_exist, skipped_big = build_plan(jobs, dest_root, dest_is_fat)
+            total = sum(x[2] for x in to_copy)
+            need = space_needed(to_copy, dest_is_fat)
+            free = shutil.disk_usage(nearest_existing(dest_root)).free
+            systems = sorted({j[0] for j in jobs})
+            dest_name = "this Pi" if d == 0 else "the USB drive"
 
-                jobs = gather_jobs(scr, inp, src_root, scope)
-                if not jobs:
-                    continue
-                dest_is_fat = fs_type_of(nearest_existing(dest_root)) in ("vfat", "msdos", "fat", "exfat")
-                to_copy, skipped_exist, skipped_big = build_plan(jobs, dest_root, dest_is_fat)
-                total = sum(x[2] for x in to_copy)
-                need = space_needed(to_copy, dest_is_fat)
-                free = shutil.disk_usage(nearest_existing(dest_root)).free
-                systems = sorted({j[0] for j in jobs})
-                dest_name = "this Pi" if d == 0 else "the USB drive"
-
-                notes = []
-                if skipped_exist:
-                    notes.append(f"{skipped_exist} file(s) already exist at the destination and will be left untouched.")
-                if skipped_big:
-                    notes.append(f"{len(skipped_big)} file(s) over 4 GB can't be stored on a FAT drive and will be skipped.")
-                if not to_copy:
-                    message(scr, inp, "NOTHING TO COPY", "Everything selected is already at the destination." + (" " + " ".join(notes) if notes else ""), good=False)
-                    continue
-                if need > free:
-                    message(scr, inp, "NOT ENOUGH SPACE",
-                            f"Copying needs about {human(need)} but {dest_name} only has {human(free)} free.\nNothing was copied. Free up space or pick fewer games.",
-                            good=False)
-                    continue
-                txt = (f"Copy {len(to_copy)} file(s), {human(total)}, to {dest_name}?\n"
-                       f"Free space there: {human(free)} (needs about {human(need)}).\n"
-                       "This is a COPY - the originals stay where they are.")
-                if notes:
-                    txt += "\n" + " ".join(notes)
-                if not confirm_dialog(scr, inp, "READY TO COPY", txt):
-                    continue
-                status, nfiles, nbytes, errors = progress_copy(
-                    scr, inp, to_copy, total, dest_root, systems, PI_USER if d == 0 else None)
-                log(f"transfer {status}: {nfiles} files {nbytes} bytes, {len(errors)} errors")
-                if status == "removed":
-                    message(scr, inp, "DRIVE DISCONNECTED", f"The drive was removed mid-copy after {nfiles} file(s).", good=False)
-                    return
-                head = {"ok": "COPY COMPLETE", "cancelled": "COPY CANCELLED"}[status] if status in ("ok", "cancelled") else "DONE"
-                body = f"Copied {nfiles} file(s), {human(nbytes)}. Nothing was moved or deleted at the source."
-                if errors:
-                    body += f"\n{len(errors)} file(s) failed (first: {errors[0]})"
-                message(scr, inp, head, body, good=(status == "ok" and not errors))
-                if d == 0 and status != "cancelled":
-                    message(scr, inp, "TIP", "New games appear in EmulationStation after it restarts (Start > Quit > Restart, or reboot).")
-            finally:
-                if mounted_here and os.path.ismount(mounted_here):
-                    unmount_drive(mounted_here)
-                    mounted_here = None
+            notes = []
+            if skipped_exist:
+                notes.append(f"{skipped_exist} file(s) already exist at the destination and will be left untouched.")
+            if skipped_big:
+                notes.append(f"{len(skipped_big)} file(s) over 4 GB can't be stored on a FAT drive and will be skipped.")
+            if not to_copy:
+                message(scr, inp, "NOTHING TO COPY", "Everything selected is already at the destination." + (" " + " ".join(notes) if notes else ""), good=False)
+                continue
+            if need > free:
+                message(scr, inp, "NOT ENOUGH SPACE",
+                        f"Copying needs about {human(need)} but {dest_name} only has {human(free)} free.\nNothing was copied. Free up space or pick fewer games.",
+                        good=False)
+                continue
+            txt = (f"Copy {len(to_copy)} file(s), {human(total)}, to {dest_name}?\n"
+                   f"Free space there: {human(free)} (needs about {human(need)}).\n"
+                   "This is a COPY - the originals stay where they are.")
+            if notes:
+                txt += "\n" + " ".join(notes)
+            if not confirm_dialog(scr, inp, "READY TO COPY", txt):
+                continue
+            status, nfiles, nbytes, errors = progress_copy(
+                scr, inp, to_copy, total, dest_root, systems, PI_USER if d == 0 else None)
+            log(f"transfer {status}: {nfiles} files {nbytes} bytes, {len(errors)} errors")
+            if status == "removed":
+                message(scr, inp, "DRIVE DISCONNECTED", f"The drive was removed mid-copy after {nfiles} file(s).", good=False)
+                return
+            head = "COPY COMPLETE" if status == "ok" else "COPY CANCELLED"
+            body = f"Copied {nfiles} file(s), {human(nbytes)}. Nothing was moved or deleted at the source."
+            if errors:
+                body += f"\n{len(errors)} file(s) failed (first: {errors[0]})"
+            message(scr, inp, head, body, good=(status == "ok" and not errors))
+            if d == 0 and status != "cancelled":
+                message(scr, inp, "TIP", "New games appear in EmulationStation after it restarts (Start > Quit > Restart, or reboot).")
     finally:
+        release_drives(drives)
         inp.close()
 
 
@@ -11246,6 +11464,209 @@ indent = text[line_start:idx]
 block = f"{indent}transfergames.rp)\n{indent}    python3 {pi_home}/scripts/transfer-games.py\n{indent}    ;;\n"
 open(path, "w").write(text[:insert_point] + block + text[insert_point:])
 print("[transfergames] wired into retropiemenu.sh")
+PYEOF
+    fi
+    return 0
+}
+
+phase_manage_games_tool() {
+    mkdir -p "$PI_HOME/scripts"
+    # Imports transfer-games.py (same directory) for the shared UI/drive code,
+    # so phase_transfer_games_tool must have run - it does, just before this.
+    tee "$PI_HOME/scripts/manage-games.py" >/dev/null <<'MGEOF'
+#!/usr/bin/env python3
+"""
+Manage games: delete chosen games from a storage target. Run from the
+RetroPie menu ("Manage Games") or directly:
+    sudo python3 manage-games.py
+
+Target: if a secondary storage device (USB drive) is connected AND is set up
+with the RetroPie roms/<system> folder structure, you are asked whether to
+manage the Pi's onboard storage or that drive. If there is no such device,
+the onboard storage is used automatically.
+
+Pick individual games, whole systems (all their games), or every game on the
+target. Deletion is PERMANENT, so it always shows what will be removed and
+needs a second, deliberate confirmation (the default choice is always
+"Cancel"). Only game entries inside a roms/<system> folder are touched -
+never the system folders themselves, saves, BIOS files, or anything outside
+the target's roms folder.
+"""
+import importlib.util
+import os
+import shutil
+import sys
+import time
+import curses
+
+_here = os.path.dirname(os.path.abspath(__file__))
+_spec = importlib.util.spec_from_file_location("transfer_games", os.path.join(_here, "transfer-games.py"))
+tg = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(tg)
+
+LOG_PATH = "/tmp/managegames.log"
+
+
+def log(msg):
+    try:
+        with open(LOG_PATH, "a") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    except OSError:
+        pass
+
+
+def inside(root, path):
+    root = os.path.realpath(root)
+    parent = os.path.realpath(os.path.dirname(path))
+    return parent == root or parent.startswith(root + os.sep)
+
+
+def delete_entries(jobs, roms_root, on_progress):
+    """jobs: (system, system_dir, game). Returns (deleted_count, freed_bytes, errors, status)."""
+    deleted, freed, errors = 0, 0, []
+    for system, sdir, game in jobs:
+        path = os.path.join(sdir, game)
+        on_progress(f"{system}/{game}")
+        # Hard safety rails: a regular entry directly inside <roms_root>/<system>.
+        if os.path.islink(path) or not inside(os.path.join(roms_root, system), path):
+            errors.append(f"{game}: refused (not a plain game entry)")
+            continue
+        try:
+            size = tg.entry_size(path)
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+            deleted += 1
+            freed += size
+        except OSError as e:
+            if not os.path.exists(roms_root):
+                errors.append(f"{game}: storage disconnected ({e})")
+                return deleted, freed, errors, "removed"
+            errors.append(f"{game}: {e}")
+    tg.run(["sync"])
+    return deleted, freed, errors, "ok"
+
+
+def flow(scr):
+    inp = tg.setup_screen(scr)
+    drives = []
+    try:
+        drives = tg.probe_drives()
+        ready = [d for d in drives if d["ready"]]
+        targets = [("This Pi (onboard storage)", tg.PI_ROMS, None)]
+        for d in ready:
+            targets.append((f"USB: {d['label'] or d['dev']}  {d['size']}  {d['fstype']}", d["roms"], d))
+        if len(targets) == 1:
+            sub = ""
+            if drives:
+                sub = "A USB drive is connected but has no ROM folder structure, so it isn't offered."
+            else:
+                sub = "No secondary storage device found - using the Pi's onboard storage."
+            tg.message(scr, inp, "MANAGE GAMES", sub + "\nTarget: this Pi (onboard storage).")
+            choice = 0
+        else:
+            choice = tg.menu(scr, inp, "MANAGE GAMES - WHICH STORAGE?", [t[0] for t in targets])
+            if choice is None:
+                return
+        name, roms_root, _drv = targets[choice]
+        if not os.path.isdir(roms_root):
+            tg.message(scr, inp, "NO ROMS FOLDER", f"{roms_root} does not exist.", good=False)
+            return
+
+        while True:
+            s = tg.menu(scr, inp, f"DELETE GAMES FROM: {name}",
+                        ["Individual games", "Entire systems (pick which)", "Everything - every game, every system"],
+                        subtitle="Deleting is permanent. Circle: back / quit")
+            if s is None:
+                return
+            scope = ("individual", "system", "all")[s]
+            jobs = tg.gather_jobs(scr, inp, roms_root, scope, "DELETE")
+            if not jobs:
+                continue
+            total = 0
+            nfiles = 0
+            for system, sdir, game in jobs:
+                for fp, _ in tg.walk_files(os.path.join(sdir, game)):
+                    nfiles += 1
+                    try:
+                        total += os.path.getsize(fp)
+                    except OSError:
+                        pass
+            systems = sorted({j[0] for j in jobs})
+            txt = (f"Permanently delete {len(jobs)} game(s) ({nfiles} file(s), {tg.human(total)}) "
+                   f"from {name}?\nSystems: {', '.join(systems[:8])}{'...' if len(systems) > 8 else ''}\n"
+                   "This CANNOT be undone.")
+            if not tg.confirm_dialog(scr, inp, "DELETE GAMES?", txt, yes="Delete", no="Cancel", good=False, default=False):
+                continue
+            if not tg.confirm_dialog(scr, inp, "ARE YOU SURE?",
+                                     f"Last chance: {len(jobs)} game(s), {tg.human(total)}, will be erased from {name} for good.",
+                                     yes="YES, DELETE", no="No, keep them", good=False, default=False):
+                continue
+
+            state = {"n": 0}
+
+            def prog(label, _total=len(jobs)):
+                state["n"] += 1
+                scr.erase()
+                h, w = scr.getmaxyx()
+                tg.center(scr, 1, "DELETING...", curses.color_pair(tg.COL_BAD) | curses.A_BOLD)
+                tg.center(scr, 4, f"{state['n']} of {_total}", curses.color_pair(tg.COL_TEXT))
+                tg.center(scr, 6, label[-(w - 6):], curses.color_pair(tg.COL_HINT))
+                scr.refresh()
+
+            deleted, freed, errors, status = delete_entries(jobs, roms_root, prog)
+            log(f"delete {status}: {deleted} entries, {freed} bytes, {len(errors)} errors on {name}")
+            if status == "removed":
+                tg.message(scr, inp, "STORAGE DISCONNECTED", f"The drive was removed during deletion after {deleted} game(s).", good=False)
+                return
+            body = f"Deleted {deleted} game(s), freed {tg.human(freed)}."
+            if errors:
+                body += f"\n{len(errors)} could not be deleted (first: {errors[0]})"
+            tg.message(scr, inp, "DELETE COMPLETE", body, good=not errors)
+            if deleted:
+                tg.message(scr, inp, "TIP", "EmulationStation updates its game lists after it restarts (Start > Quit > Restart, or reboot).")
+    finally:
+        tg.release_drives(drives)
+        inp.close()
+
+
+def main():
+    if os.geteuid() != 0:
+        os.execvp("sudo", ["sudo", sys.executable] + sys.argv)
+    curses.wrapper(flow)
+
+
+if __name__ == "__main__":
+    main()
+MGEOF
+    chmod +x "$PI_HOME/scripts/manage-games.py"
+    chown "$PI_USER:$PI_USER" "$PI_HOME/scripts/manage-games.py"
+
+    touch "$PI_HOME/RetroPie/retropiemenu/managegames.rp"
+
+    local menu_script="$PI_HOME/RetroPie-Setup/scriptmodules/supplementary/retropiemenu.sh"
+    if [ -f "$menu_script" ] && ! grep -q "managegames.rp)" "$menu_script"; then
+        sudo cp "$menu_script" "${menu_script}.bak.$(date +%s)"
+        sudo python3 - "$menu_script" "$PI_HOME" <<'PYEOF'
+import sys
+path, pi_home = sys.argv[1], sys.argv[2]
+text = open(path).read()
+anchor = "filemanager.rp)"
+idx = text.find(anchor)
+if idx == -1:
+    print("[managegames] anchor 'filemanager.rp)' not found in retropiemenu.sh; skipping menu wiring")
+    sys.exit(0)
+case_end = text.find(";;", idx)
+if case_end == -1:
+    print("[managegames] could not find end of filemanager.rp) case; skipping menu wiring")
+    sys.exit(0)
+insert_point = text.find("\n", case_end) + 1
+line_start = text.rfind("\n", 0, idx) + 1
+indent = text[line_start:idx]
+block = f"{indent}managegames.rp)\n{indent}    python3 {pi_home}/scripts/manage-games.py\n{indent}    ;;\n"
+open(path, "w").write(text[:insert_point] + block + text[insert_point:])
+print("[managegames] wired into retropiemenu.sh")
 PYEOF
     fi
     return 0
@@ -11348,6 +11769,7 @@ main() {
         bezel_project_install
         usb_rom_autoloader
         transfer_games_tool
+        manage_games_tool
         finalize
     )
 
