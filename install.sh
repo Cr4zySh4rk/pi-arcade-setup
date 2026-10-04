@@ -4403,7 +4403,7 @@ PROFEOF
 phase_custom_retropie_system() {
     mkdir -p "$PI_HOME/ES-DE/custom_systems" "$PI_HOME/ES-DE/gamelists/retropie"
 
-    local keep=(showip.rp avsettings.rp wifigate.rp ftpsettings.rp retroarch.rp assignports.rp)
+    local keep=(showip.rp avsettings.rp wifigate.rp ftpsettings.rp retroarch.rp assignports.rp transfergames.rp)
     [ "$ENABLE_BT_SPEAKER" = "true" ] && keep+=(btpair.rp btaudio.rp)
     [ "$ENABLE_MUSIC_PLAYER" = "true" ] && keep+=(musicplayer.rp)
     [ "$ENABLE_LED_STRIP" = "true" ] && keep+=(ledconfig.rp)
@@ -4532,6 +4532,12 @@ LEDCFG
 		<name>Assign P1/P2 Controller</name>
 		<desc>Pin which physical controller drives Player 1, Player 2, etc. by name, so it stays correct even after a Bluetooth pad reconnects on a different port. Flashes each controller green in the list when it sends input, so you can tell them apart.</desc>
 		<image>$icon_dir/configedit.png</image>
+	</game>
+	<game>
+		<path>./transfergames.rp</path>
+		<name>Transfer games</name>
+		<desc>Copy games between a USB drive and this Pi - individual games, whole systems, or everything. Always a copy, never a move, and checks the destination has enough free space first.</desc>
+		<image>$icon_dir/filemanager.png</image>
 	</game>
 $( [ "$ENABLE_BEZEL_PROJECT" = "true" ] && cat <<BEZELPROJECT
 	<game>
@@ -10454,6 +10460,797 @@ EOF
     return 0
 }
 
+phase_transfer_games_tool() {
+    mkdir -p "$PI_HOME/scripts"
+    # Quoted heredoc + placeholder substitution below, rather than an unquoted
+    # heredoc, so nothing inside the Python (regexes, f-strings, backticks)
+    # can be misinterpreted by bash.
+    tee "$PI_HOME/scripts/transfer-games.py" >/dev/null <<'TGEOF'
+#!/usr/bin/env python3
+"""
+Transfer games between this Pi and a USB drive. Run from the RetroPie menu
+("Transfer games") or directly (as root, for mounting):
+    sudo python3 transfer-games.py
+
+ALWAYS a copy, never a move - nothing is ever deleted from the source, and
+nothing already present at the destination is ever overwritten. Before any
+copying starts, the destination's free space is checked against the exact
+size of what's about to be copied; if it won't fit, nothing is copied.
+
+Pick a direction (USB -> Pi or Pi -> USB), then a scope: individual games,
+whole systems, or every system at once. Fully navigable by controller or
+keyboard: up/down to move, X/Cross/A (or Enter/Space) to select, Circle/B
+(or Esc) to go back / cancel a running copy.
+"""
+import curses
+import os
+import re
+import select
+import shutil
+import struct
+import subprocess
+import sys
+import time
+
+JS_EVENT_BUTTON = 0x01
+JS_EVENT_AXIS = 0x02
+JS_EVENT_INIT = 0x80
+EVENT_FORMAT = "IhBB"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+AXIS_THRESHOLD = 16000
+BTN_CONFIRM = @BTN_X@
+BTN_BACK = @BTN_CIRCLE@
+
+PI_HOME = "@PI_HOME@"
+PI_USER = "@PI_USER@"
+PI_ROMS = f"{PI_HOME}/RetroPie/roms"
+MEDIA_ROOT = "/media"
+LOG_PATH = "/tmp/transfergames.log"
+
+SKIP_NAMES = {"gamelist.xml", "media", "downloaded_media", ".DS_Store", "lost+found", "System Volume Information"}
+FAT_MAX_FILE = 4 * 1024 ** 3 - 1
+CHUNK = 1024 * 1024
+REPEAT_DELAY = 0.40
+REPEAT_RATE = 0.10
+
+COL_TITLE, COL_TEXT, COL_SEL, COL_GOOD, COL_BAD, COL_HINT = 1, 2, 3, 4, 5, 6
+
+
+def log(msg):
+    try:
+        with open(LOG_PATH, "a") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    except OSError:
+        try:
+            os.remove(LOG_PATH)
+            with open(LOG_PATH, "a") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+        except OSError:
+            pass
+
+
+def human(n):
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+# ---------------------------------------------------------------- drives
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def parent_disk(dev):
+    m = re.match(r'^(/dev/(?:sd[a-z]+|hd[a-z]+|vd[a-z]+))\d+$', dev)
+    if m:
+        return m.group(1)
+    m = re.match(r'^(/dev/(?:mmcblk\d+|nvme\d+n\d+))p\d+$', dev)
+    return m.group(1) if m else dev
+
+
+def root_disk():
+    src = run(["findmnt", "-no", "SOURCE", "/"]).stdout.strip()
+    return parent_disk(src) if src else None
+
+
+def find_drives():
+    """Partitions with a filesystem on any disk other than the one backing /."""
+    out = run(["lsblk", "-nrpo", "NAME,TYPE,FSTYPE,SIZE,LABEL,MOUNTPOINT"]).stdout
+    rd = root_disk()
+    drives = []
+    for line in out.splitlines():
+        parts = line.split(None, 5)
+        if len(parts) < 4:
+            continue
+        name, typ, fstype, size = parts[0], parts[1], parts[2], parts[3]
+        if typ != "part" or not fstype or fstype in ("swap", "crypto_LUKS"):
+            continue
+        if parent_disk(name) == rd:
+            continue
+        rest = parts[4] if len(parts) > 4 else ""
+        label, mnt = "", ""
+        if len(parts) == 6:
+            label, mnt = parts[4], parts[5]
+        elif rest.startswith("/"):
+            mnt = rest
+        else:
+            label = rest
+        drives.append({"dev": name, "fstype": fstype, "size": size, "label": label, "mount": mnt})
+    return drives
+
+
+def mount_drive(drive):
+    """Returns (mountpoint, we_mounted_it) or (None, False)."""
+    if drive["mount"]:
+        return drive["mount"], False
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', os.path.basename(drive["dev"])) or "usb"
+    mp = f"{MEDIA_ROOT}/usbrom-{safe}"
+    os.makedirs(mp, exist_ok=True)
+    if os.path.ismount(mp):
+        return mp, False
+    if drive["fstype"] in ("vfat", "exfat", "ntfs"):
+        opts = f"uid={PI_USER},gid={PI_USER},umask=000"
+        cmd = ["mount", "-o", opts, drive["dev"], mp]
+    else:
+        cmd = ["mount", drive["dev"], mp]
+    r = run(cmd)
+    if r.returncode != 0:
+        log(f"mount failed: {r.stderr.strip()}")
+        try:
+            os.rmdir(mp)
+        except OSError:
+            pass
+        return None, False
+    return mp, True
+
+
+def unmount_drive(mp):
+    run(["sync"])
+    run(["umount", mp])
+    try:
+        os.rmdir(mp)
+    except OSError:
+        pass
+
+
+def usb_roms_dir(mp, create=False):
+    for name in ("roms", "ROMS", "Roms"):
+        p = os.path.join(mp, name)
+        if os.path.isdir(p):
+            return p
+    if create:
+        p = os.path.join(mp, "roms")
+        os.makedirs(p, exist_ok=True)
+        return p
+    return None
+
+
+def fs_type_of(path):
+    r = run(["findmnt", "-no", "FSTYPE", "-T", path])
+    return r.stdout.strip()
+
+
+# ------------------------------------------------------------ scanning
+
+def real_dirs(root):
+    """System folders directly under root, skipping symlinks (e.g. genesis -> megadrive)."""
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return []
+    out = []
+    for n in names:
+        p = os.path.join(root, n)
+        if n.startswith(".") or n in SKIP_NAMES:
+            continue
+        if os.path.isdir(p) and not os.path.islink(p):
+            out.append(n)
+    return out
+
+
+def list_games(system_dir):
+    """Top-level entries (a file, or a folder for multi-file games). Symlinks are
+    skipped: they're either USB games linked in by the USB loader or aliases,
+    and copying them would duplicate or loop."""
+    try:
+        names = sorted(os.listdir(system_dir), key=str.lower)
+    except OSError:
+        return []
+    out = []
+    for n in names:
+        if n.startswith(".") or n in SKIP_NAMES:
+            continue
+        p = os.path.join(system_dir, n)
+        if os.path.islink(p):
+            continue
+        if os.path.isfile(p) or os.path.isdir(p):
+            out.append(n)
+    return out
+
+
+def walk_files(path):
+    """Yield (abs_path, relative_to_parent) for every regular file under path."""
+    if os.path.isfile(path):
+        yield path, os.path.basename(path)
+        return
+    base = os.path.dirname(path)
+    for dp, dns, fns in os.walk(path):
+        dns[:] = [d for d in dns if not os.path.islink(os.path.join(dp, d))]
+        for fn in fns:
+            fp = os.path.join(dp, fn)
+            if os.path.islink(fp):
+                continue
+            yield fp, os.path.relpath(fp, base)
+
+
+def entry_size(path):
+    total = 0
+    for fp, _ in walk_files(path):
+        try:
+            total += os.path.getsize(fp)
+        except OSError:
+            pass
+    return total
+
+
+def build_plan(jobs, dest_root, dest_is_fat):
+    """jobs: list of (system, src_system_dir, game_name). Returns the files to
+    copy and what is skipped. Existing destination files are NEVER overwritten."""
+    to_copy = []      # (src, dst, size)
+    skipped_exist = 0
+    skipped_big = []
+    for system, src_dir, game in jobs:
+        src_entry = os.path.join(src_dir, game)
+        for fp, rel in walk_files(src_entry):
+            try:
+                size = os.path.getsize(fp)
+            except OSError:
+                continue
+            dst = os.path.join(dest_root, system, rel)
+            if os.path.exists(dst):
+                skipped_exist += 1
+                continue
+            if dest_is_fat and size > FAT_MAX_FILE:
+                skipped_big.append(rel)
+                continue
+            to_copy.append((fp, dst, size))
+    return to_copy, skipped_exist, skipped_big
+
+
+def nearest_existing(path):
+    while path and not os.path.exists(path):
+        path = os.path.dirname(path)
+    return path or "/"
+
+
+def space_needed(to_copy, dest_is_fat):
+    per_file = 32768 if dest_is_fat else 4096
+    data = sum(((s + per_file - 1) // per_file) * per_file for _, _, s in to_copy)
+    return data + data // 100 + 8 * 1024 * 1024 if to_copy else 0
+
+
+class Cancelled(Exception):
+    pass
+
+
+def copy_one(src, dst, on_bytes, check_cancel, chown_to=None):
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    tmp = dst + ".part"
+    try:
+        with open(src, "rb") as fi, open(tmp, "wb") as fo:
+            while True:
+                buf = fi.read(CHUNK)
+                if not buf:
+                    break
+                fo.write(buf)
+                on_bytes(len(buf))
+                check_cancel()
+            fo.flush()
+            os.fsync(fo.fileno())
+        os.replace(tmp, dst)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    try:
+        shutil.copystat(src, dst)
+    except OSError:
+        pass
+    if chown_to:
+        try:
+            shutil.chown(dst, user=chown_to, group=chown_to)
+        except (OSError, LookupError):
+            pass
+
+
+def chown_tree_dirs(dest_root, systems, user):
+    for s in systems:
+        d = os.path.join(dest_root, s)
+        for dp, dns, fns in os.walk(d):
+            try:
+                shutil.chown(dp, user=user, group=user)
+            except (OSError, LookupError):
+                pass
+
+
+# ----------------------------------------------------------------- input
+
+class Input:
+    def __init__(self, stdscr):
+        self.stdscr = stdscr
+        self.js = []
+        self.held = {}
+        for n in self._pads():
+            try:
+                f = open(f"/dev/input/js{n}", "rb", buffering=0)
+                os.set_blocking(f.fileno(), False)
+                self.js.append(f)
+            except OSError:
+                pass
+        log(f"input: opened {len(self.js)} joystick(s)")
+
+    @staticmethod
+    def _pads():
+        try:
+            text = open("/proc/bus/input/devices").read()
+        except OSError:
+            return []
+        out = []
+        for block in text.split("\n\n"):
+            nm = re.search(r'^N: Name="(.*)"$', block, re.M)
+            hd = re.search(r'^H: Handlers=(.*)$', block, re.M)
+            if not nm or not hd:
+                continue
+            if any(s in nm.group(1) for s in ("Motion Sensors", "Touchpad", "Keyboard", "Mouse", "Consumer Control")):
+                continue
+            m = re.search(r'\bjs(\d+)\b', hd.group(1))
+            if m:
+                out.append(int(m.group(1)))
+        return out
+
+    def close(self):
+        for f in self.js:
+            try:
+                f.close()
+            except OSError:
+                pass
+
+    def poll(self, timeout=0.15):
+        """Returns one of up/down/left/right/confirm/back/None."""
+        fds = [sys.stdin] + self.js
+        try:
+            ready, _, _ = select.select(fds, [], [], timeout)
+        except (OSError, ValueError):
+            ready = []
+        action = None
+        for f in self.js:
+            if f not in ready:
+                continue
+            try:
+                data = os.read(f.fileno(), EVENT_SIZE)
+            except OSError:
+                continue
+            if not data or len(data) != EVENT_SIZE:
+                continue
+            _t, value, typ, number = struct.unpack(EVENT_FORMAT, data)
+            if typ & JS_EVENT_INIT:
+                continue
+            if typ == JS_EVENT_BUTTON and value == 1:
+                if number == BTN_CONFIRM:
+                    action = "confirm"
+                elif number == BTN_BACK:
+                    action = "back"
+            elif typ == JS_EVENT_AXIS and number in (0, 1, 6, 7):
+                key = (f, number)
+                if abs(value) > AXIS_THRESHOLD:
+                    if key not in self.held:
+                        if number in (0, 6):
+                            d = "right" if value > 0 else "left"
+                        else:
+                            d = "down" if value > 0 else "up"
+                        self.held[key] = (d, time.time() + REPEAT_DELAY)
+                        action = d
+                else:
+                    self.held.pop(key, None)
+        if action is None:
+            now = time.time()
+            for key, (d, due) in list(self.held.items()):
+                if now >= due:
+                    self.held[key] = (d, now + REPEAT_RATE)
+                    action = d
+                    break
+        if action is None and sys.stdin in ready:
+            ch = self.stdscr.getch()
+            action = {
+                curses.KEY_UP: "up", curses.KEY_DOWN: "down",
+                curses.KEY_LEFT: "left", curses.KEY_RIGHT: "right",
+                10: "confirm", 13: "confirm", ord(" "): "confirm",
+                27: "back", ord("q"): "back", ord("Q"): "back",
+            }.get(ch)
+        return action
+
+
+# -------------------------------------------------------------------- UI
+
+def put(win, y, x, text, attr=0):
+    h, w = win.getmaxyx()
+    if 0 <= y < h and x < w:
+        try:
+            win.addstr(y, max(0, x), text[: max(0, w - x - 1)], attr)
+        except curses.error:
+            pass
+
+
+def center(win, y, text, attr=0):
+    _, w = win.getmaxyx()
+    put(win, y, max(0, (w - len(text)) // 2), text, attr)
+
+
+def wrap(text, width):
+    lines = []
+    for para in text.split("\n"):
+        cur = ""
+        for word in para.split(" "):
+            if cur and len(cur) + len(word) + 1 > width:
+                lines.append(cur)
+                cur = word
+            else:
+                cur = f"{cur} {word}".strip()
+        lines.append(cur)
+    return lines
+
+
+def message(scr, inp, title, text, good=True):
+    while True:
+        scr.erase()
+        h, w = scr.getmaxyx()
+        center(scr, 1, title, curses.color_pair(COL_GOOD if good else COL_BAD) | curses.A_BOLD)
+        for i, line in enumerate(wrap(text, min(w - 6, 74))):
+            center(scr, 3 + i, line, curses.color_pair(COL_TEXT))
+        center(scr, h - 2, "X: OK", curses.color_pair(COL_HINT))
+        scr.refresh()
+        if inp.poll() in ("confirm", "back"):
+            return
+
+
+def menu(scr, inp, title, rows, multi=False, subtitle="", footer=None):
+    """rows: list of strings. Single: returns index or None (back).
+    Multi: rows are toggles; returns (set_of_indexes, confirmed_bool) - the last
+    two virtual rows are 'Select all/none' and 'DONE'."""
+    sel = set()
+    cur = 0
+    top = 0
+    extra = ["[ Select all / none ]", "[ DONE ]"] if multi else []
+    allrows = rows + extra
+    while True:
+        scr.erase()
+        h, w = scr.getmaxyx()
+        center(scr, 0, title, curses.color_pair(COL_TITLE) | curses.A_BOLD)
+        if subtitle:
+            center(scr, 1, subtitle, curses.color_pair(COL_HINT))
+        vis = max(3, h - 5)
+        if cur < top:
+            top = cur
+        if cur >= top + vis:
+            top = cur - vis + 1
+        for i in range(top, min(len(allrows), top + vis)):
+            is_extra = multi and i >= len(rows)
+            mark = ""
+            if multi and not is_extra:
+                mark = "[x] " if i in sel else "[ ] "
+            text = mark + allrows[i]
+            attr = curses.color_pair(COL_TEXT)
+            if is_extra:
+                attr = curses.color_pair(COL_GOOD)
+            if i == cur:
+                attr = curses.color_pair(COL_SEL) | curses.A_REVERSE | curses.A_BOLD
+            put(scr, 3 + i - top, 2, text.ljust(w - 5), attr)
+        if len(allrows) > vis:
+            put(scr, h - 3, 2, f"{cur + 1}/{len(allrows)}", curses.color_pair(COL_HINT))
+        hint = footer or ("Up/Down: move   X: toggle/select   Circle: back" if multi else "Up/Down: move   X: select   Circle: back")
+        center(scr, h - 2, hint, curses.color_pair(COL_HINT))
+        scr.refresh()
+        a = inp.poll()
+        if a == "up":
+            cur = (cur - 1) % len(allrows)
+        elif a == "down":
+            cur = (cur + 1) % len(allrows)
+        elif a == "left":
+            cur = max(0, cur - 10)
+        elif a == "right":
+            cur = min(len(allrows) - 1, cur + 10)
+        elif a == "back":
+            return (sel, False) if multi else None
+        elif a == "confirm":
+            if not multi:
+                return cur
+            if cur == len(rows) + 1:
+                return sel, True
+            if cur == len(rows):
+                if len(sel) == len(rows):
+                    sel.clear()
+                else:
+                    sel = set(range(len(rows)))
+            else:
+                sel.symmetric_difference_update({cur})
+
+
+def confirm_dialog(scr, inp, title, text, yes="Copy", no="Cancel", good=True):
+    choice = True
+    while True:
+        scr.erase()
+        h, w = scr.getmaxyx()
+        center(scr, 1, title, curses.color_pair(COL_TITLE if good else COL_BAD) | curses.A_BOLD)
+        lines = wrap(text, min(w - 6, 74))
+        for i, line in enumerate(lines):
+            center(scr, 3 + i, line, curses.color_pair(COL_TEXT))
+        y = 5 + len(lines)
+        yl, nl = f"[ {yes} ]", f"[ {no} ]"
+        x = max(0, (w - (len(yl) + len(nl) + 4)) // 2)
+        put(scr, y, x, yl, curses.color_pair(COL_GOOD) | (curses.A_REVERSE if choice else 0) | curses.A_BOLD)
+        put(scr, y, x + len(yl) + 4, nl, curses.color_pair(COL_BAD) | (0 if choice else curses.A_REVERSE) | curses.A_BOLD)
+        center(scr, h - 2, "Left/Right: choose   X: confirm   Circle: cancel", curses.color_pair(COL_HINT))
+        scr.refresh()
+        a = inp.poll()
+        if a in ("left", "right"):
+            choice = not choice
+        elif a == "confirm":
+            return choice
+        elif a == "back":
+            return False
+
+
+def progress_copy(scr, inp, to_copy, total, dest_root, systems, chown_user):
+    done = {"bytes": 0, "files": 0}
+    start = time.time()
+    state = {"cur": "", "last_draw": 0.0}
+
+    def draw(force=False):
+        now = time.time()
+        if not force and now - state["last_draw"] < 0.2:
+            return
+        state["last_draw"] = now
+        scr.erase()
+        h, w = scr.getmaxyx()
+        center(scr, 1, "COPYING...", curses.color_pair(COL_TITLE) | curses.A_BOLD)
+        pct = (done["bytes"] / total) if total else 1.0
+        barw = max(10, min(w - 12, 60))
+        filled = int(barw * pct)
+        center(scr, 4, "[" + "#" * filled + "-" * (barw - filled) + f"] {pct * 100:4.0f}%", curses.color_pair(COL_GOOD))
+        elapsed = max(0.1, now - start)
+        speed = done["bytes"] / elapsed
+        eta = (total - done["bytes"]) / speed if speed > 0 else 0
+        center(scr, 6, f"{human(done['bytes'])} of {human(total)}   {human(speed)}/s   ETA {int(eta)}s", curses.color_pair(COL_TEXT))
+        center(scr, 7, f"file {done['files'] + 1} of {len(to_copy)}", curses.color_pair(COL_TEXT))
+        center(scr, 9, state["cur"][-(w - 6):], curses.color_pair(COL_HINT))
+        center(scr, h - 2, "Circle: cancel (already-copied files are kept, the file in progress is discarded)", curses.color_pair(COL_HINT))
+        scr.refresh()
+
+    def on_bytes(n):
+        done["bytes"] += n
+        draw()
+
+    def check_cancel():
+        if inp.poll(0) == "back":
+            raise Cancelled()
+
+    errors = []
+    status = "ok"
+    for src, dst, size in to_copy:
+        state["cur"] = os.path.basename(dst)
+        draw(True)
+        try:
+            copy_one(src, dst, on_bytes, check_cancel, chown_user)
+            done["files"] += 1
+        except Cancelled:
+            status = "cancelled"
+            break
+        except OSError as e:
+            if not os.path.exists(os.path.dirname(dst) or "/") or not os.path.exists(src):
+                status = "removed"
+                errors.append(f"{os.path.basename(dst)}: drive disconnected ({e})")
+                break
+            errors.append(f"{os.path.basename(dst)}: {e}")
+    run(["sync"])
+    if chown_user:
+        chown_tree_dirs(dest_root, systems, chown_user)
+    return status, done["files"], done["bytes"], errors
+
+
+# ---------------------------------------------------------------- flow
+
+def gather_jobs(scr, inp, src_root, scope):
+    systems = [s for s in real_dirs(src_root) if list_games(os.path.join(src_root, s))]
+    if not systems:
+        message(scr, inp, "NOTHING TO COPY", f"No games found under {src_root}.", good=False)
+        return None
+    counts = [len(list_games(os.path.join(src_root, s))) for s in systems]
+    if scope == "all":
+        return [(s, os.path.join(src_root, s), g) for s in systems for g in list_games(os.path.join(src_root, s))]
+    labels = [f"{s}  ({c} game{'s' if c != 1 else ''})" for s, c in zip(systems, counts)]
+    if scope == "system":
+        sel, ok = menu(scr, inp, "SELECT SYSTEMS TO COPY", labels, multi=True)
+        if not ok or not sel:
+            return None
+        return [(systems[i], os.path.join(src_root, systems[i]), g) for i in sorted(sel) for g in list_games(os.path.join(src_root, systems[i]))]
+    # individual games
+    chosen = {}   # system -> set(game)
+    while True:
+        rows = [f"{s}  ({len(chosen.get(s, ()))} selected / {c})" for s, c in zip(systems, counts)]
+        rows.append(">> REVIEW AND COPY <<")
+        idx = menu(scr, inp, "PICK A SYSTEM, THEN ITS GAMES", rows, subtitle="Circle on this list = cancel")
+        if idx is None:
+            return None
+        if idx == len(systems):
+            jobs = [(s, os.path.join(src_root, s), g) for s in systems for g in sorted(chosen.get(s, ()))]
+            if jobs:
+                return jobs
+            message(scr, inp, "NOTHING SELECTED", "Pick at least one game first.", good=False)
+            continue
+        s = systems[idx]
+        games = list_games(os.path.join(src_root, s))
+        labels2 = []
+        for g in games:
+            sz = entry_size(os.path.join(src_root, s, g))
+            labels2.append(f"{g}  [{human(sz)}]")
+        sel, _ = menu(scr, inp, f"{s.upper()} - SELECT GAMES", labels2, multi=True)
+        # Circle (back) keeps whatever was toggled, same as DONE
+        chosen[s] = {games[i] for i in sel}
+
+
+def flow(scr):
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(COL_TITLE, curses.COLOR_YELLOW, -1)
+    curses.init_pair(COL_TEXT, curses.COLOR_CYAN, -1)
+    curses.init_pair(COL_SEL, curses.COLOR_WHITE, -1)
+    curses.init_pair(COL_GOOD, curses.COLOR_GREEN, -1)
+    curses.init_pair(COL_BAD, curses.COLOR_RED, -1)
+    curses.init_pair(COL_HINT, curses.COLOR_MAGENTA, -1)
+    scr.nodelay(True)
+    scr.keypad(True)
+    inp = Input(scr)
+    mounted_here = None
+    try:
+        while True:
+            drives = find_drives()
+            if not drives:
+                message(scr, inp, "NO USB DRIVE", "No USB drive with a filesystem was found. Plug one in and open this tool again.", good=False)
+                return
+            if len(drives) == 1:
+                drive = drives[0]
+            else:
+                rows = [f"{d['dev']}  {d['label'] or '(no label)'}  {d['size']}  {d['fstype']}" for d in drives]
+                i = menu(scr, inp, "WHICH USB DRIVE?", rows)
+                if i is None:
+                    return
+                drive = drives[i]
+
+            d = menu(scr, inp, "TRANSFER GAMES  (always a copy - nothing is ever moved or deleted)",
+                     ["USB drive  ->  this Pi", "This Pi  ->  USB drive"], subtitle=f"Drive: {drive['label'] or drive['dev']} ({drive['size']}, {drive['fstype']})")
+            if d is None:
+                return
+            s = menu(scr, inp, "WHAT TO COPY?", ["Individual games", "Entire systems (pick which)", "Everything - all games, all systems"])
+            if s is None:
+                continue
+            scope = ("individual", "system", "all")[s]
+
+            mp, we_mounted = mount_drive(drive)
+            if not mp:
+                message(scr, inp, "MOUNT FAILED", f"Could not mount {drive['dev']} - see {LOG_PATH}", good=False)
+                continue
+            if we_mounted:
+                mounted_here = mp
+            try:
+                usb_roms = usb_roms_dir(mp, create=(d == 1))
+                if d == 0:
+                    if not usb_roms:
+                        message(scr, inp, "NO ROMS FOLDER", "This drive has no roms folder to copy from.", good=False)
+                        continue
+                    src_root, dest_root = usb_roms, PI_ROMS
+                else:
+                    src_root, dest_root = PI_ROMS, usb_roms
+
+                jobs = gather_jobs(scr, inp, src_root, scope)
+                if not jobs:
+                    continue
+                dest_is_fat = fs_type_of(nearest_existing(dest_root)) in ("vfat", "msdos", "fat", "exfat")
+                to_copy, skipped_exist, skipped_big = build_plan(jobs, dest_root, dest_is_fat)
+                total = sum(x[2] for x in to_copy)
+                need = space_needed(to_copy, dest_is_fat)
+                free = shutil.disk_usage(nearest_existing(dest_root)).free
+                systems = sorted({j[0] for j in jobs})
+                dest_name = "this Pi" if d == 0 else "the USB drive"
+
+                notes = []
+                if skipped_exist:
+                    notes.append(f"{skipped_exist} file(s) already exist at the destination and will be left untouched.")
+                if skipped_big:
+                    notes.append(f"{len(skipped_big)} file(s) over 4 GB can't be stored on a FAT drive and will be skipped.")
+                if not to_copy:
+                    message(scr, inp, "NOTHING TO COPY", "Everything selected is already at the destination." + (" " + " ".join(notes) if notes else ""), good=False)
+                    continue
+                if need > free:
+                    message(scr, inp, "NOT ENOUGH SPACE",
+                            f"Copying needs about {human(need)} but {dest_name} only has {human(free)} free.\nNothing was copied. Free up space or pick fewer games.",
+                            good=False)
+                    continue
+                txt = (f"Copy {len(to_copy)} file(s), {human(total)}, to {dest_name}?\n"
+                       f"Free space there: {human(free)} (needs about {human(need)}).\n"
+                       "This is a COPY - the originals stay where they are.")
+                if notes:
+                    txt += "\n" + " ".join(notes)
+                if not confirm_dialog(scr, inp, "READY TO COPY", txt):
+                    continue
+                status, nfiles, nbytes, errors = progress_copy(
+                    scr, inp, to_copy, total, dest_root, systems, PI_USER if d == 0 else None)
+                log(f"transfer {status}: {nfiles} files {nbytes} bytes, {len(errors)} errors")
+                if status == "removed":
+                    message(scr, inp, "DRIVE DISCONNECTED", f"The drive was removed mid-copy after {nfiles} file(s).", good=False)
+                    return
+                head = {"ok": "COPY COMPLETE", "cancelled": "COPY CANCELLED"}[status] if status in ("ok", "cancelled") else "DONE"
+                body = f"Copied {nfiles} file(s), {human(nbytes)}. Nothing was moved or deleted at the source."
+                if errors:
+                    body += f"\n{len(errors)} file(s) failed (first: {errors[0]})"
+                message(scr, inp, head, body, good=(status == "ok" and not errors))
+                if d == 0 and status != "cancelled":
+                    message(scr, inp, "TIP", "New games appear in EmulationStation after it restarts (Start > Quit > Restart, or reboot).")
+            finally:
+                if mounted_here and os.path.ismount(mounted_here):
+                    unmount_drive(mounted_here)
+                    mounted_here = None
+    finally:
+        inp.close()
+
+
+def main():
+    if os.geteuid() != 0:
+        os.execvp("sudo", ["sudo", sys.executable] + sys.argv)
+    curses.wrapper(flow)
+
+
+if __name__ == "__main__":
+    main()
+TGEOF
+    sed -i -e "s|@PI_HOME@|$PI_HOME|g" -e "s|@PI_USER@|$PI_USER|g" -e "s|@BTN_X@|$BTN_X|g" -e "s|@BTN_CIRCLE@|$BTN_CIRCLE|g" "$PI_HOME/scripts/transfer-games.py"
+    chmod +x "$PI_HOME/scripts/transfer-games.py"
+    chown "$PI_USER:$PI_USER" "$PI_HOME/scripts/transfer-games.py"
+
+    touch "$PI_HOME/RetroPie/retropiemenu/transfergames.rp"
+
+    local menu_script="$PI_HOME/RetroPie-Setup/scriptmodules/supplementary/retropiemenu.sh"
+    if [ -f "$menu_script" ] && ! grep -q "transfergames.rp)" "$menu_script"; then
+        sudo cp "$menu_script" "${menu_script}.bak.$(date +%s)"
+        sudo python3 - "$menu_script" "$PI_HOME" <<'PYEOF'
+import sys
+path, pi_home = sys.argv[1], sys.argv[2]
+text = open(path).read()
+anchor = "filemanager.rp)"
+idx = text.find(anchor)
+if idx == -1:
+    print("[transfergames] anchor 'filemanager.rp)' not found in retropiemenu.sh; skipping menu wiring")
+    sys.exit(0)
+case_end = text.find(";;", idx)
+if case_end == -1:
+    print("[transfergames] could not find end of filemanager.rp) case; skipping menu wiring")
+    sys.exit(0)
+insert_point = text.find("\n", case_end) + 1
+line_start = text.rfind("\n", 0, idx) + 1
+indent = text[line_start:idx]
+block = f"{indent}transfergames.rp)\n{indent}    python3 {pi_home}/scripts/transfer-games.py\n{indent}    ;;\n"
+open(path, "w").write(text[:insert_point] + block + text[insert_point:])
+print("[transfergames] wired into retropiemenu.sh")
+PYEOF
+    fi
+    return 0
+}
+
 phase_finalize() {
     # Defensive ownership normalization. Confirmed live on a second
     # reference Pi, across the several separate install_run*.log attempts
@@ -10550,6 +11347,7 @@ main() {
         mame_menu_hotkey_default
         bezel_project_install
         usb_rom_autoloader
+        transfer_games_tool
         finalize
     )
 
