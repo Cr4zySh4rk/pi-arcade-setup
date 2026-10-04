@@ -9784,7 +9784,7 @@ def restart_esde():
     r = run(["pgrep", "-f", "autostart.sh"])
     if r.returncode != 0:
         subprocess.Popen(
-            ["setsid", "bash", f"{PI_HOME}/RetroPie/configs/all/autostart.sh"],
+            ["setsid", "bash", "/opt/retropie/configs/all/autostart.sh"],
             stdin=open("/dev/tty1"), stdout=open("/dev/tty1", "w"), stderr=subprocess.STDOUT,
             start_new_session=True,
         )
@@ -10121,6 +10121,14 @@ def _handle_add(devnode):
         return
 
     disk = parent_disk(devnode)
+    # This Pi can itself boot from a USB-attached disk, in which case udev's
+    # ID_BUS=="usb" filter matches the SYSTEM disk too - confirmed live: the
+    # boot SSD (sda) fired this handler on every boot, racing dialogs, killing
+    # ES-DE and relaunching it from a wrong path. Never touch the disk that
+    # backs / or any of its mounted partitions.
+    if disk == root_disk():
+        log(f"{disk} backs the running system - ignoring")
+        return
     global _current_disk
     _current_disk = disk
     if devnode == disk:
