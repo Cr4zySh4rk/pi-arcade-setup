@@ -9803,25 +9803,42 @@ def remove_symlinks(devnode):
 
 
 def restart_esde():
-    # Killing es-de outright can make its own autostart.sh loop treat the
-    # exit as a deliberate quit and stop relaunching (confirmed live on
-    # this project's own reference Pi - ES-DE logs "ES-DE cleanly shutting
-    # down" on SIGTERM same as a real quit, and the loop can't tell the
-    # difference). Rather than depend on that log-line heuristic working
-    # the same way on every ES-DE build, explicitly re-launch the
-    # autostart loop ourselves afterward if it's no longer running -
-    # matching exactly how this was recovered live during this project's
-    # own testing.
-    run(["pkill", "-f", "es-de"])
-    time.sleep(2)
-    r = run(["pgrep", "-f", "autostart.sh"])
-    if r.returncode != 0:
-        subprocess.Popen(
-            ["setsid", "bash", "/opt/retropie/configs/all/autostart.sh"],
-            stdin=open("/dev/tty1"), stdout=open("/dev/tty1", "w"), stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        log("autostart.sh had stopped - relaunched it directly")
+    # Killing es-de outright makes autostart.sh's loop treat the exit as a
+    # deliberate quit (ES-DE logs "cleanly shutting down" on SIGTERM same as
+    # a real quit) and the loop ENDS - leaving the console at a bare command
+    # line. So the frontend has to be relaunched explicitly afterward.
+    #
+    # It must be relaunched AS THE PI USER, not as root: this handler runs
+    # as root (udev -> systemd-run), and autostart.sh derives ES-DE's
+    # XDG_RUNTIME_DIR from the user it runs as - launched as root, ES-DE got
+    # /run/user/0, found no display session and exited at once, which ended
+    # the loop again and left the command line even though a relaunch was
+    # "attempted" (confirmed live: answering No to the load prompt dropped
+    # to the console, with the log claiming autostart.sh was relaunched).
+    if run(["pgrep", "-x", "es-de"]).returncode == 0:
+        run(["pkill", "-x", "es-de"])
+        time.sleep(2)
+    loop_alive = run(["pgrep", "-f", "^bash /opt/retropie/configs/all/autostart.sh"]).returncode == 0
+    if loop_alive:
+        # The loop is still running; give it a moment to bring ES-DE back itself.
+        for _ in range(8):
+            if run(["pgrep", "-x", "es-de"]).returncode == 0:
+                return
+            time.sleep(1)
+        log("autostart.sh loop is alive but ES-DE did not return - relaunching it")
+        run(["pkill", "-f", "^bash /opt/retropie/configs/all/autostart.sh"])
+    run(["chvt", "1"])
+    subprocess.Popen(
+        ["/usr/sbin/runuser", "-u", PI_USER, "--", "setsid", "bash", "/opt/retropie/configs/all/autostart.sh"],
+        stdin=open("/dev/tty1"), stdout=open("/dev/tty1", "w"), stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    for _ in range(10):
+        time.sleep(1)
+        if run(["pgrep", "-x", "es-de"]).returncode == 0:
+            log("ES-DE relaunched via autostart.sh as " + PI_USER)
+            return
+    log("WARNING: ES-DE did not come back after relaunching autostart.sh")
 
 
 # --------------------------------------------------------------------
