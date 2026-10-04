@@ -9802,6 +9802,59 @@ def remove_symlinks(devnode):
     return removed
 
 
+def prune_stale():
+    """Drop USB entries whose drive is no longer attached: a missed remove
+    event (or a reboot, which unmounts everything) otherwise leaves ghost
+    menu entries in ES-DE pointing at a dead or stale /media mount. Removes
+    tracked symlinks + mounts for absent devnodes, then any leftover
+    symlink under the roms tree that points into a usbrom mount which is no
+    longer a live mount or whose target no longer exists."""
+    changed = 0
+    state = load_state()
+    for dev in list(state.keys()):
+        entry = state[dev]
+        mp = entry.get("mountpoint")
+        if device_present(dev) and mount_still_present(mp):
+            continue
+        for link in entry.get("symlinks", []):
+            try:
+                if os.path.islink(link):
+                    os.remove(link)
+                    changed += 1
+            except OSError:
+                pass
+        state.pop(dev)
+    save_state(state)
+    try:
+        for name in os.listdir(MEDIA_ROOT):
+            mp = os.path.join(MEDIA_ROOT, name)
+            if name.startswith("usbrom-") and os.path.ismount(mp):
+                dev = "/dev/" + name[len("usbrom-"):]
+                if not device_present(dev):
+                    run(["umount", "-l", mp])
+            if name.startswith("usbrom-") and os.path.isdir(mp) and not os.path.ismount(mp):
+                try:
+                    os.rmdir(mp)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    roms = os.path.join(PI_HOME, "RetroPie", "roms")
+    for root, dirs, files in os.walk(roms):
+        for n in files + dirs:
+            path = os.path.join(root, n)
+            if os.path.islink(path):
+                tgt = os.readlink(path)
+                mount_dir = "/".join(tgt.split("/")[:3])
+                if tgt.startswith(MEDIA_ROOT + "/usbrom-") and (not os.path.exists(tgt) or not os.path.ismount(mount_dir)):
+                    try:
+                        os.remove(path)
+                        changed += 1
+                    except OSError:
+                        pass
+    return changed
+
+
 def restart_esde():
     # Killing es-de outright makes autostart.sh's loop treat the exit as a
     # deliberate quit (ES-DE logs "cleanly shutting down" on SIGTERM same as
@@ -9828,6 +9881,15 @@ def restart_esde():
         log("autostart.sh loop is alive but ES-DE did not return - relaunching it")
         run(["pkill", "-f", "^bash /opt/retropie/configs/all/autostart.sh"])
     run(["chvt", "1"])
+    # Cleanest relaunch: respawn the tty1 autologin session, which runs
+    # autostart.sh exactly like a boot does (one owner of tty1, no race).
+    run(["systemctl", "restart", "getty@tty1.service"])
+    for _ in range(15):
+        time.sleep(1)
+        if run(["pgrep", "-x", "es-de"]).returncode == 0:
+            log("ES-DE relaunched via getty@tty1 autologin")
+            return
+    log("getty respawn did not bring ES-DE back - starting autostart.sh directly")
     subprocess.Popen(
         ["/usr/sbin/runuser", "-u", PI_USER, "--", "setsid", "bash", "/opt/retropie/configs/all/autostart.sh"],
         stdin=open("/dev/tty1"), stdout=open("/dev/tty1", "w"), stderr=subprocess.STDOUT,
@@ -10096,8 +10158,10 @@ def show_dialog(title, message, yesno=True):
 
     ensure_esde_stopped()
 
-    # Re-exec this same script as a dedicated child attached to VT1 (free
-    # now that ES-DE is gone) via openvt, rather than trying to attach the
+    # Re-exec this same script as a dedicated child attached to VT3 via
+    # openvt (NOT VT1: VT1 is the autologin shell's controlling terminal,
+    # and openvt -f on it hangs that session up - "session terminated,
+    # killing shell" - so getty respawned a login that raced the relaunch), rather than trying to attach the
     # CURRENT process (which has no controlling terminal at all, having
     # been launched from udev/systemd-run) to a tty in place. Passing the
     # dialog contents through temp files, not argv/stdin, keeps the
@@ -10115,7 +10179,7 @@ def show_dialog(title, message, yesno=True):
         # the openvt wrapping it) if the drive gets pulled before anyone
         # answers.
         run([
-            "openvt", "-c", "1", "-s", "-w", "-f", "--",
+            "openvt", "-c", "3", "-s", "-w", "-f", "--",
             "/usr/bin/env", "TERM=linux",
             sys.executable, os.path.abspath(__file__), "--render-dialog", in_path, out_path, _current_disk,
         ])
@@ -10146,6 +10210,7 @@ def handle_add(devnode):
     global _esde_stopped
     _esde_stopped = False
     try:
+        prune_stale()
         _handle_add(devnode)
     finally:
         if _esde_stopped:
@@ -10340,8 +10405,29 @@ def kill_stale_add_handlers(disk):
     so an unrelated drive's legitimate, currently-open dialog for a
     *different* disk is never disturbed by this.
     """
-    result = run(["pkill", "-9", "-f", f"usb-rom-loader.py.*{re.escape(disk)}"])
-    if result.returncode != 0:
+    # NEVER match by bare pattern with pkill: this very process runs as
+    # "usb-rom-loader.py remove <devnode>", whose command line also matches
+    # the disk pattern - the remove handler used to SIGKILL ITSELF here, so
+    # symlinks were never removed on unplug (ghost menu entries). Select
+    # PIDs explicitly and skip our own pid, our ancestors and any "remove"
+    # or "prune" invocation.
+    me = {os.getpid(), os.getppid()}
+    killed = False
+    pids = run(["pgrep", "-f", f"usb-rom-loader.py.*{re.escape(disk)}"]).stdout.split()
+    for pid in pids:
+        try:
+            pid_i = int(pid)
+            if pid_i in me:
+                continue
+            with open(f"/proc/{pid_i}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\0", b" ").decode(errors="replace")
+        except (ValueError, OSError):
+            continue
+        if " remove " in cmd or " prune" in cmd:
+            continue
+        os.kill(pid_i, 9)
+        killed = True
+    if not killed:
         return
     log(f"killed a stale, unanswered dialog for {disk} (the drive was removed before it was answered)")
     time.sleep(0.5)
@@ -10364,6 +10450,7 @@ def kill_stale_add_handlers(disk):
 def handle_remove(devnode):
     kill_stale_add_handlers(parent_disk(devnode))
     removed = remove_symlinks(devnode)
+    removed += ["stale"] * prune_stale()
     # A drive pulled without a symlink load (e.g. after Copy structure, or a
     # declined prompt) leaves its mount behind as a dead entry; with the
     # device letter changing on every replug these pile up (sdb1, sdc1, ...).
@@ -10405,6 +10492,11 @@ def main():
             log(f"--render-dialog: could not write {out_path}: {e!r}")
         return
 
+    if len(sys.argv) == 2 and sys.argv[1] == "prune":
+        log("=== prune ===")
+        log(f"pruned {prune_stale()} stale link(s)")
+        return
+
     if len(sys.argv) != 3 or sys.argv[1] not in ("add", "remove"):
         print(f"usage: {sys.argv[0]} <add|remove> <devnode>", file=sys.stderr)
         sys.exit(1)
@@ -10424,6 +10516,23 @@ if __name__ == "__main__":
 PYEOF
     chmod +x "$PI_HOME/scripts/usb-rom-loader.py"
     chown "$PI_USER:$PI_USER" "$PI_HOME/scripts/usb-rom-loader.py"
+
+    # Boot-time cleanup: every /media mount is gone after a reboot, so USB
+    # symlinks from the previous session would show as dead menu entries.
+    sudo tee /etc/systemd/system/usb-rom-prune.service >/dev/null <<PRUNEEOF
+[Unit]
+Description=Remove stale USB ROM symlinks
+Before=getty@tty1.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 $PI_HOME/scripts/usb-rom-loader.py prune
+
+[Install]
+WantedBy=multi-user.target
+PRUNEEOF
+    sudo systemctl daemon-reload 2>/dev/null || true
+    sudo systemctl enable usb-rom-prune.service >/dev/null 2>&1 || true
 
     # A physical drive fires several near-simultaneous udev "add" events -
     # one for the whole disk, one for each partition on it - and the
