@@ -11972,8 +11972,10 @@ def bt_conf(mac, name):
     return (
         "# pi-arcade-setup: managed by arcade-audio-daemon.py - do not edit.\n"
         f"# Output: Bluetooth {name or ''} ({mac}) over BlueALSA A2DP.\n"
-        "pcm.!arcade_out {\n    type plug\n"
-        f"    slave.pcm \"bluealsa:DEV={mac},PROFILE=a2dp\"\n}}\n"
+        # A plain alias to BlueALSA's own (already plug-wrapped) PCM: wrapping
+        # it in another "plug" fails at open with an empty hw_params
+        # interval (assertion, no sound).
+        f"pcm.!arcade_out \"bluealsa:DEV={mac},PROFILE=a2dp\"\n"
     )
 
 
