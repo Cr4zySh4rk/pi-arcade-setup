@@ -7955,7 +7955,7 @@ def draw(win, sinks, out_idx, vol, muted, sel, js_connected):
     safe_addstr(win, h - 3, cx(win, js_line), js_line, curses.color_pair(COL_GOOD if js_connected else COL_BAD) | curses.A_DIM)
 
     footer1 = "UP/DOWN: select   LEFT/RIGHT: change/adjust"
-    footer2 = "Enter/A/X: apply   ESC/B/Circle: done"
+    footer2 = "Enter/A/X: apply   ESC/B/Circle: done (output change applies on exit)"
     safe_addstr(win, h - 2, cx(win, footer1), footer1, curses.color_pair(COL_HINT))
     safe_addstr(win, h - 1, cx(win, footer2), footer2, curses.A_DIM)
     win.refresh()
@@ -8004,6 +8004,8 @@ def run(stdscr):
                 key = ROWS[sel]
                 step_dir = 1 if action == "right" else (-1 if action == "left" else 0)
                 if key == "output" and sinks:
+                    if action == "confirm" and not step_dir:
+                        step_dir = 1  # confirm cycles to the next output too
                     if step_dir:
                         out_idx = (out_idx + step_dir) % len(sinks)
                     if action == "confirm" or step_dir:
@@ -12126,7 +12128,8 @@ def safe_to_restart_frontend():
         return False
     return not pgrep_any([
         "retroarch", "runcommand", "openvt",
-        "scripts/(bt-audio-output|audio-settings|transfer-games|manage-games|usb-rom-loader|bt-nowplaying|music-player)",
+        # Menu tools only - NOT the always-running bt-nowplaying-daemon.py.
+        "scripts/(bt-audio-output|audio-settings|transfer-games|manage-games|usb-rom-loader|bt-nowplaying|music-player)[.]py",
     ])
 
 
