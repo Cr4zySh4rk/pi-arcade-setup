@@ -4489,8 +4489,8 @@ EOF
 $( [ "$ENABLE_BT_SPEAKER" = "true" ] && cat <<BTPAIR
 	<game>
 		<path>./btpair.rp</path>
-		<name>Bluetooth</name>
-		<desc>Scan for and pair wireless controllers (or any Bluetooth device) - just select one and press confirm, pairing is accepted automatically.</desc>
+		<name>Bluetooth controller</name>
+		<desc>Scan for and pair wireless game controllers - only gamepads/joysticks are listed. Just select one and press confirm, pairing is accepted automatically.</desc>
 		<image>$icon_dir/bluetooth.png</image>
 	</game>
 BTPAIR
@@ -6770,9 +6770,10 @@ phase_bt_pair_tool() {
     tee "$PI_HOME/scripts/bt-controller-pair.py" >/dev/null <<PYEOF
 #!/usr/bin/env python3
 """
-Seamless Bluetooth device pairing wizard for pi-arcade-setup - mainly for
-wireless controllers, but works for any discoverable device. Run from the
-RetroPie menu ("Bluetooth") or directly:
+Seamless Bluetooth controller pairing wizard for pi-arcade-setup - lists
+only devices that identify themselves as a gamepad/joystick (phones,
+speakers etc. are filtered out; use "Bluetooth Audio Output" for those). Run from the
+RetroPie menu ("Bluetooth controller") or directly:
     python3 bt-controller-pair.py
 Drives BlueZ directly over D-Bus (no bluetoothctl text-parsing): scans for
 nearby devices and lists them live, and pairs/trusts/connects the selected
@@ -6785,6 +6786,7 @@ move, X/Cross to pair the selected device, Circle/B to exit - same button
 roles as the rest of the RetroPie menu.
 """
 import curses
+import re
 import select
 import struct
 import sys
@@ -6832,12 +6834,45 @@ def find_adapter_path(bus):
     return None
 
 
+_CONTROLLER_NAME_RE = re.compile(
+    r"controller|gamepad|joypad|joystick|joy-con|dualshock|dualsense|"
+    r"wireless pad|xbox|8bitdo|stadia|pro controller|gamesir|ipega", re.I)
+
+
+def is_controller(dev):
+    """True only for devices that identify themselves as a gamepad/joystick:
+    BlueZ Icon "input-gaming", the GAP Appearance value for a joystick/
+    gamepad (0x03C3/0x03C4), or the Class-of-Device peripheral/gamepad
+    minor class. Name matching is only a fallback for the few pads that
+    advertise none of those. Phones, speakers, laptops etc. never match."""
+    if str(dev.get("Icon", "")) == "input-gaming":
+        return True
+    try:
+        if int(dev.get("Appearance", 0)) in (0x03C3, 0x03C4):
+            return True
+    except (TypeError, ValueError):
+        pass
+    try:
+        cod = int(dev.get("Class", 0))
+    except (TypeError, ValueError):
+        cod = 0
+    if cod and ((cod >> 8) & 0x1F) == 0x05 and ((cod >> 2) & 0x0F) in (0x01, 0x02):
+        return True
+    if cod and ((cod >> 8) & 0x1F) in (0x01, 0x02, 0x04):
+        return False  # computer / phone / audio-video: never a pad
+    if str(dev.get("Icon", "")) in ("phone", "computer", "audio-card", "audio-headset", "audio-headphones", "input-keyboard", "input-mouse"):
+        return False
+    return bool(_CONTROLLER_NAME_RE.search(str(dev.get("Alias", dev.get("Name", "")))))
+
+
 def list_devices(bus, adapter_path):
     manager = dbus.Interface(bus.get_object(BLUEZ_SERVICE, "/"), "org.freedesktop.DBus.ObjectManager")
     devices = []
     for path, ifaces in manager.GetManagedObjects().items():
         dev = ifaces.get(DEVICE_IFACE)
         if dev is None or not path.startswith(adapter_path + "/"):
+            continue
+        if not is_controller(dev):
             continue
         name = str(dev.get("Name", dev.get("Alias", "")))
         addr = str(dev.get("Address", ""))
@@ -6925,7 +6960,7 @@ def poll_action(stdscr, js_file, axis_state, action_debounce, timeout=0.15):
 def draw(win, devices, sel, js_connected, status_line, status_attr, scanning):
     win.erase()
     h, w = win.getmaxyx()
-    title = " BLUETOOTH PAIRING "
+    title = " BLUETOOTH CONTROLLER PAIRING "
     safe_addstr(win, 1, cx(win, title), title, curses.color_pair(COL_HEADER) | curses.A_BOLD)
     sub = "Scanning for nearby devices..." if scanning else "Scan paused"
     safe_addstr(win, 2, cx(win, sub), sub, curses.A_DIM)
