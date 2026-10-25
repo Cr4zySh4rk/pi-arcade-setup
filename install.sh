@@ -7653,13 +7653,15 @@ menu ("Audio settings") or directly:
     python3 audio-settings.py
 Lets you switch the default PipeWire/WirePlumber output between the aux
 (3.5mm) jack and any HDMI output, and adjust master volume/mute - a
-controller-navigable front end for \`wpctl\`.
+controller-navigable front end for the arcade's real output routing
+(aux jack or the chosen Bluetooth speaker; see arcade-audio-daemon.py).
 
 Fully navigable by controller as well as keyboard: left stick (or D-pad) to
 move/adjust, X/Cross to confirm, Circle/B to exit - same button roles as
 the rest of the RetroPie menu.
 """
 import curses
+import json
 import os
 import re
 import select
@@ -7734,47 +7736,88 @@ def friendly_name(info):
     return card
 
 
-def list_sinks():
-    """Returns [{"id": str, "name": str, "default": bool}, ...]."""
+BT_CONFIG = PI_HOME + "/.bt-audio-output.json"
+ROUTE_CONF = "/etc/arcade-audio-out.conf"
+DAEMON = PI_HOME + "/scripts/arcade-audio-daemon.py"
+
+
+def _bt_cfg():
     try:
-        out = subprocess.run(["wpctl", "status"], capture_output=True, text=True, timeout=3, env=_wpctl_env()).stdout
+        with open(BT_CONFIG) as f:
+            cfg = json.load(f)
+        if isinstance(cfg, dict):
+            return cfg
+    except (OSError, ValueError):
+        pass
+    return {"mode": "aux"}
+
+
+def _bt_routed():
+    """True when ALSA's default output is actually going to Bluetooth right
+    now (the arcade-audio daemon only routes there while the chosen
+    speaker is connected)."""
+    try:
+        with open(ROUTE_CONF) as f:
+            return "bluealsa" in f.read()
+    except OSError:
+        return False
+
+
+def _bt_pcm():
+    mac = str(_bt_cfg().get("mac", "")).upper().replace(":", "_")
+    return f"/org/bluealsa/hci0/dev_{mac}/a2dpsrc/sink" if mac else ""
+
+
+def _sh(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=4).stdout
     except Exception:
-        return []
-    sinks = []
-    in_sinks = False
-    for line in out.splitlines():
-        if "Sinks:" in line:
-            in_sinks = True
-            continue
-        if in_sinks:
-            if "Sources:" in line:
-                break
-            m = re.search(r"(\*?)\s*(\d+)\.\s+(.+?)\s*\[vol", line)
-            if m:
-                sinks.append({"id": m.group(2), "default": m.group(1) == "*", "raw": line})
-    for s in sinks:
-        try:
-            info = subprocess.run(["wpctl", "inspect", s["id"]], capture_output=True, text=True, timeout=3, env=_wpctl_env()).stdout
-        except Exception:
-            info = ""
-        s["name"] = friendly_name(info)
+        return ""
+
+
+def list_sinks():
+    """The real output choices. Apps (ES-DE, RetroArch) play through ALSA's
+    default device, which the arcade-audio daemon points at the aux jack or
+    the chosen Bluetooth speaker - so this lists those, not PipeWire sinks.
+    Returns [{"id": "aux"|"bt", "name": str, "default": bool}, ...]."""
+    cfg = _bt_cfg()
+    want_bt = cfg.get("mode") == "bt"
+    sinks = [{"id": "aux", "name": "Aux / Headphone jack", "default": not want_bt}]
+    if cfg.get("mac"):
+        name = cfg.get("name") or cfg["mac"]
+        label = "Bluetooth: " + name
+        if want_bt and not _bt_routed():
+            label += " (not connected - using aux)"
+        sinks.append({"id": "bt", "name": label, "default": want_bt})
     return sinks
 
 
 def set_default_sink(sink_id):
+    cfg = _bt_cfg()
+    cfg["mode"] = "bt" if sink_id == "bt" and cfg.get("mac") else "aux"
     try:
-        subprocess.run(["wpctl", "set-default", sink_id], capture_output=True, timeout=3, env=_wpctl_env())
+        tmp = BT_CONFIG + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(cfg, f)
+        os.replace(tmp, BT_CONFIG)
+        st = os.stat(PI_HOME)
+        os.chown(BT_CONFIG, st.st_uid, st.st_gid)
+        subprocess.run(["python3", DAEMON, "apply"], capture_output=True, timeout=30)
     except Exception:
         pass
 
 
 def get_volume():
     try:
-        out = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"],
-                              capture_output=True, text=True, timeout=2, env=_wpctl_env()).stdout
-        parts = out.strip().split()
-        vol = int(round(float(parts[1]) * 100)) if len(parts) >= 2 else 0
-        muted = "MUTED" in out
+        if _bt_routed() and _bt_pcm():
+            out = _sh(["bluealsa-cli", "volume", _bt_pcm()])
+            m = re.search(r"L:\s*(\d+)", out)
+            vol = int(round(int(m.group(1)) * 100 / 127)) if m else 0
+            muted = "L: true" in _sh(["bluealsa-cli", "mute", _bt_pcm()])
+            return clamp(vol, 0, 100), muted
+        m = re.search(r"\[(\d+)%\]", _sh(["amixer", "-c", "Headphones", "sget", "Limited"]))
+        vol = int(m.group(1)) if m else 0
+        muted = "[off]" in _sh(["amixer", "-c", "Headphones", "sget", "PCM"])
         return clamp(vol, 0, 100), muted
     except Exception:
         return 0, False
@@ -7782,16 +7825,27 @@ def get_volume():
 
 def set_volume_step(step):
     try:
-        sign = "+" if step > 0 else "-"
-        subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{abs(step)}%{sign}"],
-                        capture_output=True, timeout=2, env=_wpctl_env())
+        vol, _ = get_volume()
+        vol = clamp(vol + step, 0, 100)
+        if _bt_routed() and _bt_pcm():
+            subprocess.run(["bluealsa-cli", "volume", _bt_pcm(), str(int(round(vol * 127 / 100)))],
+                           capture_output=True, timeout=4)
+        else:
+            subprocess.run(["amixer", "-c", "Headphones", "sset", "Limited", f"{vol}%"],
+                           capture_output=True, timeout=4)
     except Exception:
         pass
 
 
 def toggle_mute():
     try:
-        subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"], capture_output=True, timeout=2, env=_wpctl_env())
+        _, muted = get_volume()
+        if _bt_routed() and _bt_pcm():
+            subprocess.run(["bluealsa-cli", "mute", _bt_pcm(), "off" if muted else "on"],
+                           capture_output=True, timeout=4)
+        else:
+            subprocess.run(["amixer", "-c", "Headphones", "sset", "PCM", "unmute" if muted else "mute"],
+                           capture_output=True, timeout=4)
     except Exception:
         pass
 
@@ -12044,7 +12098,41 @@ def reconcile():
         state = "aux"
     if changed:
         log(f"output route -> {state}")
-    return mode, mac
+    return mode, mac, changed
+
+
+def route_kind():
+    try:
+        with open(OUT_CONF) as f:
+            return "bt" if "bluealsa" in f.read() else "aux"
+    except OSError:
+        return "aux"
+
+
+def pgrep_any(patterns):
+    for pat in patterns:
+        if run(["pgrep", "-f", pat]).returncode == 0:
+            return True
+    return False
+
+
+def safe_to_restart_frontend():
+    """ES-DE keeps its SDL audio stream open on whatever output was active
+    when it started, so menu sounds stay on the old output after a route
+    change until ES-DE restarts. Only restart it when nothing would be
+    interrupted: ES-DE is up, no game/emulator is running, and no menu
+    tool (or USB dialog) is open."""
+    if run(["pgrep", "-x", "es-de"]).returncode != 0:
+        return False
+    return not pgrep_any([
+        "retroarch", "runcommand", "openvt",
+        "scripts/(bt-audio-output|audio-settings|transfer-games|manage-games|usb-rom-loader|bt-nowplaying|music-player)",
+    ])
+
+
+def restart_frontend():
+    log("restarting ES-DE so menu sounds follow the new output")
+    run(["systemctl", "restart", "getty@tty1.service"], timeout=30)
 
 
 def enforce_cap():
@@ -12067,13 +12155,22 @@ def main():
         return
     log("daemon started")
     last_cap = last_try = 0.0
+    last_kind = None
+    pending_restart = False
     while True:
         now = time.time()
         try:
             if now - last_cap >= CAP_CHECK_S:
                 last_cap = now
                 enforce_cap()
-            mode, mac = reconcile()
+            mode, mac, _ = reconcile()
+            kind = route_kind()
+            if last_kind is not None and kind != last_kind:
+                pending_restart = True
+            last_kind = kind
+            if pending_restart and safe_to_restart_frontend():
+                pending_restart = False
+                restart_frontend()
             if (mode == "bt" and not bt_connected(mac) and now - last_try >= RECONNECT_S
                     and not os.path.exists(PLAYER_FLAG)):
                 last_try = now
@@ -12181,6 +12278,9 @@ def load_config():
 
 
 def save_config(mode, mac="", name=""):
+    if mode == "aux" and not mac:
+        old = load_config()  # keep the chosen speaker so Audio settings can switch back
+        mac, name = old.get("mac", ""), old.get("name", "")
     cfg = {"mode": mode, "mac": mac, "name": name}
     tmp = CONFIG + ".tmp"
     with open(tmp, "w") as f:
