@@ -544,6 +544,18 @@ ENABLE_BEZEL_PROJECT="${ENABLE_BEZEL_PROJECT:-true}"
 ENABLE_BT_SPEAKER="${ENABLE_BT_SPEAKER:-true}"
 BT_SPEAKER_NAME="${BT_SPEAKER_NAME:-RetroPieArcade}"
 
+# --- Bluetooth audio OUTPUT + aux volume cap ------------------------------------
+# Lets the arcade play its sound through a Bluetooth speaker or headphones
+# (RetroPie menu -> "Bluetooth Audio Output"): pair/choose a device, and the
+# arcade-audio daemon routes ALSA's default device to it while it is
+# connected, falling back to the aux jack when it is not. Independent of
+# ENABLE_BT_SPEAKER (that one is the reverse direction: phone -> arcade).
+ENABLE_BT_AUDIO_OUTPUT="${ENABLE_BT_AUDIO_OUTPUT:-true}"
+# Hard cap on the aux (3.5mm) jack: the Pi's hardware PCM gain is pinned so
+# the loudest possible output is this percentage of full scale (amplitude;
+# 70% = -3.10 dB). Applies on every path to the jack, set 100 to disable.
+AUX_MAX_VOLUME_PERCENT="${AUX_MAX_VOLUME_PERCENT:-70}"
+
 # Hotplug a USB drive and this project offers to load ROMs from it (or set
 # it up as one): plug in a FAT32 drive with a RetroPie roms/ folder and it
 # offers to load those ROMs into ES-DE as an extra source; plug in a FAT32
@@ -4405,6 +4417,7 @@ phase_custom_retropie_system() {
 
     local keep=(showip.rp avsettings.rp wifigate.rp ftpsettings.rp retroarch.rp assignports.rp transfergames.rp managegames.rp)
     [ "$ENABLE_BT_SPEAKER" = "true" ] && keep+=(btpair.rp btaudio.rp)
+    [ "$ENABLE_BT_AUDIO_OUTPUT" = "true" ] && keep+=(btaudiooutput.rp)
     [ "$ENABLE_MUSIC_PLAYER" = "true" ] && keep+=(musicplayer.rp)
     [ "$ENABLE_LED_STRIP" = "true" ] && keep+=(ledconfig.rp)
 
@@ -4499,6 +4512,15 @@ $( [ "$ENABLE_BT_SPEAKER" = "true" ] && cat <<BTAUDIO
 		<image>$icon_dir/bluetooth.png</image>
 	</game>
 BTAUDIO
+)
+$( [ "$ENABLE_BT_AUDIO_OUTPUT" = "true" ] && cat <<BTAOUT
+	<game>
+		<path>./btaudiooutput.rp</path>
+		<name>Bluetooth Audio Output</name>
+		<desc>Play the arcade's sound through a Bluetooth speaker or headphones. Scan, pair and pick a device, or switch back to the aux jack. Falls back to the aux jack automatically if the speaker is off.</desc>
+		<image>$icon_dir/bluetooth.png</image>
+	</game>
+BTAOUT
 )
 $( [ "$ENABLE_LED_STRIP" = "true" ] && cat <<LEDCFG
 	<game>
@@ -6617,13 +6639,13 @@ if __name__ == "__main__":
 PYEOF
     chmod +x "$PI_HOME/scripts/bt-nowplaying-daemon.py"
 
-    # BlueALSA defaults to advertising both a2dp-sink and a2dp-source; this
-    # Pi only ever needs to be a sink, so trim it to just that.
+    # Both A2DP roles: sink (phone -> Pi, the Bluetooth Player) and source
+    # (Pi -> Bluetooth speaker/headphones, see phase_bt_audio_output_setup).
     sudo mkdir -p /etc/systemd/system/bluealsa.service.d
     sudo tee /etc/systemd/system/bluealsa.service.d/override.conf >/dev/null <<'EOF'
 [Service]
 ExecStart=
-ExecStart=/usr/bin/bluealsa -S --keep-alive=5 -p a2dp-sink
+ExecStart=/usr/bin/bluealsa -S --keep-alive=5 -p a2dp-source -p a2dp-sink
 EOF
 
     # bluealsa-aplay opens a fresh connection to the ALSA PCM device for
@@ -11798,6 +11820,626 @@ PYEOF
     return 0
 }
 
+phase_bt_audio_output_setup() {
+    if [ "$ENABLE_BT_AUDIO_OUTPUT" != "true" ]; then
+        log "ENABLE_BT_AUDIO_OUTPUT=false, skipping"
+        return 0
+    fi
+    sudo apt-get install -y bluez-alsa-utils alsa-utils \
+        || { log_warn "Bluetooth audio output dependency install failed; skipping"; return 0; }
+    mkdir -p "$PI_HOME/scripts"
+
+    # BlueALSA must advertise the A2DP *source* role to stream to a speaker.
+    sudo mkdir -p /etc/systemd/system/bluealsa.service.d
+    sudo tee /etc/systemd/system/bluealsa.service.d/override.conf >/dev/null <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/bin/bluealsa -S --keep-alive=5 -p a2dp-source -p a2dp-sink
+EOF
+
+    # ALSA's default device -> "arcade_out", whose definition lives in a
+    # separate file the daemon rewrites (aux <-> Bluetooth) at runtime. The
+    # aux path goes through the "limited" softvol PCM (kept for its
+    # "Limited Volume" control); the actual cap is the hardware PCM gain,
+    # pinned by the daemon, so it also holds for paths that skip softvol.
+    sudo tee /etc/asound.conf >/dev/null <<'EOF'
+# pi-arcade-setup (managed): default output = arcade_out (see
+# /etc/arcade-audio-out.conf, rewritten by arcade-audio-daemon.py).
+</etc/arcade-audio-out.conf>
+
+pcm.limited {
+    type softvol
+    slave.pcm "hw:Headphones,0"
+    control { name "Limited Volume" card Headphones }
+    min_dB -51.0
+    max_dB 0.0
+}
+
+pcm.!default { type plug slave.pcm "arcade_out" }
+ctl.!default { type hw card Headphones }
+EOF
+    # Only seed the route file if absent so a re-run never undoes a chosen
+    # Bluetooth output.
+    if [ ! -f /etc/arcade-audio-out.conf ]; then
+        sudo tee /etc/arcade-audio-out.conf >/dev/null <<'EOF'
+# pi-arcade-setup: managed by arcade-audio-daemon.py - do not edit.
+pcm.!arcade_out {
+    type plug
+    slave.pcm "limited"
+}
+EOF
+    fi
+
+    # WirePlumber must not drive the jack's hardware mixer (it would undo the
+    # cap with wpctl volume changes) - use software volume for that card.
+    sudo -u "$PI_USER" mkdir -p "$PI_HOME/.config/wireplumber/wireplumber.conf.d"
+    sudo -u "$PI_USER" tee "$PI_HOME/.config/wireplumber/wireplumber.conf.d/52-aux-soft-mixer.conf" >/dev/null <<'CONF'
+# pi-arcade-setup: keep the aux jack's hardware gain (the volume cap) fixed.
+monitor.alsa.rules = [
+  {
+    matches = [ { device.name = "~alsa_card.platform-.*mailbox" } ]
+    actions = { update-props = { api.alsa.soft-mixer = true } }
+  }
+]
+CONF
+
+    # --- arcade-audio-daemon.py (aux cap + Bluetooth routing) ---
+    tee "$PI_HOME/scripts/arcade-audio-daemon.py" >/dev/null <<'AADEOF'
+#!/usr/bin/env python3
+"""
+arcade-audio-daemon: keeps the cabinet's audio output sane. Runs as root via
+arcade-audio.service (and once on demand: `arcade-audio-daemon.py apply`).
+
+1. Aux volume cap. The 3.5mm jack's hardware PCM gain is pinned so the
+   loudest possible output is AUX_MAX_PERCENT of full scale (default 70% =
+   -3.10 dB). It is re-asserted every 30 s so nothing (WirePlumber, an
+   emulator, a stale alsa state file after a power cut) can raise it.
+2. Bluetooth speaker/headphone routing. Apps open ALSA's "default" device,
+   which /etc/asound.conf points at "arcade_out", defined in
+   /etc/arcade-audio-out.conf. This daemon rewrites that file: Bluetooth
+   (BlueALSA A2DP to the chosen device) while the chosen speaker is
+   connected, the capped aux jack otherwise - so sound never goes silent just
+   because the speaker was switched off. New audio streams (the next game, the
+   next ES-DE start) pick the change up; it also periodically tries to
+   reconnect the chosen speaker (not while the Bluetooth Player is open).
+
+Config (written by the "Bluetooth Audio Output" menu tool):
+  @PI_HOME@/.bt-audio-output.json   {"mode": "bt"|"aux", "mac": "AA:BB:..", "name": "..."}
+"""
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import time
+
+PI_HOME = "@PI_HOME@"
+CONFIG = PI_HOME + "/.bt-audio-output.json"
+OUT_CONF = "/etc/arcade-audio-out.conf"
+PLAYER_FLAG = PI_HOME + "/.bt-nowplaying-active"
+MAX_PERCENT = @AUX_MAX@
+CARD = "Headphones"
+LOG = "/tmp/arcade-audio.log"
+
+POLL_S = 3
+CAP_CHECK_S = 30
+RECONNECT_S = 25
+
+AUX_CONF = (
+    "# pi-arcade-setup: managed by arcade-audio-daemon.py - do not edit.\n"
+    "# Output: aux jack (3.5mm), through the volume-capped 'limited' PCM.\n"
+    "pcm.!arcade_out {\n    type plug\n    slave.pcm \"limited\"\n}\n"
+)
+
+
+def bt_conf(mac, name):
+    return (
+        "# pi-arcade-setup: managed by arcade-audio-daemon.py - do not edit.\n"
+        f"# Output: Bluetooth {name or ''} ({mac}) over BlueALSA A2DP.\n"
+        "pcm.!arcade_out {\n    type plug\n"
+        f"    slave.pcm \"bluealsa:DEV={mac},PROFILE=a2dp\"\n}}\n"
+    )
+
+
+def log(msg):
+    try:
+        with open(LOG, "a") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    except OSError:
+        pass
+
+
+def run(cmd, timeout=15):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log(f"run failed {cmd}: {e!r}")
+        return subprocess.CompletedProcess(cmd, 1, "", str(e))
+
+
+def load_config():
+    try:
+        with open(CONFIG) as f:
+            cfg = json.load(f)
+        mac = str(cfg.get("mac", "")).upper()
+        if cfg.get("mode") == "bt" and re.fullmatch(r"([0-9A-F]{2}:){5}[0-9A-F]{2}", mac):
+            return "bt", mac, str(cfg.get("name", ""))
+    except (OSError, ValueError):
+        pass
+    return "aux", "", ""
+
+
+def bt_connected(mac):
+    path = "/org/bluez/hci0/dev_" + mac.replace(":", "_")
+    r = run(["busctl", "get-property", "org.bluez", path, "org.bluez.Device1", "Connected"])
+    return r.returncode == 0 and "true" in r.stdout
+
+
+def pcm_ready(mac):
+    """BlueALSA exposes the A2DP source (we -> speaker) PCM shortly after connect."""
+    r = run(["bluealsa-cli", "list-pcms"])
+    tag = "dev_" + mac.replace(":", "_")
+    return any(tag in line and "a2dpsrc" in line for line in r.stdout.splitlines())
+
+
+def write_if_changed(text):
+    try:
+        with open(OUT_CONF) as f:
+            if f.read() == text:
+                return False
+    except OSError:
+        pass
+    tmp = OUT_CONF + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, OUT_CONF)
+    return True
+
+
+def reconcile():
+    mode, mac, name = load_config()
+    if mode == "bt" and bt_connected(mac) and pcm_ready(mac):
+        changed = write_if_changed(bt_conf(mac, name))
+        state = f"bluetooth {mac}"
+    else:
+        changed = write_if_changed(AUX_CONF)
+        state = "aux"
+    if changed:
+        log(f"output route -> {state}")
+    return mode, mac
+
+
+def enforce_cap():
+    target_db = 20 * math.log10(max(1, min(100, MAX_PERCENT)) / 100.0)
+    r = run(["amixer", "-c", CARD, "sget", "PCM"])
+    if r.returncode != 0:
+        return
+    m = re.search(r"\[(-?\d+(?:\.\d+)?)dB\]", r.stdout)
+    if m and abs(float(m.group(1)) - target_db) < 0.05:
+        return
+    run(["amixer", "-c", CARD, "sset", "PCM", "--", f"{target_db:.2f}dB"])
+    run(["alsactl", "store"])
+    log(f"aux hardware gain re-pinned to {target_db:.2f} dB ({MAX_PERCENT}% max)")
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "apply":
+        enforce_cap()
+        reconcile()
+        return
+    log("daemon started")
+    last_cap = last_try = 0.0
+    while True:
+        now = time.time()
+        try:
+            if now - last_cap >= CAP_CHECK_S:
+                last_cap = now
+                enforce_cap()
+            mode, mac = reconcile()
+            if (mode == "bt" and not bt_connected(mac) and now - last_try >= RECONNECT_S
+                    and not os.path.exists(PLAYER_FLAG)):
+                last_try = now
+                run(["bluetoothctl", "--timeout", "15", "connect", mac], timeout=25)
+        except Exception as e:  # never let the loop die
+            log(f"loop error: {e!r}")
+        time.sleep(POLL_S)
+
+
+if __name__ == "__main__":
+    main()
+AADEOF
+    sed -i -e "s|@PI_HOME@|$PI_HOME|g" -e "s|@AUX_MAX@|$AUX_MAX_VOLUME_PERCENT|g" "$PI_HOME/scripts/arcade-audio-daemon.py"
+    chmod +x "$PI_HOME/scripts/arcade-audio-daemon.py"
+    chown "$PI_USER:$PI_USER" "$PI_HOME/scripts/arcade-audio-daemon.py"
+
+    sudo tee /etc/systemd/system/arcade-audio.service >/dev/null <<AASVC
+[Unit]
+Description=Arcade audio: aux volume cap + Bluetooth output routing
+After=bluetooth.service sound.target alsa-restore.service
+
+[Service]
+ExecStart=/usr/bin/python3 $PI_HOME/scripts/arcade-audio-daemon.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+AASVC
+
+    # --- bt-audio-output.py (RetroPie menu tool; reuses transfer-games.py's UI) ---
+    tee "$PI_HOME/scripts/bt-audio-output.py" >/dev/null <<'BAOEOF'
+#!/usr/bin/env python3
+"""
+Bluetooth Audio Output: send the arcade's sound to a Bluetooth speaker or
+headphones instead of the aux jack. Run from the RetroPie menu
+("Bluetooth Audio Output") or directly:
+    sudo python3 bt-audio-output.py
+
+Scan for and pair a speaker/headphones, pick which paired device to use, or
+switch back to the aux jack. The choice is saved; arcade-audio-daemon.py
+(arcade-audio.service) then routes sound to the device whenever it is
+connected and falls back to the aux jack (volume-capped) when it is not.
+Changes apply to the next audio stream - ES-DE restarts when this tool closes,
+and every game starts a fresh stream.
+
+Note: opening the "Bluetooth Player" tool (phone -> arcade) disconnects other
+Bluetooth devices; the speaker reconnects automatically after it is closed.
+"""
+import curses
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import wave
+import struct
+import math
+
+PI_HOME = "@PI_HOME@"
+PI_USER = "@PI_USER@"
+CONFIG = PI_HOME + "/.bt-audio-output.json"
+LOG_PATH = "/tmp/btaudiooutput.log"
+SCAN_SECONDS = 15
+
+_here = os.path.dirname(os.path.abspath(__file__))
+_spec = importlib.util.spec_from_file_location("transfer_games", os.path.join(_here, "transfer-games.py"))
+tg = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(tg)
+
+
+def log(msg):
+    try:
+        with open(LOG_PATH, "a") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    except OSError:
+        pass
+
+
+def run(cmd, timeout=20):
+    log("$ " + " ".join(cmd))
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log(f"  failed: {e!r}")
+        return subprocess.CompletedProcess(cmd, 1, "", str(e))
+
+
+def btctl(*args, timeout=20):
+    return run(["bluetoothctl", *args], timeout=timeout)
+
+
+# ---------------------------------------------------------------- config
+def load_config():
+    try:
+        with open(CONFIG) as f:
+            cfg = json.load(f)
+        if isinstance(cfg, dict):
+            return cfg
+    except (OSError, ValueError):
+        pass
+    return {"mode": "aux"}
+
+
+def save_config(mode, mac="", name=""):
+    cfg = {"mode": mode, "mac": mac, "name": name}
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f)
+    os.replace(tmp, CONFIG)
+    try:
+        import pwd
+        pw = pwd.getpwnam(PI_USER)
+        os.chown(CONFIG, pw.pw_uid, pw.pw_gid)
+    except (KeyError, OSError):
+        pass
+    apply_route()
+
+
+def apply_route():
+    run(["python3", os.path.join(_here, "arcade-audio-daemon.py"), "apply"], timeout=30)
+
+
+# ---------------------------------------------------------------- devices
+MAC_RE = re.compile(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$", re.I)
+
+
+def list_devices(paired_only=False):
+    out = btctl("devices", "Paired").stdout if paired_only else btctl("devices").stdout
+    devs = []
+    for line in out.splitlines():
+        m = re.match(r"Device\s+(\S+)\s+(.*)", line.strip())
+        if m and MAC_RE.match(m.group(1)):
+            devs.append((m.group(1).upper(), m.group(2).strip()))
+    return devs
+
+
+def device_info(mac):
+    info = btctl("info", mac).stdout
+    d = {"paired": "Paired: yes" in info, "connected": "Connected: yes" in info,
+         "trusted": "Trusted: yes" in info, "audio": False}
+    if re.search(r"Icon:\s*audio-", info) or "0000110b-" in info.lower() or "0000110d-" in info.lower():
+        d["audio"] = True
+    m = re.search(r"Class:\s*0x([0-9a-fA-F]+)", info)
+    if m and (int(m.group(1), 16) & 0x1F00) == 0x0400:
+        d["audio"] = True
+    m = re.search(r"Alias:\s*(.*)", info)
+    d["alias"] = m.group(1).strip() if m else mac
+    return d
+
+
+def audio_devices(paired_only=False):
+    rows = []
+    for mac, name in list_devices(paired_only):
+        d = device_info(mac)
+        if paired_only and not d["paired"]:
+            continue
+        if d["audio"]:
+            rows.append((mac, d["alias"] or name, d))
+    return rows
+
+
+def label(mac, name, d):
+    flags = []
+    if d["connected"]:
+        flags.append("connected")
+    elif d["paired"]:
+        flags.append("paired")
+    cfg = load_config()
+    if cfg.get("mode") == "bt" and cfg.get("mac", "").upper() == mac:
+        flags.append("OUTPUT")
+    return f"{name}  [{', '.join(flags)}]" if flags else name
+
+
+def forget(mac):
+    cfg = load_config()
+    if cfg.get("mode") == "bt" and cfg.get("mac", "").upper() == mac:
+        save_config("aux")
+    btctl("disconnect", mac)
+    btctl("remove", mac)
+
+
+def wait_connected(mac, seconds=12):
+    end = time.time() + seconds
+    while time.time() < end:
+        if device_info(mac)["connected"]:
+            return True
+        time.sleep(1)
+    return False
+
+
+def pair_and_connect(scr, inp, mac, name):
+    """Pair (if needed), trust, connect. Returns (ok, reason)."""
+    show_busy(scr, f"Connecting to {name}...", "This can take up to 30 seconds. Keep it in pairing mode.")
+    d = device_info(mac)
+    if not d["paired"]:
+        r = btctl("pair", mac, timeout=35)
+        log(f"pair rc={r.returncode} out={r.stdout.strip()[-200:]}")
+        if not device_info(mac)["paired"]:
+            return False, "Pairing failed. Put the device in pairing mode and try again."
+    btctl("trust", mac)
+    show_busy(scr, f"Connecting to {name}...", "Almost there...")
+    if not device_info(mac)["connected"]:
+        btctl("connect", mac, timeout=30)
+    if not wait_connected(mac):
+        return False, "Paired, but it would not connect. Make sure it is on and not connected to another device."
+    return True, ""
+
+
+def show_busy(scr, title, text):
+    scr.erase()
+    h, w = scr.getmaxyx()
+    tg.center(scr, 1, title, curses.color_pair(tg.COL_TITLE) | curses.A_BOLD)
+    for i, line in enumerate(tg.wrap(text, min(w - 6, 74))):
+        tg.center(scr, 3 + i, line, curses.color_pair(tg.COL_TEXT))
+    scr.refresh()
+
+
+# ---------------------------------------------------------------- scan
+def scan(scr, inp):
+    btctl("power", "on")
+    p = subprocess.Popen(["bluetoothctl", "--timeout", str(SCAN_SECONDS + 2), "scan", "on"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    start = time.time()
+    try:
+        while time.time() - start < SCAN_SECONDS:
+            left = int(SCAN_SECONDS - (time.time() - start))
+            scr.erase()
+            h, w = scr.getmaxyx()
+            tg.center(scr, 1, "SCANNING FOR SPEAKERS / HEADPHONES", curses.color_pair(tg.COL_TITLE) | curses.A_BOLD)
+            tg.center(scr, 3, "Put your device in PAIRING mode now.", curses.color_pair(tg.COL_TEXT))
+            tg.center(scr, 5, f"{left}s left", curses.color_pair(tg.COL_GOOD))
+            tg.center(scr, h - 2, "Circle: stop scanning early", curses.color_pair(tg.COL_HINT))
+            scr.refresh()
+            if inp.poll(timeout=0.5) == "back":
+                break
+    finally:
+        p.terminate()
+        try:
+            p.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            p.kill()
+        btctl("scan", "off")
+
+
+# ---------------------------------------------------------------- test sound
+def test_sound(scr, inp):
+    path = "/usr/share/sounds/alsa/Front_Center.wav"
+    if not os.path.exists(path):
+        path = "/tmp/arcade-test-tone.wav"
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(44100)
+            w.writeframes(b"".join(struct.pack("<h", int(9000 * math.sin(2 * math.pi * 440 * i / 44100)))
+                                   for i in range(44100)))
+    show_busy(scr, "TEST SOUND", "Playing a short test sound on the current output...")
+    r = run(["aplay", "-q", path], timeout=15)
+    if r.returncode != 0:
+        tg.message(scr, inp, "TEST FAILED", (r.stderr.strip() or "Could not play the sound.")[:200], good=False)
+
+
+# ---------------------------------------------------------------- screens
+def status_line():
+    cfg = load_config()
+    if cfg.get("mode") == "bt" and cfg.get("mac"):
+        d = device_info(cfg["mac"].upper())
+        state = "connected" if d["connected"] else "NOT connected - using aux until it is"
+        return f"Output: Bluetooth - {cfg.get('name') or cfg['mac']} ({state})"
+    return "Output: aux jack (3.5mm)"
+
+
+def device_menu(scr, inp, mac, name):
+    d = device_info(mac)
+    rows = []
+    acts = []
+    if not d["connected"]:
+        rows.append("Connect and use as output")
+        acts.append("use")
+    else:
+        rows.append("Use as output")
+        acts.append("use")
+        rows.append("Disconnect")
+        acts.append("disc")
+    rows.append("Forget (unpair) this device")
+    acts.append("forget")
+    rows.append("Back")
+    acts.append("back")
+    i = tg.menu(scr, inp, name, rows, subtitle=status_line())
+    if i is None:
+        return
+    act = acts[i]
+    if act == "use":
+        ok, why = pair_and_connect(scr, inp, mac, name)
+        if not ok:
+            tg.message(scr, inp, "COULD NOT CONNECT", why, good=False)
+            return
+        save_config("bt", mac, name)
+        tg.message(scr, inp, "OUTPUT SET", f"Sound now plays on {name}.\nGames and ES-DE pick it up on their next start. If the device is switched off, the arcade falls back to the aux jack automatically.")
+    elif act == "disc":
+        btctl("disconnect", mac)
+        tg.message(scr, inp, "DISCONNECTED", "Disconnected. The arcade will try to reconnect it automatically while it is the chosen output.\nChoose \"Use the aux jack\" to stop that.")
+    elif act == "forget":
+        if tg.confirm_dialog(scr, inp, "FORGET DEVICE", f"Unpair {name}? You will have to pair it again to use it.", yes="Forget", no="Cancel", good=False, default=False):
+            forget(mac)
+            tg.message(scr, inp, "FORGOTTEN", f"{name} was removed.")
+
+
+def pick_new(scr, inp):
+    scan(scr, inp)
+    show_busy(scr, "CHECKING DEVICES", "Looking at what was found...")
+    found = audio_devices()
+    if not found:
+        tg.message(scr, inp, "NOTHING FOUND", "No Bluetooth speakers or headphones were found. Put the device in pairing mode (usually hold its Bluetooth button until it flashes) and scan again.", good=False)
+        return
+    i = tg.menu(scr, inp, "SPEAKERS / HEADPHONES FOUND", [label(m, n, d) for m, n, d in found],
+                subtitle="Select one to pair and use")
+    if i is not None:
+        mac, name, _ = found[i]
+        device_menu(scr, inp, mac, name)
+
+
+def flow(scr):
+    inp = tg.setup_screen(scr)
+    try:
+        while True:
+            rows = ["Find and connect a new speaker / headphones",
+                    "Paired devices",
+                    "Use the aux jack (3.5mm)",
+                    "Play a test sound",
+                    "Exit"]
+            i = tg.menu(scr, inp, "BLUETOOTH AUDIO OUTPUT", rows, subtitle=status_line())
+            if i is None or i == 4:
+                return
+            if i == 0:
+                pick_new(scr, inp)
+            elif i == 1:
+                show_busy(scr, "PAIRED DEVICES", "Loading...")
+                paired = audio_devices(paired_only=True)
+                if not paired:
+                    tg.message(scr, inp, "NO PAIRED DEVICES", "No paired Bluetooth speakers or headphones yet. Use \"Find and connect\" first.", good=False)
+                    continue
+                j = tg.menu(scr, inp, "PAIRED AUDIO DEVICES", [label(m, n, d) for m, n, d in paired])
+                if j is not None:
+                    device_menu(scr, inp, paired[j][0], paired[j][1])
+            elif i == 2:
+                save_config("aux")
+                tg.message(scr, inp, "AUX JACK", "Sound now plays through the aux jack (volume-capped).")
+            elif i == 3:
+                test_sound(scr, inp)
+    finally:
+        inp.close()
+
+
+def main():
+    if os.geteuid() != 0:
+        os.execvp("sudo", ["sudo", sys.executable] + sys.argv)
+    curses.wrapper(flow)
+
+
+if __name__ == "__main__":
+    main()
+BAOEOF
+    sed -i -e "s|@PI_HOME@|$PI_HOME|g" -e "s|@PI_USER@|$PI_USER|g" "$PI_HOME/scripts/bt-audio-output.py"
+    chmod +x "$PI_HOME/scripts/bt-audio-output.py"
+    chown "$PI_USER:$PI_USER" "$PI_HOME/scripts/bt-audio-output.py"
+
+    touch "$PI_HOME/RetroPie/retropiemenu/btaudiooutput.rp"
+    local menu_script="$PI_HOME/RetroPie-Setup/scriptmodules/supplementary/retropiemenu.sh"
+    if [ -f "$menu_script" ] && ! grep -q "btaudiooutput.rp)" "$menu_script"; then
+        sudo cp "$menu_script" "${menu_script}.bak.$(date +%s)"
+        sudo python3 - "$menu_script" "$PI_HOME" <<'PYEOF'
+import sys
+path, pi_home = sys.argv[1], sys.argv[2]
+text = open(path).read()
+anchor = "filemanager.rp)"
+idx = text.find(anchor)
+if idx == -1:
+    print("[btaudiooutput] anchor 'filemanager.rp)' not found in retropiemenu.sh; skipping menu wiring")
+    sys.exit(0)
+case_end = text.find(";;", idx)
+if case_end == -1:
+    print("[btaudiooutput] could not find end of filemanager.rp) case; skipping menu wiring")
+    sys.exit(0)
+insert_point = text.find("\n", case_end) + 1
+line_start = text.rfind("\n", 0, idx) + 1
+indent = text[line_start:idx]
+block = f"{indent}btaudiooutput.rp)\n{indent}    python3 {pi_home}/scripts/bt-audio-output.py\n{indent}    ;;\n"
+open(path, "w").write(text[:insert_point] + block + text[insert_point:])
+print("[btaudiooutput] wired into retropiemenu.sh")
+PYEOF
+    fi
+
+    sudo systemctl daemon-reload
+    sudo systemctl restart bluealsa 2>/dev/null || true
+    sudo systemctl enable arcade-audio.service >/dev/null 2>&1 || log_warn "could not enable arcade-audio.service"
+    sudo systemctl restart arcade-audio.service || log_warn "could not start arcade-audio.service"
+    sudo -u "$PI_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$PI_USER")" systemctl --user restart wireplumber 2>/dev/null || true
+    return 0
+}
+
 phase_finalize() {
     # Defensive ownership normalization. Confirmed live on a second
     # reference Pi, across the several separate install_run*.log attempts
@@ -11896,6 +12538,7 @@ main() {
         usb_rom_autoloader
         transfer_games_tool
         manage_games_tool
+        bt_audio_output_setup
         finalize
     )
 
